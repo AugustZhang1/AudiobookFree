@@ -1,0 +1,59 @@
+# Private/internal documentation and text artifacts
+*.md
+*.txt
+!/README.md
+!/requirements.txt
+/docs/
+/Reference Image/
+/graphify-out/
+/.agents/
+/.codex/
+/scripts/benchmark_voice.py
+
+# Local environments, caches, and generated Python artifacts
+.venv/
+**/.venv/
+.uv-cache/
+.uv-python/
+.local-temp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+/tests/.pytest-*/
+/benchmark/.pytest-*/
+
+# Benchmark-only artifacts and environments (source code remains trackable)
+/benchmark/results/
+/benchmark/previews/
+/benchmark/sample.txt
+/benchmark/environments/chatterbox/
+/benchmark/environments/*/.venv/
+
+# Benchmark-only and private tests
+/tests/test_phase0.py
+/tests/test_phase6_ui.py
+
+# Secrets, credentials, and private key material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# User inputs and generated media
+*.pdf
+*.wav
+*.m4b
+*.mp3
+
+# Common OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Existing local marker
+FORME

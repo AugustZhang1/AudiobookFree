@@ -1,0 +1,4 @@
+fastapi==0.139.2
+pdfplumber==0.11.10
+pypdf==6.15.0
+uvicorn==0.51.0

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A private, local PDF audiobook maker">
+  <title>Local PDF Audiobook</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#add" aria-label="Local PDF Audiobook home">PDF <span>to</span> Audiobook</a>
+    <div class="privacy" aria-label="Privacy status"><span class="privacy-dot" aria-hidden="true"></span>Runs privately on this computer</div>
+  </header>
+  <main class="shell">
+    <nav class="steps" aria-label="Workflow steps">
+      <button class="step active" data-view="add" aria-current="step" type="button"><span>1</span><strong>Add book</strong></button>
+      <span class="step-line" aria-hidden="true"></span>
+      <button class="step" data-view="configure" type="button"><span>2</span><strong>Configure</strong></button>
+      <span class="step-line" aria-hidden="true"></span>
+      <button class="step" data-view="progress" type="button"><span>3</span><strong>Progress</strong></button>
+    </nav>
+
+    <section id="view-add" class="view active" aria-labelledby="add-title">
+      <p class="eyebrow">A calm place for your next listen</p>
+      <h1 id="add-title" tabindex="-1">Turn a PDF into<br><em>something you can hear.</em></h1>
+      <p class="lede">Your book stays on this computer. Start with a text-based English PDF and we will prepare it for local review.</p>
+      <div class="dropzone" tabindex="0" role="button" aria-label="Choose a PDF file">
+        <div class="drop-icon" aria-hidden="true">&#8595;</div>
+        <h2>Drop your PDF here</h2>
+        <p>or <button class="text-button browse" type="button">browse your files</button></p>
+        <input id="pdf-input" type="file" accept="application/pdf,.pdf" hidden>
+      </div>
+      <p id="add-status" class="status" role="status" aria-live="polite">No file selected. PDF analysis runs locally.</p>
+      <button class="primary analyze" type="button" disabled>Analyze PDF</button>
+      <div id="existing-state" class="existing-state" hidden>
+        <h2 id="existing-title">Current job</h2>
+        <p id="existing-state-label" class="existing-state-label"></p>
+        <p id="existing-message" class="status" role="status" aria-live="polite"></p>
+        <div class="existing-actions">
+          <button id="view-current-job" class="secondary" type="button">View Current Job</button>
+          <button id="cancel-current-generation" class="secondary" type="button" hidden>Cancel Current Generation</button>
+          <button class="secondary delete-job" type="button">Delete existing job</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-configure" class="view" aria-labelledby="configure-title" hidden>
+      <p class="eyebrow">Step two &middot; configure your listen</p>
+      <h1 id="configure-title" tabindex="-1">Make it <em>yours.</em></h1>
+      <p class="lede">Review your chapter labels, choose a local voice and set the reading speed. You can return here after a cancellation or failure.</p>
+      <div class="config-grid">
+        <fieldset class="panel">
+          <legend>Document review</legend>
+          <div id="analysis-metadata" class="note"></div>
+          <p class="note">Four approved local voices are available. Voice previews use audio files already present in this source checkout.</p>
+          <h3 class="section-title">Warnings</h3>
+          <ul id="analysis-warnings" class="note"></ul>
+          <h3 class="section-title">Cleaned preview</h3>
+          <pre id="cleaned-preview" class="preview">No analysis yet.</pre>
+        </fieldset>
+
+        <fieldset class="panel chapter-panel">
+          <legend>Chapter plan</legend>
+          <div class="plan-controls" role="group" aria-label="Chapter plan mode">
+            <label><input type="radio" name="plan-mode" value="original" checked> Original Chapters</label>
+            <label><input type="radio" name="plan-mode" value="custom"> Custom Chapters</label>
+            <label><input type="radio" name="plan-mode" value="whole"> Whole Book</label>
+            <label class="custom-count" hidden>Count <input id="chapter-count" type="number" min="2" max="50" value="4" inputmode="numeric"></label>
+          </div>
+          <div class="plan-actions"><button id="regenerate-plan" class="secondary" type="button">Generate plan</button><span id="plan-status" class="status" role="status" aria-live="polite"></span></div>
+          <div class="chapter-range" role="group" aria-labelledby="chapter-range-title">
+            <h3 id="chapter-range-title" class="section-title">Output range</h3>
+            <div class="range-inputs">
+              <label for="chapter-start">From chapter <input id="chapter-start" type="number" min="1" value="1" inputmode="numeric"></label>
+              <label for="chapter-end">Through chapter <input id="chapter-end" type="number" min="1" value="1" inputmode="numeric"></label>
+            </div>
+            <p id="chapter-range-status" class="status" role="status" aria-live="polite">Select an inclusive chapter range after generating a plan.</p>
+          </div>
+          <ul id="plan-warnings" class="note"></ul>
+          <ol id="chapter-plan" class="chapters"><li>No plan generated yet.</li></ol>
+          <div class="plan-save"><button id="save-labels" class="primary" type="button" disabled>Save labels</button></div>
+          <p class="muted">Chapter boundaries are sentence-safe and come from PDF evidence or deterministic text structure. Labels can be edited; boundaries cannot.</p>
+          <h3 class="section-title">Detected candidates</h3>
+          <ol id="chapter-candidates" class="chapters"><li>No candidates detected.</li></ol>
+          <p class="muted">Candidates come from PDF bookmarks, explicit headings, and reliable layout headings.</p>
+        </fieldset>
+      </div>
+
+      <fieldset class="panel generation-panel">
+        <legend>Voice and output</legend>
+        <div class="voice-grid" role="radiogroup" aria-label="Voice">
+          <div class="voice-card selected"><label class="voice-choice"><input type="radio" name="voice" value="af_heart" checked><span><strong>af_heart</strong><small>Warm, clear</small></span></label><button class="preview-voice" type="button" data-voice="af_heart" aria-label="Preview af_heart">Preview</button></div>
+          <div class="voice-card"><label class="voice-choice"><input type="radio" name="voice" value="af_bella"><span><strong>af_bella</strong><small>Bright, measured</small></span></label><button class="preview-voice" type="button" data-voice="af_bella" aria-label="Preview af_bella">Preview</button></div>
+          <div class="voice-card"><label class="voice-choice"><input type="radio" name="voice" value="bf_emma"><span><strong>bf_emma</strong><small>Natural, steady</small></span></label><button class="preview-voice" type="button" data-voice="bf_emma" aria-label="Preview bf_emma">Preview</button></div>
+          <div class="voice-card"><label class="voice-choice"><input type="radio" name="voice" value="bf_isabella"><span><strong>bf_isabella</strong><small>Thoughtful, calm</small></span></label><button class="preview-voice" type="button" data-voice="bf_isabella" aria-label="Preview bf_isabella">Preview</button></div>
+        </div>
+        <p id="preview-status" class="status" role="status" aria-live="polite"></p>
+        <div class="settings-row">
+          <label class="speed-control" for="speed">Speed <output id="speed-value" for="speed">1.0&times;</output><input id="speed" type="range" min="0.5" max="2" step="0.1" value="1"></label>
+          <div class="output-note"><strong>Default output</strong><span>Saved directly in Downloads; only the final M4B appears there. Work chunks stay hidden in AppData.</span></div>
+        </div>
+        <div class="performance-mode" role="radiogroup" aria-labelledby="performance-mode-title">
+          <strong id="performance-mode-title">Generation performance</strong>
+          <label><input type="radio" name="performance-mode" value="background" checked><span><b>Background</b><small>Recommended; lower CPU use keeps your computer responsive.</small></span></label>
+          <label><input type="radio" name="performance-mode" value="maximum_speed"><span><b>Maximum speed</b><small>Uses all detected logical CPUs; your computer may become busy.</small></span></label>
+        </div>
+        <p id="generation-status" class="status" role="status" aria-live="polite"></p>
+        <div class="generate-actions"><button id="start-generation" class="primary next" type="button" disabled>Generate audiobook</button></div>
+      </fieldset>
+      <div class="actions"><button class="secondary back" data-view="add" type="button">&#8592; Back</button></div>
+    </section>
+
+    <section id="view-progress" class="view" aria-labelledby="progress-title" hidden>
+      <p class="eyebrow">Step three &middot; progress</p>
+      <h1 id="progress-title" tabindex="-1">Your audiobook is<br><em>taking shape.</em></h1>
+      <div id="progress-live" class="progress-card" aria-live="polite">
+        <div class="progress-heading"><span id="progress-stage">Preparing generation</span><strong id="progress-percent">0%</strong></div>
+        <div id="progress-bar" class="progress-track" role="progressbar" aria-label="Audiobook generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <dl class="progress-facts">
+          <div><dt>Chapter</dt><dd id="progress-chapter">-</dd></div>
+          <div><dt>Chunks</dt><dd id="progress-chunks">-</dd></div>
+          <div><dt>Completed chapters</dt><dd id="progress-completed-chapters">-</dd></div>
+          <div><dt>Elapsed</dt><dd id="progress-elapsed">-</dd></div>
+        </dl>
+        <p id="progress-status" class="status" role="status"></p>
+        <button id="cancel-generation" class="secondary" type="button">Cancel generation</button>
+      </div>
+
+      <div id="completion-card" class="completion-card" hidden>
+        <h2>Ready to listen</h2>
+        <dl class="output-facts">
+          <div><dt>Filename</dt><dd id="output-filename">-</dd></div>
+          <div><dt>Path</dt><dd id="output-path">-</dd></div>
+          <div><dt>Size</dt><dd id="output-size">-</dd></div>
+          <div><dt>Duration</dt><dd id="output-duration">-</dd></div>
+          <div><dt>Chapters</dt><dd id="output-chapters">-</dd></div>
+        </dl>
+        <p id="output-status" class="status" role="status" aria-live="polite"></p>
+        <div class="completion-actions"><button id="open-audiobook" class="primary" type="button">Open Audiobook</button><button id="open-folder" class="secondary" type="button">Open Folder</button></div>
+        <div class="actions"><button id="convert-another" class="secondary" type="button">Convert Another PDF</button><button id="exit-complete" class="secondary" type="button">Exit Application</button></div>
+      </div>
+      <div id="progress-note" class="honest-note"><span aria-hidden="true">&#10022;</span><p><strong>This app stays open while work is running.</strong><br>Closing this tab will not stop a conversion. You can return later to resume.</p></div>
+    </section>
+  </main>
+  <footer><span>Local PDF Audiobook &middot; Phase 6</span><span>No cloud processing &middot; No account required</span></footer>
+  <script src="/app.js"></script>
+</body>
+</html>
