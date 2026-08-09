@@ -62,6 +62,45 @@ def test_generation_performance_mode_defaults_forwards_and_stays_out_of_tts() ->
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_stale_runtime_generation_cancel_persists_terminal_state() -> None:
+    root = Path("tests") / f".pytest-phase6-stale-cancel-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        app, client, headers, _ = _app(root, 19891)
+        pdf = make_pdf(root / "book.pdf", ["One sentence. Two sentence."])
+        upload_headers = {**headers, "X-PDF-Filename": "book.pdf", "Content-Type": "application/pdf"}
+        assert client.post("/api/analyze", content=pdf.read_bytes(), headers=upload_headers).status_code == 200
+        assert client.post("/api/chapter-plan", json={"mode": "whole"}, headers=headers).status_code == 200
+        assert client.post("/api/generation/start", json={"voice": "af_heart", "speed": 1.0}, headers=headers).status_code == 200
+        workspace = Workspace(root / "data")
+        conversion_id = workspace.inspect_startup().conversion_id
+        assert conversion_id
+        planned = workspace.read_job(conversion_id)
+        stale = workspace.update_generation(
+            conversion_id,
+            status="synthesizing",
+            stage="synthesis",
+            worker={"pid": 4_000_000_000, "started_at": planned["created_at"], "updated_at": planned["updated_at"]},
+        )
+        app.state.phase1.worker_process = None
+
+        cancelled = client.post("/api/generation/cancel", json={"conversion_id": conversion_id}, headers=headers)
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json() == {"conversion_id": conversion_id, "status": "cancelled", "cancel_requested": False}
+
+        persisted = workspace.read_job(conversion_id)
+        assert persisted["status"] == "cancelled" and persisted["stage"] == "cancelled"
+        assert persisted["worker"] is None and persisted["last_safe_error"] == "cancelled"
+        for key in ("tts", "total_chunks", "completed_chunks", "progress", "output"):
+            assert persisted[key] == stale[key]
+        assert not workspace.cancellation_requested(conversion_id)
+
+        current = client.get("/api/status", headers=headers)
+        assert current.status_code == 200
+        assert current.json()["state"] == "cancelled" and current.json()["job"]["status"] == "cancelled"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_voice_preview_auth_validation_and_no_store() -> None:
     root = Path("tests") / f".pytest-phase6-preview-{uuid.uuid4().hex}"
     try:

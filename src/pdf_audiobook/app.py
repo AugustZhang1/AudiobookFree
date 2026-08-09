@@ -671,13 +671,25 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 return JSONResponse({"error": {"code": "NOT_GENERATING", "message": "generation has not started"}}, status_code=409)
             status = inspection.manifest.get("status")
             recorded = inspection.manifest.get("worker") or {}
+            runtime_active_statuses = {"synthesizing", "cancelling", "assembling", "encoding", "verifying", "publishing"}
             active_statuses = {"planned", "starting", "synthesizing", "assembling", "encoding", "verifying", "publishing"}
             live = status in active_statuses | {"cancelling"} and pid_is_alive(int(recorded.get("pid", 0)))
             local_process = state.worker_process
             synthesis_preclaim = status == "completed" and inspection.manifest.get("stage") == "synthesis_complete" and inspection.manifest.get("output") is None
-            local_live = (status in (active_statuses | {"cancelled", "failed"}) or synthesis_preclaim) and local_process is not None and (not hasattr(local_process, "poll") or local_process.poll() is None)
+            local_live = (status in (active_statuses | {"cancelling", "cancelled", "failed"}) or synthesis_preclaim) and local_process is not None and (not hasattr(local_process, "poll") or local_process.poll() is None)
             live = live or local_live
             if not live:
+                if status in runtime_active_statuses:
+                    await asyncio.to_thread(
+                        workspace.update_generation,
+                        inspection.conversion_id,
+                        status="cancelled",
+                        stage="cancelled",
+                        worker=None,
+                        last_safe_error="cancelled",
+                    )
+                    await asyncio.to_thread(workspace.clear_cancel_request, inspection.conversion_id)
+                    return {"conversion_id": inspection.conversion_id, "status": "cancelled", "cancel_requested": False}
                 return JSONResponse({"error": {"code": "NOT_GENERATING", "message": "generation is complete"}}, status_code=409)
             await asyncio.to_thread(workspace.request_cancel, inspection.conversion_id)
             return {"conversion_id": inspection.conversion_id, "status": "cancelling", "cancel_requested": True}
