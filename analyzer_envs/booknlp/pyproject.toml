@@ -1,0 +1,13 @@
+[project]
+name = "pdf-audiobook-booknlp"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+dependencies = ["booknlp==1.0.8", "setuptools<81", "transformers==4.26.1"]
+
+# This is intentionally a nested, separately-created environment.  Do not add
+# BookNLP or its ML dependencies to the application pyproject or uv.lock.
+# Create analyzer_envs/booknlp/.venv with Python 3.11 or 3.13 when installing.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

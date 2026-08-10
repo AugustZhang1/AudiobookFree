@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import json
+
 import pdf_audiobook.tts as tts
 import pytest
-from pdf_audiobook.tts import EngineMetadata, SynthesisSettings, chunk_input_hash, plan_chunks
+from pdf_audiobook.tts import EngineMetadata, SynthesisSettings, chunk_input_hash, plan_chunks, plan_interactive_chunks
+from pdf_audiobook import voice_registry
+from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 
 
 def _metadata() -> EngineMetadata:
     settings = SynthesisSettings(chunk_mode="legacy")
     return EngineMetadata("fake", "builtin", "fake", "r1", "c1", "fake-neutral", "v1", "c2", 24000, settings.as_dict())
+
+
+def test_approved_voices_match_registry_and_all_are_accepted() -> None:
+    assert tts.APPROVED_VOICES == voice_registry.APPROVED_VOICE_IDS
+    assert len(tts.APPROVED_VOICES) == 28 and len(set(tts.APPROVED_VOICES)) == 28
+    for voice_id in tts.APPROVED_VOICES:
+        tts.load_voice(voice_id, engine="fake").close_voice()
+    with pytest.raises(ValueError, match="not approved"):
+        tts.load_voice("not-a-voice", engine="fake")
 
 
 def test_chapter_mode_plans_one_exact_chunk_per_chapter() -> None:
@@ -118,6 +131,67 @@ def test_kokoro_configures_threads_before_pipeline_and_wraps_inference(monkeypat
     assert events.index("inference-enter") < events.index("pipeline-call") < events.index("inference-exit")
 
 
+def _fake_kokoro_voice(pipeline: object, events: list[str], *, sample_rate: int = 1000) -> tts.KokoroVoice:
+    class Context:
+        def __enter__(self) -> None:
+            events.append("inference-enter")
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("inference-exit")
+
+    return tts.KokoroVoice(
+        pipeline,
+        "af_heart",
+        SynthesisSettings(sample_rate=sample_rate),
+        inference_context=lambda: Context(),
+    )
+
+
+@pytest.mark.parametrize("text", [" \n\t", "!?…"])
+def test_kokoro_silences_non_speakable_chunks_without_pipeline_call(text: str) -> None:
+    events: list[str] = []
+
+    class Pipeline:
+        def __call__(self, *_args: object, **_kwargs: object):
+            events.append("pipeline-call")
+            return iter(())
+
+    pcm = _fake_kokoro_voice(Pipeline(), events).synthesize(text)
+    assert pcm == b"\x00\x00" * 50
+    assert pcm and not any(pcm)
+    assert events == []
+
+
+def test_kokoro_sends_unicode_alphanumeric_text_to_pipeline() -> None:
+    calls: list[str] = []
+    events: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), events).synthesize("é١")
+    assert pcm == b"\x00\x00"
+    assert calls == ["é١"]
+    assert events == ["inference-enter", "inference-exit"]
+
+
+def test_kokoro_speakable_text_without_pipeline_output_still_raises() -> None:
+    calls: list[str] = []
+    events: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter(())
+
+    with pytest.raises(RuntimeError, match="^Kokoro returned no audio$"):
+        _fake_kokoro_voice(Pipeline(), events).synthesize("hello")
+    assert calls == ["hello"]
+    assert events == ["inference-enter", "inference-exit"]
+
+
 @pytest.mark.parametrize(("cpu_count", "expected_threads"), ((16, 8), (4, 4)))
 def test_kokoro_unset_threads_uses_adaptive_default(monkeypatch, cpu_count: int, expected_threads: int) -> None:
     events: list[str] = []
@@ -134,3 +208,191 @@ def test_invalid_threads_fail_before_model_load(monkeypatch) -> None:
     monkeypatch.setattr(tts.importlib, "import_module", lambda _name: (_ for _ in ()).throw(AssertionError("model import must not run")))
     with pytest.raises(ValueError, match="positive integer"):
         tts.load_voice("af_heart")
+
+
+def _interactive_facts() -> dict[str, dict[str, object]]:
+    facts = {
+        "id": "af_heart", "engine": "kokoro", "package": "kokoro", "package_version": "0.9.4",
+        "model": "model", "model_revision": "r1", "model_checksum": "m1",
+        "voice_version": "v1", "voice_checksum": "w1", "sample_rate": 24000, "enabled": True,
+    }
+    return {"af_heart": facts}
+
+
+def _interactive_plan(text: str, spans: list[dict[str, object]], *, revision: int = 1, state: str = "approved") -> dict[str, object]:
+    plan = {
+        "schema_version": 1,
+        "artifact": "voice-plan",
+        "revision": revision,
+        "approval": {"state": state, "approved_revision": revision if state == "approved" else None},
+        "cast": [
+            {"cast_id": "narrator", "voice_id": "af_heart", "voice_settings": {"speed": 1.0}},
+            {"cast_id": "alice", "voice_id": "af_heart", "voice_settings": {"speed": 1.2}},
+        ],
+        "chapters": [{"chapter_index": 1, "source_start": 0, "source_end": len(text), "spans": spans}],
+    }
+    return with_canonical_artifact_hash(plan)
+
+
+def test_interactive_chunks_reconstruct_exactly_and_never_cross_span() -> None:
+    text = "Narrátor says: “Áé.”  Alice replies!\n\n" + ("Long sentence " * 35) + "done."
+    split = text.index("Alice")
+    long_start = text.index("Long")
+    plan = _interactive_plan(text, [
+        {"span_id": "n", "source_start": 0, "source_end": split, "type": "narration", "speaker_id": "narrator"},
+        {"span_id": "a", "source_start": split, "source_end": long_start, "type": "dialogue", "speaker_id": "alice"},
+        {"span_id": "n2", "source_start": long_start, "source_end": len(text), "type": "narration", "speaker_id": "narrator"},
+    ])
+    chunks = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=40)
+    assert "".join(chunk.text for chunk in chunks) == text
+    assert any(chunk.span_id == "n2" for chunk in chunks)
+    assert all(chunk.source_start >= (split if chunk.span_id != "n" else 0) for chunk in chunks)
+    assert all(chunk.voice_id == "af_heart" for chunk in chunks)
+    record = chunks[0].manifest_record("chunks/a.wav", 1.0)
+    assert record["segment_type"] == "narration"
+    assert record["span_id"] == "n"
+
+
+def test_interactive_accepted_unknown_narrator_fallback_plans_narration_without_mutation() -> None:
+    text = "Unresolved line."
+    plan = _interactive_plan(text, [{"span_id": "u", "source_start": 0, "source_end": len(text), "type": "unknown", "speaker_id": "narrator"}])
+    plan["unresolved_policy"] = {"mode": "narrator", "accepted_by_user": True, "accepted_at": "2026-01-01T00:00:00Z"}
+    plan = with_canonical_artifact_hash(plan)
+    original = json.loads(json.dumps(plan))
+    chunks = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100)
+    assert len(chunks) == 1 and chunks[0].segment_type == "narration" and chunks[0].voice_id == "af_heart"
+    assert plan == original
+
+
+@pytest.mark.parametrize(
+    "policy, speaker_id",
+    [
+        (None, "narrator"),
+        ({"mode": "narrator", "accepted_by_user": False, "accepted_at": None}, "narrator"),
+        ({"mode": "narrator", "accepted_by_user": True, "accepted_at": None}, "narrator"),
+        ({"mode": "narrator", "accepted_by_user": True, "accepted_at": "not-a-timestamp"}, "narrator"),
+        ({"mode": "narrator", "accepted_by_user": True, "accepted_at": "2026-01-01T00:00:00Z"}, "alice"),
+    ],
+)
+def test_interactive_rejects_unaccepted_or_non_narrator_unknown_fallback(policy, speaker_id: str) -> None:
+    text = "Unresolved line."
+    plan = _interactive_plan(text, [{"span_id": "u", "source_start": 0, "source_end": len(text), "type": "unknown", "speaker_id": speaker_id}])
+    if policy is not None:
+        plan["unresolved_policy"] = policy
+    plan = with_canonical_artifact_hash(plan)
+    with pytest.raises(ValueError, match="unknown spans"):
+        plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100)
+
+
+def test_interactive_selected_chapter_range_preserves_order_and_reconstructs_selection() -> None:
+    parts = ["Chapter one. ", "Chapter two — naïve.  ", "Chapter three!\n"]
+    text = "".join(parts)
+    chapters = []
+    cursor = 0
+    for index, part in enumerate(parts, start=1):
+        end = cursor + len(part)
+        chapters.append({
+            "chapter_index": index,
+            "source_start": cursor,
+            "source_end": end,
+            "spans": [{
+                "span_id": f"s{index}",
+                "source_start": cursor,
+                "source_end": end,
+                "type": "narration",
+                "speaker_id": "narrator",
+            }],
+        })
+        cursor = end
+    plan = with_canonical_artifact_hash({
+        "schema_version": 1,
+        "artifact": "voice-plan",
+        "revision": 1,
+        "approval": {"state": "approved", "approved_revision": 1},
+        "cast": [{"cast_id": "narrator", "voice_id": "af_heart", "voice_settings": {"speed": 1.0}}],
+        "chapters": chapters,
+    })
+    chunks = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, (2, 3), cap=100)
+    assert "".join(chunk.text for chunk in chunks) == parts[1] + parts[2]
+    assert [chunk.chapter_index for chunk in chunks] == [2, 3]
+    assert [chunk.global_index for chunk in chunks] == [0, 1]
+    assert [chunk.local_index for chunk in chunks] == [0, 0]
+
+
+def test_interactive_hashes_bind_plan_registry_voice_and_offsets() -> None:
+    text = "One. Two."
+    base_span = {"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}
+    plan = _interactive_plan(text, [base_span])
+    baseline = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100)[0].input_hash
+    changed_facts = _interactive_facts()
+    changed_facts["af_heart"] = {**changed_facts["af_heart"], "model_revision": "r2"}
+    assert plan_interactive_chunks(text, plan, changed_facts, "a" * 64, cap=100)[0].input_hash != baseline
+    assert plan_interactive_chunks(text, plan, _interactive_facts(), "b" * 64, cap=100)[0].input_hash != baseline
+    changed_plan = _interactive_plan(text, [base_span], revision=2)
+    assert plan_interactive_chunks(text, changed_plan, _interactive_facts(), "a" * 64, cap=100)[0].input_hash != baseline
+    changed_speed = _interactive_plan(text, [base_span])
+    changed_speed["cast"][0]["voice_settings"]["speed"] = 1.1  # type: ignore[index]
+    changed_speed = with_canonical_artifact_hash(changed_speed)
+    assert plan_interactive_chunks(text, changed_speed, _interactive_facts(), "a" * 64, cap=100)[0].input_hash != baseline
+
+
+def test_interactive_audio_hash_reuse_excludes_plan_and_registry_revisions() -> None:
+    text = "One. Two."
+    span = {"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}
+    plan = _interactive_plan(text, [span])
+    baseline = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100)[0]
+    revised = plan_interactive_chunks(text, _interactive_plan(text, [span], revision=2), _interactive_facts(), "a" * 64, cap=100)[0]
+    registry_changed = plan_interactive_chunks(text, plan, _interactive_facts(), "b" * 64, cap=100)[0]
+    assert revised.input_hash != baseline.input_hash
+    assert registry_changed.input_hash != baseline.input_hash
+    assert revised.audio_input_hash == baseline.audio_input_hash == registry_changed.audio_input_hash
+
+
+def test_interactive_audio_hash_changes_for_voice_settings_model_text_and_offsets() -> None:
+    text = "One. Two."
+    span = {"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}
+    plan = _interactive_plan(text, [span])
+    baseline = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100)[0].audio_input_hash
+
+    voice_facts = _interactive_facts()
+    voice_facts["af_bella"] = {**voice_facts["af_heart"], "id": "af_bella"}
+    voice_plan = _interactive_plan(text, [span])
+    voice_plan["cast"][0]["voice_id"] = "af_bella"  # type: ignore[index]
+    voice_plan = with_canonical_artifact_hash(voice_plan)
+    assert plan_interactive_chunks(text, voice_plan, voice_facts, "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+    settings_plan = _interactive_plan(text, [span])
+    settings_plan["cast"][0]["voice_settings"]["speed"] = 1.1  # type: ignore[index]
+    settings_plan = with_canonical_artifact_hash(settings_plan)
+    assert plan_interactive_chunks(text, settings_plan, _interactive_facts(), "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+    model_facts = _interactive_facts()
+    model_facts["af_heart"] = {**model_facts["af_heart"], "model_revision": "r2"}
+    assert plan_interactive_chunks(text, plan, model_facts, "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+    changed_text = "One. Three."
+    changed_span = {**span, "source_end": len(changed_text)}
+    changed_text_plan = _interactive_plan(changed_text, [changed_span])
+    assert plan_interactive_chunks(changed_text, changed_text_plan, _interactive_facts(), "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+    offset_plan = _interactive_plan(text, [
+        {"span_id": "s1", "source_start": 0, "source_end": 4, "type": "narration", "speaker_id": "narrator"},
+        {"span_id": "s2", "source_start": 4, "source_end": len(text), "type": "narration", "speaker_id": "narrator"},
+    ])
+    assert plan_interactive_chunks(text, offset_plan, _interactive_facts(), "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+
+@pytest.mark.parametrize("mutation", ["draft", "missing-facts", "disabled-facts", "missing-cast"])
+def test_interactive_rejects_unapproved_or_unresolvable_inputs(mutation: str) -> None:
+    text = "One."
+    plan = _interactive_plan(text, [{"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}], state="draft" if mutation == "draft" else "approved")
+    facts = _interactive_facts()
+    if mutation == "missing-facts":
+        facts = {}
+    elif mutation == "disabled-facts":
+        facts["af_heart"]["enabled"] = False
+    elif mutation == "missing-cast":
+        plan["chapters"][0]["spans"][0]["speaker_id"] = "unknown"  # type: ignore[index]
+        plan = with_canonical_artifact_hash(plan)
+    with pytest.raises(ValueError):
+        plan_interactive_chunks(text, plan, facts, "a" * 64)

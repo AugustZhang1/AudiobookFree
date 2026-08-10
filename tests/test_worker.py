@@ -5,10 +5,14 @@ from pathlib import Path
 import shutil
 import uuid
 
-from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks
+import pytest
+
+import pdf_audiobook.worker as worker_module
+from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks, plan_interactive_chunks
 from pdf_audiobook.chapters import select_chapter_range
 from pdf_audiobook.worker import ConversionWorker
-from pdf_audiobook.workspace import Workspace
+from pdf_audiobook.voice_plan import with_canonical_artifact_hash
+from pdf_audiobook.workspace import ManifestError, Workspace, atomic_write_json
 
 
 def _prepared() -> tuple[Path, Workspace, str, EngineMetadata]:
@@ -40,6 +44,166 @@ class _CountingEngine:
             self.workspace.request_cancel(self.conversion_id)
         return result
     def close_voice(self): self.inner.close_voice()
+
+
+def _prepared_v5() -> tuple[Path, Workspace, str, str, dict, dict, dict[str, dict], dict]:
+    root = Path("tests") / f".pytest-phase5-worker-{uuid.uuid4().hex}"; root.mkdir()
+    source = root / "book.pdf"; source.write_bytes(b"%PDF-1")
+    workspace = Workspace(root / "data"); manifest = workspace.create_conversion(source)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    workspace.persist_analysis(manifest["conversion_id"], {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []})
+    chapter_plan = {"schema_version": 1, "mode": "whole", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "Book", "start_offset": 0, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": len(text.split())}], "warnings": []}
+    workspace.persist_chapter_plan(manifest["conversion_id"], chapter_plan)
+    alice_start, bob_start = text.index("Alice"), text.index("Bob")
+    voice_plan = with_canonical_artifact_hash({
+        "schema_version": 1, "artifact": "voice-plan", "revision": 1,
+        "source_pdf_sha256": manifest["source_pdf_sha256"], "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "chapter_plan_sha256": workspace.read_job(manifest["conversion_id"])["chapter_plan_sha256"], "chapter_plan_schema_version": 1,
+        "analyzer": {"id": "fake", "version": "1", "model_hash": None},
+        "cast": [
+            {"cast_id": "narrator", "display_label": "Narrator", "role": "narrator", "relationship": "third_person", "voice_id": "voice-a", "voice_settings": {"speed": 1.0}},
+            {"cast_id": "alice", "display_label": "Alice", "role": "character", "relationship": "separate_from_narrator", "voice_id": "voice-b", "voice_settings": {"speed": 1.2}},
+            {"cast_id": "bob", "display_label": "Bob", "role": "character", "relationship": "separate_from_narrator", "voice_id": "voice-c", "voice_settings": {"speed": 0.8}},
+        ], "aliases": [],
+        "chapters": [{"chapter_index": 1, "source_start": 0, "source_end": len(text), "source_page_start": 1, "source_page_end": 1, "spans": [
+            {"span_id": "s1", "source_start": 0, "source_end": alice_start, "type": "narration", "speaker_id": "narrator", "confidence": {"score": 0.2, "band": "high", "reasons": ["fixture"]}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+            {"span_id": "s2", "source_start": alice_start, "source_end": bob_start, "type": "dialogue", "speaker_id": "alice", "confidence": {"score": 0.9, "band": "low", "reasons": ["fixture"]}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+            {"span_id": "s3", "source_start": bob_start, "source_end": len(text), "type": "narration", "speaker_id": "bob", "confidence": {"score": 0.5, "band": "medium", "reasons": []}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+        ]}],
+        "unresolved_policy": {"mode": "narrator", "accepted_by_user": False, "accepted_at": None},
+        "approval": {"state": "approved", "approved_at": "2026-01-01T00:00:00Z", "approved_revision": 1},
+    })
+    workspace.persist_voice_plan(manifest["conversion_id"], voice_plan)
+    analysis = with_canonical_artifact_hash({
+        "schema_version": 1, "artifact": "speaker-analysis", "revision": 1,
+        "source_pdf_sha256": manifest["source_pdf_sha256"], "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "chapter_plan_sha256": workspace.read_job(manifest["conversion_id"])["chapter_plan_sha256"], "chapter_plan_schema_version": 1,
+        "analyzer": {"id": "fake", "version": "1", "model_hash": None},
+        "characters": [{"character_id": "alice", "canonical_label": "Alice", "aliases": [], "line_count": 1, "quote_count": 0}, {"character_id": "bob", "canonical_label": "Bob", "aliases": [], "line_count": 1, "quote_count": 0}],
+        "spans": [{"span_id": "m1", "chapter_index": 1, "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": None, "confidence": {"score": 0.5, "band": "medium", "reasons": []}, "provenance": {"source": "fake"}}],
+        "warnings": [],
+    })
+    workspace.persist_speaker_analysis(manifest["conversion_id"], analysis)
+    facts = {voice: {"id": voice, "engine": "fake", "package": "builtin", "package_version": "builtin", "model": "fake-model", "model_revision": "1", "model_checksum": "model", "voice_version": "1", "voice_checksum": "voice", "sample_rate": 24000, "enabled": True} for voice in ("voice-a", "voice-b", "voice-c")}
+    tts = {"engine": "fake", "package_version": "builtin", "model": "fake-model", "model_revision": "1", "model_checksum": "model", "voice": "voice-a", "voice_version": "1", "voice_checksum": "voice", "sample_rate": 24000, "settings": {}, "speed": 1.0, "chunk_cap": 900}
+    return root, workspace, manifest["conversion_id"], text, voice_plan, facts, tts
+
+
+def _configure_v5(workspace: Workspace, conversion_id: str, text: str, voice_plan: dict, facts: dict[str, dict], tts: dict, revision: str = "a" * 64) -> int:
+    total = len(plan_interactive_chunks(text, voice_plan, facts, revision))
+    workspace.configure_interactive_generation(conversion_id, tts=tts, total_chunks=total, voice_registry_revision=revision)
+    return total
+
+
+class _RecordedVoice:
+    def __init__(self, voice: str, settings: SynthesisSettings):
+        self.inner = FakeVoice(voice, settings); self.voice = voice; self.speed = settings.speed; self.closed = 0
+    @property
+    def metadata(self): return self.inner.metadata
+    def synthesize(self, text: str): return self.inner.synthesize(text)
+    def close_voice(self): self.closed += 1; self.inner.close_voice()
+
+
+def test_v5_dispatches_cast_settings_and_releases_lru_cache(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and [(item.voice, item.speed) for item in made] == [("voice-a", 1.0), ("voice-b", 1.2), ("voice-c", 0.8)]
+        assert [item.closed for item in made] == [1, 1, 1]
+        assert [record["global_index"] for record in workspace.read_job(conversion_id)["completed_chunks"]] == [0, 1, 2]
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("cancel_point", ["before_load", "after_load", "synthesis", "before_eviction"])
+def test_v5_cancellation_checks_surround_load_eviction_and_synthesis(monkeypatch, cancel_point: str) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        if cancel_point == "before_load": workspace.request_cancel(conversion_id)
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded)
+            if cancel_point == "after_load" or (cancel_point == "before_eviction" and voice == "voice-c"):
+                workspace.request_cancel(conversion_id)
+            return loaded
+        class SynthCancel(_RecordedVoice):
+            def synthesize(self, text):
+                result = super().synthesize(text); workspace.request_cancel(conversion_id); return result
+        def synth_factory(voice, settings, *, engine):
+            if cancel_point == "synthesis":
+                loaded = SynthCancel(voice, settings); made.append(loaded); return loaded
+            return factory(voice, settings, engine=engine)
+        result = ConversionWorker(workspace, conversion_id, engine_factory=synth_factory).run(full_pipeline=False)
+        assert result.status == "cancelled" and all(item.closed == 1 for item in made)
+        if cancel_point == "before_load": assert made == []
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_retries_and_preserves_safe_failure(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        class Failing:
+            def __init__(self): self.calls = 0; self.closed = 0; self.metadata = FakeVoice("voice-a", SynthesisSettings()).metadata
+            def synthesize(self, _text): self.calls += 1; raise RuntimeError("secret detail")
+            def close_voice(self): self.closed += 1
+        failing = Failing()
+        with pytest.raises(RuntimeError, match="chunk 0 failed after 3 attempts"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *_args, **_kwargs: failing).run(full_pipeline=False)
+        job = workspace.read_job(conversion_id); assert failing.calls == 3 and failing.closed == 1 and job["status"] == "failed" and job["error"] == "chunk 0 failed after 3 attempts"
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_strict_bindings_and_approved_plan(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "b" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts, "a" * 64)
+        with pytest.raises(ManifestError, match="voice registry revision"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *_args, **_kwargs: None).run(full_pipeline=False)
+        job = workspace.read_job(conversion_id)
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "voice_plan_sha256": "b" * 64})
+        monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        with pytest.raises(ManifestError, match="voice plan"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *_args, **_kwargs: None).run(full_pipeline=False)
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "speaker_analysis_sha256": "c" * 64})
+        with pytest.raises(ManifestError, match="speaker analysis"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *_args, **_kwargs: None).run(full_pipeline=False)
+        draft = {**voice_plan, "approval": {**voice_plan["approval"], "state": "draft", "approved_at": None, "approved_revision": None}}
+        atomic_write_json(workspace.conversion_path(conversion_id) / "voice-plan.json", with_canonical_artifact_hash(draft))
+        monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        with pytest.raises(ManifestError, match="approved voice plan"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *_args, **_kwargs: None).run(full_pipeline=False)
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_semantic_reuse_rewrites_current_manifest_and_rejects_bad_audio(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); revision = ["a" * 64]; monkeypatch.setattr(worker_module, "registry_revision", lambda: revision[0])
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts, revision[0])
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        worker = ConversionWorker(workspace, conversion_id, engine_factory=factory); assert worker.run(full_pipeline=False).status == "completed"
+        previous = workspace.read_job(conversion_id); paths = [workspace.conversion_path(conversion_id) / r["relative_path"] for r in previous["completed_chunks"]]
+        revised_plan = with_canonical_artifact_hash({**voice_plan, "revision": 2, "approval": {**voice_plan["approval"], "approved_revision": 2}})
+        workspace.persist_voice_plan(conversion_id, revised_plan); atomic_write_json(workspace.job_path(conversion_id), {**previous, "status": "cancelled", "stage": "cancelled", "worker": None})
+        revision[0] = "b" * 64; _configure_v5(workspace, conversion_id, text, revised_plan, facts, tts, revision[0]); made.clear()
+        assert worker.run(full_pipeline=False).attempts == 0 and not made
+        current = workspace.read_job(conversion_id); assert all(record["input_hash"] == chunk.input_hash for record, chunk in zip(current["completed_chunks"], worker._planned_chunks(current)))
+        tampered_records = [{**current["completed_chunks"][0], "wav_sha256": "0" * 64}, *current["completed_chunks"][1:]]
+        atomic_write_json(workspace.job_path(conversion_id), {**current, "status": "cancelled", "stage": "cancelled", "worker": None, "completed_chunks": tampered_records, "progress": {"completed": 3, "current": 3, "total": 3}})
+        paths[0].write_bytes(b"bad")
+        _configure_v5(workspace, conversion_id, text, revised_plan, facts, tts, revision[0]); made.clear(); assert worker.run(full_pipeline=False).attempts == 1 and len(made) == 1
+    finally: shutil.rmtree(root, ignore_errors=True)
 
 
 def test_fake_worker_resumes_without_rewriting_completed_chunk() -> None:

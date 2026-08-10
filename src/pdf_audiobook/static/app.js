@@ -17,6 +17,8 @@
   let pollTimer = null;
   let elapsedTimer = null;
   let activePreview = null;
+  let activePreviewButton = null;
+  let activePreviewStatus = null;
   let previewRequest = 0;
   let recoveredState = null;
   let recoveredRoute = false;
@@ -40,9 +42,14 @@
     const range = currentChapterRange();
     controls.forEach((control) => control?.setAttribute("aria-invalid", range.valid ? "false" : "true"));
     const target = document.querySelector("#chapter-range-status");
+    const chapterTitle = (index) => {
+      const title = chapterPlan?.chapters?.[index - 1]?.title;
+      return typeof title === "string" && title.trim() ? title.trim() : `Chapter ${index}`;
+    };
     if (!range.total) target.textContent = "Select an inclusive chapter range after generating a plan.";
     else if (!range.valid) target.textContent = `Choose an inclusive range from 1 through ${range.total}.`;
-    else target.textContent = `${range.end - range.start + 1} chapter${range.end - range.start === 0 ? "" : "s"} selected (inclusive).`;
+    else if (range.start === range.end) target.textContent = `${chapterTitle(range.start)} selected (inclusive).`;
+    else target.textContent = `${range.end - range.start + 1} chapters selected: ${chapterTitle(range.start)} through ${chapterTitle(range.end)} (inclusive).`;
     const ready = Boolean(chapterPlan && planMatchesSelection(chapterPlan) && range.valid && !planRequestInFlight);
     document.querySelector(".next").disabled = !ready;
     return range;
@@ -216,6 +223,7 @@
     finally {
       planRequestInFlight = false; setPlanControlsDisabled(false);
       if (chapterPlan && planMatchesSelection(chapterPlan)) { document.querySelector("#save-labels").disabled = !labelsDirty; document.querySelector(".next").disabled = false; }
+      if (interactiveMode) { interactive("#start-voice-analysis").disabled = !chapterPlan; interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis."; updateInteractiveReadiness(); }
     }
   };
 
@@ -245,12 +253,13 @@
   };
 
   const setGenerationControlsDisabled = (disabled) => {
-    document.querySelectorAll("#view-configure input, #view-configure button").forEach((control) => { control.disabled = disabled; });
+    document.querySelectorAll("#view-configure input, #view-configure button, #view-configure select").forEach((control) => { control.disabled = disabled; });
     setPlanControlsDisabled(disabled);
     if (!disabled) {
       const active = activeGenerationStates.has(recoveredState);
       document.querySelector("#start-generation").disabled = active || !chapterPlan || !planMatchesSelection(chapterPlan) || !currentChapterRange().valid;
       document.querySelector("#save-labels").disabled = active || !labelsDirty;
+      if (interactiveMode) updateInteractiveReadiness();
     }
   };
 
@@ -303,7 +312,11 @@
 
   const applyStatus = (body) => {
     conversionId = body.conversion_id || conversionId;
-    setStructuralPlanLocked(body.job?.schema_version === 4);
+    if (body.job?.mode === "interactive_voices") {
+      const modeControl = document.querySelector('input[name="voice-mode"][value="interactive_voices"]');
+      if (modeControl && !modeControl.checked) { modeControl.checked = true; setInteractiveMode(true); }
+    }
+    setStructuralPlanLocked(body.job?.schema_version === 4 || body.job?.schema_version === 5);
     if (body.analysis) renderAnalysis(body.analysis);
     if (body.chapter_plan) renderPlan(body.chapter_plan);
     const recordedSettings = body.job?.tts?.settings || {};
@@ -365,6 +378,7 @@
   };
 
   const startGeneration = async () => {
+    if (interactiveMode) { await startInteractiveGeneration(); return; }
     if (generationRequestInFlight || activeGenerationStates.has(recoveredState) || !chapterPlan || !planMatchesSelection(chapterPlan)) return;
     const range = updateChapterRange();
     if (!range.valid) { document.querySelector("#generation-status").textContent = "Choose a valid inclusive chapter range before generating."; return; }
@@ -379,16 +393,64 @@
     finally { generationRequestInFlight = false; if (!pollTimer) setGenerationControlsDisabled(false); }
   };
 
-  const stopPreview = () => { previewRequest += 1; if (activePreview) { activePreview.pause(); activePreview.currentTime = 0; activePreview = null; } document.querySelectorAll(".preview-voice").forEach((button) => { button.textContent = "Preview"; }); };
-  const previewVoice = async (voice, button) => {
-    stopPreview(); button.textContent = "Loading..."; document.querySelector("#preview-status").textContent = `Loading ${voice} preview...`;
+  const previewStatusFor = (button, statusTarget) => statusTarget || button?.closest(".cast-entry")?.querySelector(".interactive-preview-status") || document.querySelector("#preview-status");
+  const stopPreview = (statusTarget) => {
+    const stoppedStatus = activePreviewStatus || statusTarget;
+    previewRequest += 1;
+    if (activePreview) { activePreview.pause(); activePreview.currentTime = 0; activePreview = null; }
+    activePreviewButton = null;
+    activePreviewStatus = null;
+    document.querySelectorAll(".preview-voice").forEach((button) => { button.textContent = "Preview"; });
+    if (stoppedStatus) stoppedStatus.textContent = "Stopped.";
+  };
+  const previewVoice = (voice, button, statusTarget) => {
+    stopPreview();
+    const targetStatus = previewStatusFor(button, statusTarget);
+    activePreviewButton = button;
+    activePreviewStatus = targetStatus;
+    button.textContent = "Loading...";
+    if (targetStatus) targetStatus.textContent = `Loading ${voice} preview...`;
     const requestId = previewRequest;
+    let audio;
     try {
-      activePreview = new Audio(`/api/voice-preview/${encodeURIComponent(voice)}`);
-      activePreview.addEventListener("error", () => { if (requestId === previewRequest) { stopPreview(); document.querySelector("#preview-status").textContent = "Preview unavailable: the local preview file could not be loaded. Generation is still available."; } }, { once: true });
-      button.textContent = "Stop preview"; document.querySelector("#preview-status").textContent = `${voice} preview playing.`;
-      activePreview.addEventListener("ended", stopPreview, { once: true }); await activePreview.play();
-    } catch (error) { stopPreview(); document.querySelector("#preview-status").textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`; }
+      audio = new Audio(`/api/voice-preview/${encodeURIComponent(voice)}`);
+    } catch (error) {
+      if (requestId !== previewRequest) return;
+      stopPreview(targetStatus);
+      if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
+      return;
+    }
+    if (requestId !== previewRequest) { audio.pause(); return; }
+    activePreview = audio;
+    audio.addEventListener("error", () => {
+      if (requestId !== previewRequest) return;
+      stopPreview(targetStatus);
+      if (targetStatus) targetStatus.textContent = "Preview unavailable: the local preview file could not be loaded. Generation is still available.";
+    }, { once: true });
+    button.textContent = "Stop preview";
+    if (targetStatus) targetStatus.textContent = `${voice} preview playing.`;
+    audio.addEventListener("ended", () => {
+      if (requestId !== previewRequest) return;
+      activePreview = null;
+      activePreviewButton = null;
+      activePreviewStatus = null;
+      button.textContent = "Preview";
+      if (targetStatus) targetStatus.textContent = "Finished.";
+    }, { once: true });
+    try {
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch((error) => {
+          if (requestId !== previewRequest) return;
+          stopPreview(targetStatus);
+          if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
+        });
+      }
+    } catch (error) {
+      if (requestId !== previewRequest) return;
+      stopPreview(targetStatus);
+      if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
+    }
   };
 
   const openOutput = async (target) => {
@@ -410,6 +472,7 @@
       if (!response.ok) throw new Error("Status is temporarily unavailable.");
       const body = await response.json();
       applyStatus(body);
+      await restoreInteractiveRecovery(body);
       if (activeGenerationStates.has(recoveredState)) startPolling();
       return recoveredState !== "no_active";
     } catch (_) {
@@ -438,8 +501,236 @@
     }
   };
 
+  let interactiveMode = false;
+  let voiceCatalog = [];
+  let voicePlan = null;
+  let voicePlanRevision = null;
+  let voiceAnalysis = null;
+  let voiceAnalysisPollTimer = null;
+  let spanOffset = 0;
+  let spanTotal = 0;
+
+  const interactive = (selector) => document.querySelector(selector);
+  const interactiveError = async (response) => {
+    const error = await readError(response);
+    return new Error(`${error.code}: ${error.message}`);
+  };
+
+  const updateInteractiveReadiness = () => {
+    const accepted = Boolean(interactive("#accept-narrator-fallback")?.checked);
+    const unresolved = Number(voicePlan?.review?.unresolved_count || 0);
+    const approved = voicePlan?.approval?.state === "approved";
+    const canApprove = Boolean(voicePlan && !approved && (!unresolved || accepted));
+    if (interactive("#approve-voice-plan")) interactive("#approve-voice-plan").disabled = !canApprove;
+    const range = currentChapterRange();
+    const ready = Boolean(interactiveMode && approved && range.valid && !generationRequestInFlight && !planRequestInFlight);
+    document.querySelector("#start-generation").disabled = !ready;
+    return ready;
+  };
+
+  const setInteractiveMode = (enabled) => {
+    interactiveMode = enabled;
+    interactive("#interactive-entry").hidden = !enabled;
+    interactive("#interactive-review").hidden = !enabled;
+    interactive("#single-voice-controls").hidden = enabled;
+    interactive("#interactive-generation-context").hidden = !enabled;
+    if (enabled) {
+      interactive("#start-voice-analysis").disabled = !chapterPlan || planRequestInFlight;
+      interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis.";
+      updateInteractiveReadiness();
+    } else {
+      document.querySelector("#start-generation").disabled = !chapterPlan || !planMatchesSelection(chapterPlan) || !currentChapterRange().valid;
+    }
+  };
+
+  const renderAnalysisProgress = (body) => {
+    const progress = body.progress || {};
+    const completed = Number(progress.completed || 0);
+    const total = Number(progress.total || 0);
+    const percent = total > 0 ? Math.min(100, Math.round(completed / total * 100)) : body.status === "completed" ? 100 : 0;
+    interactive("#interactive-analysis-stage").textContent = String(body.stage || body.status || "queued").replaceAll("_", " ");
+    interactive("#interactive-analysis-percent").textContent = `${percent}%`;
+    interactive("#interactive-analysis-bar").setAttribute("aria-valuenow", String(percent));
+    interactive("#interactive-analysis-bar span").style.width = `${percent}%`;
+    interactive("#interactive-analysis-progress").hidden = false;
+    interactive("#cancel-voice-analysis").disabled = !body.cancelable;
+    const message = body.error?.message || (body.status === "completed" ? "Analysis complete. Preparing a reviewable voice plan." : body.status === "cancelled" ? "Voice analysis was cancelled. You can start it again when ready." : `Voice analysis ${body.status || "is running"}.`);
+    interactive("#interactive-analysis-status").textContent = message;
+  };
+
+  const stopVoiceAnalysisPolling = () => { if (voiceAnalysisPollTimer) { clearTimeout(voiceAnalysisPollTimer); voiceAnalysisPollTimer = null; } };
+
+  const loadVoices = async () => {
+    if (voiceCatalog.length) return voiceCatalog;
+    const response = await fetch("/api/voices");
+    if (!response.ok) throw await interactiveError(response);
+    const body = await response.json();
+    voiceCatalog = Array.isArray(body.voices) ? body.voices.filter((entry) => entry && entry.enabled !== false) : [];
+    if (!voiceCatalog.length) throw new Error("VOICE_CATALOG_EMPTY: no local voices are available.");
+    return voiceCatalog;
+  };
+
+  const voiceOptions = (selected) => voiceCatalog.map((entry) => {
+    const option = document.createElement("option");
+    const label = entry.display_label || entry.display_name || entry.label || entry.name || entry.id;
+    const description = typeof entry.description === "string" && entry.description.trim() ? ` - ${entry.description.trim()}` : "";
+    option.value = entry.id; option.textContent = `${label}${description}`; option.selected = entry.id === selected; return option;
+  });
+
+  const mutateVoicePlan = async (endpoint, payload) => {
+    const response = await fetch(endpoint, { method: endpoint === "/api/voice-plan" ? "PUT" : "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify(payload) });
+    if (!response.ok) throw await interactiveError(response);
+    const body = await response.json();
+    voicePlanRevision = body.revision || voicePlanRevision;
+    await loadVoicePlan();
+    return body;
+  };
+
+  const renderCast = () => {
+    const target = interactive("#interactive-cast"); target.replaceChildren();
+    (voicePlan?.cast || []).forEach((entry) => {
+      const article = document.createElement("article"); article.className = "cast-entry";
+      const header = document.createElement("div"); header.className = "cast-entry-header";
+      const title = document.createElement("strong"); title.textContent = entry.display_label; header.append(title);
+      const meta = document.createElement("small"); meta.textContent = `${entry.role || "character"} · ${entry.relationship || "third_person"}`; header.append(meta); article.append(header);
+      const fields = document.createElement("div"); fields.className = "cast-fields";
+      const nameLabel = document.createElement("label"); nameLabel.textContent = "Name"; const name = document.createElement("input"); name.type = "text"; name.value = entry.display_label; name.maxLength = 512; name.setAttribute("aria-label", `${entry.display_label} display name`); nameLabel.append(name); fields.append(nameLabel);
+      const voiceField = document.createElement("div"); voiceField.className = "cast-voice-field";
+      const voiceLabel = document.createElement("label"); voiceLabel.textContent = "Voice"; const voice = document.createElement("select"); voice.setAttribute("aria-label", `${entry.display_label} voice`); voiceOptions(entry.voice_id).forEach((option) => voice.append(option)); voiceLabel.append(voice); voiceField.append(voiceLabel);
+      const previewControls = document.createElement("span"); previewControls.className = "cast-preview";
+      const preview = document.createElement("button"); preview.className = "preview-voice interactive-preview"; preview.type = "button"; preview.textContent = "Preview"; preview.setAttribute("aria-label", `Preview ${entry.display_label} voice`);
+      const previewStatus = document.createElement("span"); previewStatus.className = "status interactive-preview-status"; previewStatus.setAttribute("role", "status"); previewStatus.setAttribute("aria-live", "polite"); previewStatus.textContent = "";
+      preview.addEventListener("click", () => { if (preview.textContent === "Stop preview") stopPreview(previewStatus); else previewVoice(voice.value, preview, previewStatus); });
+      voice.addEventListener("change", () => { if (activePreviewButton === preview) stopPreview(previewStatus); });
+      previewControls.append(preview, previewStatus); voiceField.append(previewControls); fields.append(voiceField);
+      const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed); fields.append(speedLabel);
+      article.append(fields);
+      const relationshipActions = document.createElement("div"); relationshipActions.className = "cast-action-row cast-primary-actions";
+      const relationshipLabel = document.createElement("label"); relationshipLabel.className = "cast-relationship-label"; relationshipLabel.textContent = "Relationship";
+      const relationship = document.createElement("select"); relationship.setAttribute("aria-label", `${entry.display_label} relationship`); ["third_person", "same_as_narrator", "separate_from_narrator"].forEach((value) => { const option = document.createElement("option"); option.value = value; option.textContent = value.replaceAll("_", " "); option.selected = value === entry.relationship; relationship.append(option); }); relationshipLabel.append(relationship); relationshipActions.append(relationshipLabel);
+      const save = document.createElement("button"); save.className = "secondary cast-save"; save.type = "button"; save.textContent = "Save cast"; save.addEventListener("click", async () => { save.disabled = true; interactive("#interactive-plan-status").textContent = "Saving cast changes..."; try { await mutateVoicePlan("/api/voice-plan", { expected_revision: voicePlanRevision, cast_id: entry.cast_id, display_label: name.value.trim(), voice_id: voice.value, speed: Number(speed.value), relationship: relationship.value }); interactive("#interactive-plan-status").textContent = "Cast changes saved."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; } finally { save.disabled = false; } }); relationshipActions.append(save); article.append(relationshipActions);
+      if (entry.role === "character") {
+        const characters = (voicePlan?.cast || []).filter((candidate) => candidate.role === "character" && candidate.cast_id !== entry.cast_id);
+        const mergeLabel = document.createElement("label"); mergeLabel.textContent = "Merge into";
+        const mergeTarget = document.createElement("select"); mergeTarget.className = "cast-merge-target"; mergeTarget.setAttribute("aria-label", `Merge ${entry.display_label} into`);
+        characters.forEach((candidate) => { const option = document.createElement("option"); option.value = candidate.cast_id; option.textContent = candidate.display_label || candidate.cast_id; mergeTarget.append(option); });
+        const merge = document.createElement("button"); merge.className = "secondary cast-merge"; merge.type = "button"; merge.textContent = "Merge"; merge.disabled = !characters.length; merge.addEventListener("click", async () => { const targetId = mergeTarget.value; if (!targetId || !window.confirm(`Merge ${entry.display_label} into ${characters.find((candidate) => candidate.cast_id === targetId)?.display_label || targetId}?`)) return; merge.disabled = true; try { await mutateVoicePlan("/api/voice-plan/cast/merge", { expected_revision: voicePlanRevision, source_cast_id: entry.cast_id, target_cast_id: targetId }); interactive("#interactive-plan-status").textContent = `${entry.display_label} merged into the selected voice.`; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; merge.disabled = false; } });
+        const remove = document.createElement("button"); remove.className = "secondary cast-remove"; remove.type = "button"; remove.textContent = "Remove voice"; remove.addEventListener("click", async () => { if (!window.confirm(`Remove ${entry.display_label}? Its attributed lines will use Narrator.`)) return; remove.disabled = true; try { await mutateVoicePlan("/api/voice-plan/cast/remove", { expected_revision: voicePlanRevision, cast_id: entry.cast_id }); interactive("#interactive-plan-status").textContent = `${entry.display_label} removed; its lines now use Narrator.`; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; remove.disabled = false; } });
+        mergeLabel.append(mergeTarget);
+        const characterActions = document.createElement("div"); characterActions.className = "cast-action-row cast-character-actions"; characterActions.append(mergeLabel, merge, remove);
+        article.append(characterActions);
+      }
+      target.append(article);
+    });
+    if (!target.children.length) target.textContent = "No cast entries are available yet.";
+  };
+
+  const renderAliasRows = () => {
+    const target = interactive("#interactive-aliases"); target.replaceChildren();
+    const aliases = Array.isArray(voicePlan?.aliases) ? voicePlan.aliases : [];
+    aliases.forEach((alias) => {
+      const article = document.createElement("article"); article.className = "alias-entry";
+      const label = document.createElement("span"); label.textContent = `${alias.text} → ${(voicePlan?.cast || []).find((entry) => entry.cast_id === alias.character_id)?.display_label || alias.character_id}`; article.append(label);
+      const actions = document.createElement("div"); actions.className = "alias-actions";
+      const merge = document.createElement("button"); merge.className = "secondary"; merge.type = "button"; merge.textContent = "Merge"; merge.addEventListener("click", async () => { const targetId = window.prompt("Merge this alias into cast ID:", alias.character_id); if (!targetId) return; try { await mutateVoicePlan("/api/voice-plan/aliases/merge", { expected_revision: voicePlanRevision, target_character_id: targetId, alias_ids: [alias.alias_id] }); interactive("#interactive-plan-status").textContent = "Alias merged."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; } }); actions.append(merge);
+      const split = document.createElement("button"); split.className = "secondary"; split.type = "button"; split.textContent = "Split"; split.addEventListener("click", async () => { const labelText = window.prompt("New cast label:", alias.text); if (!labelText) return; try { await mutateVoicePlan("/api/voice-plan/aliases/split", { expected_revision: voicePlanRevision, alias_ids: [alias.alias_id], display_label: labelText }); interactive("#interactive-plan-status").textContent = "Alias split into a new cast entry."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; } }); actions.append(split); article.append(actions); target.append(article);
+    });
+    if (!target.children.length) target.textContent = "No aliases detected.";
+  };
+
+  const renderAliases = () => {
+    const target = interactive("#interactive-aliases");
+    const disclosure = interactive("#interactive-aliases-disclosure");
+    const aliases = Array.isArray(voicePlan?.aliases) ? voicePlan.aliases : [];
+    const suppliedCount = voicePlan?.alias_count;
+    const numericCount = Number(suppliedCount);
+    const aliasCount = suppliedCount !== null && suppliedCount !== undefined && Number.isFinite(numericCount) && numericCount >= 0 ? Math.floor(numericCount) : aliases.length;
+    const truncated = voicePlan?.aliases_truncated === true;
+    const summary = interactive("#interactive-aliases-summary");
+    summary.textContent = aliasCount === 0
+      ? "No aliases detected"
+      : `${aliasCount} alias${aliasCount === 1 ? "" : "es"}${truncated ? " (only the loaded subset is shown when expanded)" : ""}`;
+    target.replaceChildren();
+    if (disclosure?.open) renderAliasRows();
+  };
+
+  const renderSpan = (span) => {
+    const article = document.createElement("article"); article.className = "span-entry";
+    const meta = document.createElement("div"); meta.className = "span-meta"; const left = document.createElement("span"); left.textContent = `Chapter ${span.chapter_index} · ${span.type}`; const right = document.createElement("span"); right.textContent = `${span.confidence?.band || "unknown"} confidence`; meta.append(left, right); article.append(meta);
+    const excerpt = document.createElement("p"); excerpt.className = "span-excerpt"; excerpt.textContent = span.excerpt || "(No excerpt available)"; article.append(excerpt);
+    const form = document.createElement("div"); form.className = "span-override";
+    const kindLabel = document.createElement("label"); kindLabel.textContent = "Override"; const kind = document.createElement("select"); kind.setAttribute("aria-label", `Override kind for span ${span.span_id}`); [["speaker", "Speaker"], ["type", "Span type"]].forEach(([value, label]) => { const option = document.createElement("option"); option.value = value; option.textContent = label; option.selected = value === "speaker"; kind.append(option); }); kindLabel.append(kind); form.append(kindLabel);
+    const toLabel = document.createElement("label"); toLabel.textContent = "To"; const to = document.createElement("select"); to.setAttribute("aria-label", `Override value for span ${span.span_id}`); const fillTo = () => { to.replaceChildren(); const values = kind.value === "speaker" ? (voicePlan?.cast || []).map((entry) => [entry.cast_id, entry.display_label]) : [["narration", "Narration"], ["dialogue", "Dialogue"], ["thought", "Thought"], ["unknown", "Unknown"]]; values.forEach(([value, label]) => { const option = document.createElement("option"); option.value = value; option.textContent = label; option.selected = value === (kind.value === "speaker" ? span.speaker_id : span.type); to.append(option); }); }; kind.addEventListener("change", fillTo); fillTo(); toLabel.append(to); form.append(toLabel);
+    const reasonLabel = document.createElement("label"); reasonLabel.textContent = "Reason"; const reason = document.createElement("input"); reason.type = "text"; reason.placeholder = "Why this is clearer"; reason.setAttribute("aria-label", `Reason for span ${span.span_id} override`); reasonLabel.append(reason); form.append(reasonLabel);
+    const save = document.createElement("button"); save.className = "secondary"; save.type = "button"; save.textContent = "Apply"; save.addEventListener("click", async () => { if (!reason.value.trim()) { interactive("#span-filter-status").textContent = "Add a reason before applying a span override."; reason.focus(); return; } save.disabled = true; try { await mutateVoicePlan("/api/voice-plan/spans/override", { expected_revision: voicePlanRevision, span_id: span.span_id, kind: kind.value, to: to.value, reason: reason.value.trim() }); interactive("#span-filter-status").textContent = "Span override saved."; } catch (error) { interactive("#span-filter-status").textContent = error.message; } finally { save.disabled = false; } }); form.append(save); article.append(form); return article;
+  };
+
+  const renderSpans = (spans, total, hasMore, append = false) => {
+    const target = interactive("#interactive-spans"); if (!append) target.replaceChildren(); (spans || []).forEach((span) => target.append(renderSpan(span))); spanTotal = total || 0; interactive("#load-more-spans").hidden = !hasMore; interactive("#span-filter-status").textContent = `${target.children.length} of ${spanTotal} speaker span${spanTotal === 1 ? "" : "s"} shown.`;
+  };
+
+  const loadVoicePlan = async (append = false) => {
+    const chapter = interactive("#span-chapter-filter").value; const confidence = interactive("#span-confidence-filter").value; const params = new URLSearchParams({ limit: "100", offset: String(append ? spanOffset : 0) }); if (chapter) params.set("chapter", chapter); if (confidence) params.set("confidence", confidence);
+    const response = await fetch(`/api/voice-plan?${params.toString()}`); if (!response.ok) throw await interactiveError(response); const body = await response.json(); voicePlan = body; voicePlanRevision = body.revision; if (!append) { spanOffset = 0; renderCast(); renderAliases(); const chapters = [...new Set((chapterPlan?.chapters || []).map((entry) => entry.index))]; const select = interactive("#span-chapter-filter"); const selected = select.value; select.replaceChildren(); const all = document.createElement("option"); all.value = ""; all.textContent = "All chapters"; select.append(all); chapters.forEach((index) => { const option = document.createElement("option"); option.value = String(index); option.textContent = `Chapter ${index}`; option.selected = String(index) === selected; select.append(option); }); }
+    spanOffset = Number(body.offset || 0) + (body.spans || []).length; renderSpans(body.spans, body.total, body.has_more, append); updateInteractiveReadiness(); return body;
+  };
+
+  const draftVoicePlan = async (revision) => {
+    interactive("#interactive-analysis-status").textContent = "Analysis complete. Drafting the reviewable voice plan...";
+    const response = await fetch("/api/voice-plan/draft", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ analysis_revision: revision }) });
+    if (!response.ok) throw await interactiveError(response); const body = await response.json(); voicePlanRevision = body.revision; await loadVoicePlan(); interactive("#interactive-editor").hidden = false; interactive("#interactive-analysis-status").textContent = "Voice plan ready for review.";
+  };
+
+  const pollVoiceAnalysis = async () => {
+    try {
+      const response = await fetch("/api/voice-analysis/status"); if (!response.ok) throw await interactiveError(response); const body = await response.json(); voiceAnalysis = body; renderAnalysisProgress(body);
+      if (body.status === "completed") { stopVoiceAnalysisPolling(); try { await draftVoicePlan(body.revision); } catch (error) { interactive("#interactive-analysis-status").textContent = error.message || "The voice plan could not be drafted."; } }
+      else if (body.status === "cancelled" || body.status === "failed") stopVoiceAnalysisPolling();
+      else voiceAnalysisPollTimer = setTimeout(pollVoiceAnalysis, 1200);
+    } catch (error) { interactive("#interactive-analysis-status").textContent = error.message || "Voice analysis status is unavailable."; voiceAnalysisPollTimer = setTimeout(pollVoiceAnalysis, 3000); }
+  };
+
+  const startVoiceAnalysis = async () => {
+    if (!chapterPlan || planRequestInFlight) { interactive("#interactive-entry-status").textContent = "Generate a chapter plan before starting voice analysis."; return; }
+    const button = interactive("#start-voice-analysis"); button.disabled = true; interactive("#interactive-entry-status").textContent = "Loading available local voices...";
+    try { await loadVoices(); const response = await fetch("/api/voice-analysis", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ mode: "interactive" }) }); if (!response.ok) throw await interactiveError(response); voiceAnalysis = await response.json(); interactive("#interactive-editor").hidden = true; renderAnalysisProgress(voiceAnalysis); pollVoiceAnalysis(); } catch (error) { interactive("#interactive-entry-status").textContent = error.message || "Interactive voice analysis could not start."; button.disabled = false; }
+  };
+
+  const cancelVoiceAnalysis = async () => {
+    if (!voiceAnalysis?.analysis_id || !voiceAnalysis?.revision) return;
+    const button = interactive("#cancel-voice-analysis"); button.disabled = true; interactive("#interactive-analysis-status").textContent = "Requesting voice analysis cancellation...";
+    try { const response = await fetch("/api/voice-analysis/cancel", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ analysis_id: voiceAnalysis.analysis_id, revision: voiceAnalysis.revision }) }); if (!response.ok) throw await interactiveError(response); voiceAnalysis = await response.json(); renderAnalysisProgress(voiceAnalysis); pollVoiceAnalysis(); } catch (error) { interactive("#interactive-analysis-status").textContent = error.message || "Voice analysis cancellation failed."; button.disabled = false; }
+  };
+
+  const approveVoicePlan = async () => {
+    const accepted = Boolean(interactive("#accept-narrator-fallback").checked); const unresolved = Number(voicePlan?.review?.unresolved_count || 0); if (unresolved && !accepted) { interactive("#interactive-approval-status").textContent = "Review unresolved spans and explicitly accept Narrator as their fallback."; return; }
+    const button = interactive("#approve-voice-plan"); button.disabled = true; interactive("#interactive-approval-status").textContent = "Approving voice plan...";
+    try { const response = await fetch("/api/voice-plan/approve", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ expected_revision: voicePlanRevision, accept_narrator_fallback: accepted }) }); if (!response.ok) throw await interactiveError(response); const body = await response.json(); voicePlanRevision = body.revision; await loadVoicePlan(); interactive("#interactive-approval-status").textContent = "Voice plan approved. Choose the chapter range and start generation."; updateInteractiveReadiness(); } catch (error) { interactive("#interactive-approval-status").textContent = error.message || "Voice plan approval failed."; updateInteractiveReadiness(); }
+  };
+
+  const startInteractiveGeneration = async () => {
+    const range = updateChapterRange(); if (!range.valid) { interactive("#generation-status").textContent = "Choose a valid inclusive chapter range before generating."; return; } if (voicePlan?.approval?.state !== "approved") { interactive("#generation-status").textContent = "Approve the Interactive Voices plan before generating."; return; }
+    generationRequestInFlight = true; setGenerationControlsDisabled(true); interactive("#generation-status").textContent = "Preparing Interactive Voices generation...";
+    try { const performance_mode = document.querySelector("input[name=performance-mode]:checked").value; const response = await fetch("/api/generation/start", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ mode: "interactive_voices", voice_plan_sha256: voicePlan.canonical_artifact_sha256, voice_plan_revision: voicePlan.revision, chapter_start: range.start, chapter_end: range.end, performance_mode }) }); if (!response.ok) throw await interactiveError(response); const body = await response.json(); conversionId = body.conversion_id || conversionId; applyStatus({ ...body, state: "starting" }); show("progress"); startPolling(); } catch (error) { interactive("#generation-status").textContent = error.message || "Interactive Voices generation could not start."; } finally { generationRequestInFlight = false; if (!pollTimer) setGenerationControlsDisabled(false); }
+  };
+
+  const restoreInteractiveRecovery = async (body) => {
+    if (body?.job?.mode !== "interactive_voices") return;
+    setInteractiveMode(true);
+    try {
+      await loadVoices();
+      await loadVoicePlan();
+      interactive("#interactive-editor").hidden = false;
+      interactive("#interactive-analysis-status").textContent = "Recovered Interactive Voices plan. Review the saved cast before continuing.";
+      updateInteractiveReadiness();
+    } catch (error) {
+      interactive("#interactive-editor").hidden = false;
+      interactive("#interactive-analysis-status").textContent = error.message || "Saved Interactive Voices review could not be restored.";
+    }
+  };
+
   const loadStatus = async () => {
-    try { const response = await fetch("/api/status"); if (!response.ok) return; const body = await response.json(); applyStatus(body); }
+    try { const response = await fetch("/api/status"); if (!response.ok) return; const body = await response.json(); applyStatus(body); await restoreInteractiveRecovery(body); }
     catch (_) { /* The shell remains usable if status is unavailable. */ }
   };
 
@@ -452,13 +743,23 @@
   drop.addEventListener("dragover", (event) => { event.preventDefault(); }); drop.addEventListener("drop", (event) => { event.preventDefault(); chosen(event.dataTransfer.files[0]); });
   document.querySelectorAll("input[name=plan-mode]").forEach((control) => control.addEventListener("change", () => { const mode = control.value; document.querySelector(".custom-count").hidden = mode !== "custom"; if (mode === "custom") { invalidatePlan("Choose a count from 2–50, then select Generate plan."); return; } runPlanRequest(mode); }));
   document.querySelector("#chapter-count").addEventListener("input", () => { if (currentPlanSpec().mode === "custom") invalidatePlan("Choose a count from 2–50, then select Generate plan."); });
-  document.querySelectorAll("#chapter-start, #chapter-end").forEach((control) => control.addEventListener("input", updateChapterRange));
+  document.querySelectorAll("#chapter-start, #chapter-end").forEach((control) => control.addEventListener("input", () => { updateChapterRange(); updateInteractiveReadiness(); }));
   document.querySelector("#regenerate-plan").addEventListener("click", async () => { const selection = currentPlanSpec(); await runPlanRequest(selection.mode, selection.mode === "custom" ? selection.count : undefined); });
   document.querySelector("#save-labels").addEventListener("click", () => saveLabels()); document.querySelector("#start-generation").addEventListener("click", startGeneration);
   document.querySelectorAll("input[name=voice]").forEach((control) => control.addEventListener("change", () => { document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector("input").checked)); }));
   document.querySelectorAll(".preview-voice").forEach((button) => button.addEventListener("click", () => { if (button.textContent === "Stop preview") stopPreview(); else previewVoice(button.dataset.voice, button); }));
   document.querySelector("#speed").addEventListener("input", (event) => { document.querySelector("#speed-value").textContent = `${Number(event.target.value).toFixed(1)}x`; });
   document.querySelector("#cancel-generation").addEventListener("click", () => cancelGeneration(document.querySelector("#cancel-generation"), document.querySelector("#progress-status")));
+  document.querySelectorAll('input[name="voice-mode"]').forEach((control) => control.addEventListener("change", () => setInteractiveMode(control.value === "interactive_voices")));
+  document.querySelector("#start-voice-analysis").addEventListener("click", startVoiceAnalysis);
+  document.querySelector("#cancel-voice-analysis").addEventListener("click", cancelVoiceAnalysis);
+  document.querySelector("#approve-voice-plan").addEventListener("click", approveVoicePlan);
+  document.querySelector("#accept-narrator-fallback").addEventListener("change", updateInteractiveReadiness);
+  document.querySelector("#reload-voice-plan").addEventListener("click", async () => { try { await loadVoices(); await loadVoicePlan(); interactive("#interactive-plan-status").textContent = "Voice plan refreshed."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message || "Voice plan could not be refreshed."; } });
+  const aliasDisclosure = document.querySelector("#interactive-aliases-disclosure");
+  aliasDisclosure.addEventListener("toggle", () => { if (aliasDisclosure.open) renderAliasRows(); else interactive("#interactive-aliases").replaceChildren(); });
+  ["#span-chapter-filter", "#span-confidence-filter"].forEach((selector) => document.querySelector(selector).addEventListener("change", async () => { spanOffset = 0; try { await loadVoicePlan(); } catch (error) { interactive("#span-filter-status").textContent = error.message || "Speaker spans could not be loaded."; } }));
+  document.querySelector("#load-more-spans").addEventListener("click", async () => { try { await loadVoicePlan(true); } catch (error) { interactive("#span-filter-status").textContent = error.message || "More speaker spans could not be loaded."; } });
   document.querySelector("#view-current-job").addEventListener("click", () => refreshCurrentJob("Current job status could not be refreshed."));
   document.querySelector("#cancel-current-generation").addEventListener("click", () => cancelGeneration(document.querySelector("#cancel-current-generation"), document.querySelector("#existing-message")));
   document.querySelector("#open-audiobook").addEventListener("click", () => openOutput("audiobook")); document.querySelector("#open-folder").addEventListener("click", () => openOutput("folder"));

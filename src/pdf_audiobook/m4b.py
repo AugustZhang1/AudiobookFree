@@ -18,8 +18,9 @@ from typing import Any, Callable, Iterable
 
 from .audio import validate_wav
 from .chapters import select_chapter_range
-from .tts import EngineMetadata, plan_chunks
-from .workspace import Workspace, atomic_write_text
+from .tts import EngineMetadata, plan_chunks, plan_interactive_chunks
+from .voice_registry import get_generation_facts, registry_revision
+from .workspace import INTERACTIVE_GENERATION_SCHEMA_VERSION, Workspace, atomic_write_text
 
 ORDINARY_PAUSE_MS = 150
 PARAGRAPH_PAUSE_MS = 400
@@ -134,14 +135,54 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
     text, _ = workspace.load_cleaned_artifacts(conversion_id)
     plan = workspace.load_chapter_plan(conversion_id)
     tts = job["tts"]
-    metadata = EngineMetadata(
-        str(tts["engine"]), str(tts.get("package_version", "")), str(tts.get("model", "")),
-        str(tts.get("model_revision", "")), str(tts.get("model_checksum", "")), str(tts["voice"]),
-        str(tts.get("voice_version", "")), str(tts.get("voice_checksum", "")), int(tts["sample_rate"]),
-        dict(tts.get("settings", {})),
-    )
-    chapters = select_chapter_range(plan, metadata.settings.get("chapter_start"), metadata.settings.get("chapter_end"))
-    chunks = plan_chunks(text, chapters, metadata, cap=int(tts.get("chunk_cap", 900)))
+    if job.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+        try:
+            voice_plan = workspace.load_voice_plan(conversion_id)
+            speaker_analysis = workspace.load_speaker_analysis(conversion_id)
+        except Exception as exc:
+            raise M4BError("interactive voice artifacts are unavailable") from exc
+        if voice_plan.get("approval", {}).get("state") != "approved":
+            raise M4BError("interactive generation requires an approved voice plan")
+        if voice_plan.get("canonical_artifact_sha256") != job.get("voice_plan_sha256") or voice_plan.get("revision") != job.get("voice_plan_revision"):
+            raise M4BError("voice plan does not match the bound generation")
+        if speaker_analysis.get("canonical_artifact_sha256") != job.get("speaker_analysis_sha256"):
+            raise M4BError("speaker analysis does not match the bound generation")
+        if registry_revision() != job.get("voice_registry_revision"):
+            raise M4BError("voice registry revision does not match the bound generation")
+        plan_voice_ids = [entry.get("voice_id") for entry in voice_plan.get("cast", []) if isinstance(entry, dict)]
+        plan_voice_ids = list(dict.fromkeys(plan_voice_ids))
+        if plan_voice_ids != job.get("cast_voice_ids"):
+            raise M4BError("voice cast does not match the bound generation")
+        settings = tts.get("settings", {}) if isinstance(tts.get("settings", {}), dict) else {}
+        chapter_start = settings.get("chapter_start")
+        chapter_end = settings.get("chapter_end")
+        start = 1 if chapter_start is None else chapter_start
+        end = len(plan["chapters"]) if chapter_end is None else chapter_end
+        chapters = select_chapter_range(plan, chapter_start, chapter_end)
+        # Interactive chunks retain their original chapter indexes. Preserve
+        # those indexes on the selected chapter metadata used for assembly.
+        for chapter, chapter_index in zip(chapters, range(start, end + 1)):
+            chapter["index"] = chapter_index
+        try:
+            chunks = plan_interactive_chunks(
+                text,
+                voice_plan,
+                get_generation_facts,
+                job["voice_registry_revision"],
+                chapter_range=(start, end),
+                cap=int(tts.get("chunk_cap", 900)),
+            )
+        except Exception as exc:
+            raise M4BError("interactive chunk plan is invalid") from exc
+    else:
+        metadata = EngineMetadata(
+            str(tts["engine"]), str(tts.get("package_version", "")), str(tts.get("model", "")),
+            str(tts.get("model_revision", "")), str(tts.get("model_checksum", "")), str(tts["voice"]),
+            str(tts.get("voice_version", "")), str(tts.get("voice_checksum", "")), int(tts["sample_rate"]),
+            dict(tts.get("settings", {})),
+        )
+        chapters = select_chapter_range(plan, metadata.settings.get("chapter_start"), metadata.settings.get("chapter_end"))
+        chunks = plan_chunks(text, chapters, metadata, cap=int(tts.get("chunk_cap", 900)))
     records = job["completed_chunks"]
     if not chunks or len(chunks) != job["total_chunks"] or len(records) != len(chunks):
         raise M4BError("completed chunk set does not match the current plan")
@@ -156,9 +197,18 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
             raise M4BError("completed chunks are not in planned global order")
         if record["input_hash"] != chunk.input_hash or record["relative_path"] != expected.relative_to(conversion).as_posix():
             raise M4BError("completed chunk input or path does not match the bound plan")
+        if job.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+            for field in ("audio_input_hash", "span_id", "speaker_id", "voice_id", "segment_type", "source_start", "source_end"):
+                if record.get(field) != getattr(chunk, field):
+                    raise M4BError(f"completed chunk {field} does not match the bound plan")
         path = conversion / record["relative_path"]
         _safe_regular_file(path, "completed chunk WAV")
-        info = validate_wav(path, expected_sample_rate=int(tts["sample_rate"]))
+        try:
+            info = validate_wav(path, expected_sample_rate=int(tts["sample_rate"]))
+        except (OSError, ValueError) as exc:
+            if job.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+                raise M4BError("completed chunk WAV is invalid") from exc
+            raise
         digest = _sha256(path)
         if "wav_sha256" in record and (record["wav_sha256"] == "0" * 64 or record["wav_sha256"] != digest):
             raise M4BError("completed chunk WAV hash mismatch")

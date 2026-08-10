@@ -8,7 +8,11 @@ import uuid
 
 import pytest
 
+import pdf_audiobook.workspace as workspace_module
+import pdf_audiobook.speaker_analysis as speaker_analysis_module
+
 from pdf_audiobook.workspace import (
+    INTERACTIVE_GENERATION_SCHEMA_VERSION,
     JOB_SCHEMA_VERSION,
     ManifestError,
     UnsafePathError,
@@ -18,9 +22,28 @@ from pdf_audiobook.workspace import (
     atomic_write_text,
     copy_source_pdf,
     validate_job_manifest,
+    validate_interactive_generation_manifest,
 )
+from pdf_audiobook.voice_plan import canonical_json_bytes, canonical_json_text, with_canonical_artifact_hash
 from pdf_audiobook.tts import FakeVoice
 from pdf_audiobook.worker import ConversionWorker
+
+
+def _interactive_tts() -> dict[str, object]:
+    return {
+        "engine": "fake",
+        "package_version": "builtin",
+        "model": "fake-model",
+        "model_revision": "1",
+        "model_checksum": None,
+        "voice": "voice-neutral",
+        "voice_version": "1",
+        "voice_checksum": None,
+        "sample_rate": 24000,
+        "settings": {},
+        "speed": 1.0,
+        "chunk_cap": 900,
+    }
 
 
 @pytest.fixture
@@ -90,6 +113,90 @@ def test_atomic_json_and_text_writes_are_utf8_and_replace_existing(tmp_path: Pat
     assert json.loads(json_path.read_text(encoding="utf-8"))["title"] == "更新"
     assert text_path.read_text(encoding="utf-8") == "Résumé — chapter\n"
     assert not list(json_path.parent.glob(".*.tmp"))
+
+
+def test_atomic_replace_retries_transient_permission_error(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "state.txt"
+    real_replace = workspace_module.os.replace
+    attempts = 0
+
+    def replace_with_transient_error(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("temporary lock")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(workspace_module.os, "replace", replace_with_transient_error)
+    monkeypatch.setattr(workspace_module.time, "sleep", lambda _: None)
+
+    atomic_write_text(target, "updated\n")
+
+    assert target.read_text(encoding="utf-8") == "updated\n"
+    assert attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("request_method", "marker_name"),
+    [("request_cancel", "cancel.request"), ("request_voice_analysis_cancel", "voice-analysis.cancel")],
+)
+def test_cancel_marker_replace_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch, request_method: str, marker_name: str
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    real_replace = workspace_module.os.replace
+    attempts = 0
+
+    def replace_with_transient_error(source_path: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("temporary lock")
+        real_replace(source_path, destination)
+
+    monkeypatch.setattr(workspace_module.os, "replace", replace_with_transient_error)
+    monkeypatch.setattr(workspace_module.time, "sleep", lambda _: None)
+
+    marker = getattr(workspace, request_method)(manifest["conversion_id"])
+
+    assert marker.name == marker_name
+    assert marker.read_text(encoding="ascii") == "cancel\n"
+    assert attempts == 2
+
+
+def test_atomic_replace_only_retries_permission_errors_and_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "state.txt"
+    attempts = 0
+
+    def always_permission_error(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError("persistent lock")
+
+    monkeypatch.setattr(workspace_module.os, "replace", always_permission_error)
+    monkeypatch.setattr(workspace_module.time, "sleep", lambda _: None)
+
+    with pytest.raises(PermissionError, match="persistent lock"):
+        atomic_write_text(target, "never committed\n")
+
+    assert attempts == workspace_module._REPLACE_RETRY_ATTEMPTS
+    assert not target.exists()
+    assert not list(target.parent.glob(".*.tmp"))
+
+    attempts = 0
+
+    def non_permission_error(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("non-retryable failure")
+
+    monkeypatch.setattr(workspace_module.os, "replace", non_permission_error)
+    with pytest.raises(OSError, match="non-retryable failure"):
+        atomic_write_text(target, "never committed\n")
+    assert attempts == 1
 
 
 def test_strict_manifest_rejects_malformed_unknown_and_unknown_schema() -> None:
@@ -166,6 +273,428 @@ def _analysis_with_mapping() -> dict[str, object]:
     analysis = _analysis_for_workspace()
     analysis["cleaned_map"] = [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(analysis["cleaned_text"])}]
     return analysis
+
+
+def _voice_plan_for_workspace(source_hash: str, chapter_hash: str, text: str, plan: dict) -> dict:
+    alice_start = text.index("Alice")
+    bob_start = text.index("Bob")
+    artifact = {
+        "schema_version": 1,
+        "artifact": "voice-plan",
+        "revision": 1,
+        "source_pdf_sha256": source_hash,
+        "cleaned_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "chapter_plan_sha256": chapter_hash,
+        "chapter_plan_schema_version": 1,
+        "analyzer": {"id": "fake", "version": "1", "model_hash": None},
+        "cast": [
+            {"cast_id": "narrator", "display_label": "Narrator", "role": "narrator", "relationship": "third_person", "voice_id": "voice-neutral", "voice_settings": {"speed": 1.0}},
+            {"cast_id": "alice", "display_label": "Alice", "role": "character", "relationship": "same_as_narrator", "voice_id": "voice-neutral", "voice_settings": {"speed": 1.1}},
+            {"cast_id": "bob", "display_label": "Bob", "role": "character", "relationship": "separate_from_narrator", "voice_id": "voice-neutral", "voice_settings": {"speed": 0.9}},
+        ],
+        "aliases": [],
+        "chapters": [
+            {"chapter_index": 1, "source_start": 0, "source_end": bob_start, "source_page_start": 1, "source_page_end": 1, "spans": [
+                {"span_id": "s1", "source_start": 0, "source_end": alice_start, "type": "narration", "speaker_id": "narrator", "confidence": {"score": 0.2, "band": "high", "reasons": ["fixture"]}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+                {"span_id": "s2", "source_start": alice_start, "source_end": bob_start, "type": "dialogue", "speaker_id": "alice", "confidence": {"score": 0.9, "band": "low", "reasons": ["fixture"]}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+            ]},
+            {"chapter_index": 2, "source_start": bob_start, "source_end": len(text), "source_page_start": 2, "source_page_end": 2, "spans": [
+                {"span_id": "s3", "source_start": bob_start, "source_end": len(text), "type": "narration", "speaker_id": "bob", "confidence": {"score": 0.5, "band": "medium", "reasons": []}, "provenance": {"source": "fake", "analysis_revision": 1}, "override": None},
+            ]},
+        ],
+        "unresolved_policy": {"mode": "narrator", "accepted_by_user": False, "accepted_at": None},
+        "approval": {"state": "approved", "approved_at": "2026-01-01T00:00:00Z", "approved_revision": 1},
+    }
+    return with_canonical_artifact_hash(artifact)
+
+
+def _speaker_analysis_for_workspace(source_hash: str, chapter_hash: str, text: str, plan: dict) -> dict:
+    split = text.index("Bob")
+    artifact = {
+        "schema_version": 1,
+        "artifact": "speaker-analysis",
+        "revision": 1,
+        "source_pdf_sha256": source_hash,
+        "cleaned_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "chapter_plan_sha256": chapter_hash,
+        "chapter_plan_schema_version": 1,
+        "analyzer": {"id": "fake", "version": "1", "model_hash": None},
+        "characters": [{"character_id": "alice", "canonical_label": "Alice", "aliases": [], "line_count": 1, "quote_count": 0}],
+        "spans": [
+            {"span_id": "machine-1", "chapter_index": 1, "source_start": 0, "source_end": 8, "type": "narration", "speaker_id": None, "confidence": {"score": 0.2, "band": "high", "reasons": ["fixture"]}, "provenance": {"source": "fake"}},
+            {"span_id": "machine-2", "chapter_index": 2, "source_start": split, "source_end": len(text), "type": "narration", "speaker_id": None, "confidence": {"score": 0.8, "band": "low", "reasons": []}, "provenance": {"source": "fake", "quote_id": "q1"}},
+        ],
+        "warnings": ["incomplete machine attribution"],
+    }
+    return with_canonical_artifact_hash(artifact)
+
+
+def _voice_analysis_status_for_workspace(job: dict, *, status: str = "queued", stage: str = "queued") -> dict:
+    artifact = {
+        "schema_version": 1,
+        "artifact": "voice-analysis-status",
+        "analysis_id": "12345678-1234-5678-9234-567812345678",
+        "revision": 1,
+        "source_pdf_sha256": job["source_pdf_sha256"],
+        "cleaned_text_sha256": job["cleaned_text_sha256"],
+        "chapter_plan_sha256": job["chapter_plan_sha256"],
+        "chapter_plan_schema_version": 1,
+        "analyzer": {"id": "fake", "version": "1", "model_hash": None},
+        "status": status,
+        "stage": stage,
+        "progress": {"completed": 0, "total": 0},
+        "cancel_requested": status in {"running", "cancelled"},
+        "warnings": [],
+        "error": {"code": "ANALYZER_FAILED", "message": "failed"} if status == "failed" else None,
+        "started_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:01Z",
+        "finished_at": "2026-01-01T00:00:02Z" if status in {"completed", "cancelled", "failed"} else None,
+    }
+    return with_canonical_artifact_hash(artifact)
+
+
+def test_voice_plan_round_trip_is_canonical_atomic_and_does_not_mutate_job(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    split = text.index("Bob")
+    analysis = {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": split}, {"source_page": 2, "cleaned_start": split, "cleaned_end": len(text)}], "warnings": []}
+    workspace.persist_analysis(manifest["conversion_id"], analysis)
+    plan = {"schema_version": 1, "mode": "original", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": 3}, {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 2, "end_page": 2, "source_type": "whole", "word_count": 2}], "warnings": []}
+    planned = workspace.persist_chapter_plan(manifest["conversion_id"], plan)
+    job_before = workspace.read_job(manifest["conversion_id"])
+    artifact = _voice_plan_for_workspace(manifest["source_pdf_sha256"], planned["chapter_plan_sha256"], text, plan)
+    returned = workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+    path = workspace.conversion_path(manifest["conversion_id"]) / "voice-plan.json"
+    assert returned == artifact
+    assert path.read_bytes() == canonical_json_text(artifact).encode("utf-8")
+    assert workspace.load_voice_plan(manifest["conversion_id"]) == artifact
+    assert workspace.read_job(manifest["conversion_id"]) == job_before
+    replacement = dict(artifact)
+    replacement["revision"] = 2
+    replacement["approval"] = {**artifact["approval"], "approved_revision": 2}
+    replacement = with_canonical_artifact_hash(replacement)
+    workspace.persist_voice_plan(manifest["conversion_id"], replacement)
+    assert workspace.load_voice_plan(manifest["conversion_id"]) == replacement
+    previous_bytes = path.read_bytes()
+    invalid_replacement = dict(replacement)
+    invalid_replacement["approval"] = {**replacement["approval"], "approved_revision": True}
+    invalid_replacement = with_canonical_artifact_hash(invalid_replacement)
+    with pytest.raises(ManifestError, match="invalid voice plan artifact"):
+        workspace.persist_voice_plan(manifest["conversion_id"], invalid_replacement)
+    assert path.read_bytes() == previous_bytes
+
+
+def test_voice_plan_load_rejects_tampered_malformed_stale_and_unsafe_artifacts(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    split = text.index("Bob")
+    workspace.persist_analysis(manifest["conversion_id"], {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": split}, {"source_page": 2, "cleaned_start": split, "cleaned_end": len(text)}], "warnings": []})
+    plan = {"schema_version": 1, "mode": "original", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": 3}, {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 2, "end_page": 2, "source_type": "whole", "word_count": 2}], "warnings": []}
+    planned = workspace.persist_chapter_plan(manifest["conversion_id"], plan)
+    artifact = _voice_plan_for_workspace(manifest["source_pdf_sha256"], planned["chapter_plan_sha256"], text, plan)
+    workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+    path = workspace.conversion_path(manifest["conversion_id"]) / "voice-plan.json"
+    tampered = dict(artifact); tampered["revision"] = 99; atomic_write_json(path, tampered)
+    with pytest.raises(ManifestError, match="invalid voice plan artifact"):
+        workspace.load_voice_plan(manifest["conversion_id"])
+    path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(ManifestError, match="malformed voice plan"):
+        workspace.load_voice_plan(manifest["conversion_id"])
+    workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+    previous_bytes = path.read_bytes()
+    stale_source = {**artifact, "source_pdf_sha256": "c" * 64}
+    stale_source = with_canonical_artifact_hash(stale_source)
+    with pytest.raises(ManifestError, match="invalid voice plan artifact"):
+        workspace.persist_voice_plan(manifest["conversion_id"], stale_source)
+    assert path.read_bytes() == previous_bytes
+    stale_chapter = {**artifact, "chapter_plan_sha256": "d" * 64}
+    stale_chapter = with_canonical_artifact_hash(stale_chapter)
+    with pytest.raises(ManifestError, match="invalid voice plan artifact"):
+        workspace.persist_voice_plan(manifest["conversion_id"], stale_chapter)
+    assert path.read_bytes() == previous_bytes
+    atomic_write_json(path, stale_source)
+    with pytest.raises(ManifestError, match="invalid voice plan artifact"):
+        workspace.load_voice_plan(manifest["conversion_id"])
+
+
+def _prepared_voice_workspace(tmp_path: Path) -> tuple[Workspace, dict, Path, dict, Path]:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    split = text.index("Bob")
+    workspace.persist_analysis(manifest["conversion_id"], {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": split}, {"source_page": 2, "cleaned_start": split, "cleaned_end": len(text)}], "warnings": []})
+    plan = {"schema_version": 1, "mode": "original", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": 3}, {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 2, "end_page": 2, "source_type": "whole", "word_count": 2}], "warnings": []}
+    planned = workspace.persist_chapter_plan(manifest["conversion_id"], plan)
+    artifact = _voice_plan_for_workspace(manifest["source_pdf_sha256"], planned["chapter_plan_sha256"], text, plan)
+    workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+    return workspace, manifest, workspace.conversion_path(manifest["conversion_id"]) / "source.pdf", artifact, workspace.conversion_path(manifest["conversion_id"]) / "voice-plan.json"
+
+
+def test_voice_plan_source_tamper_fails_closed(tmp_path: Path) -> None:
+    workspace, manifest, source_path, _, _ = _prepared_voice_workspace(tmp_path)
+    source_path.write_bytes(b"tampered")
+    with pytest.raises(ManifestError, match="source PDF hash mismatch"):
+        workspace.load_voice_plan(manifest["conversion_id"])
+
+
+def test_voice_plan_unsafe_targets_are_rejected_without_skipping_other_checks(tmp_path: Path) -> None:
+    workspace, manifest, source_path, artifact, path = _prepared_voice_workspace(tmp_path)
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ManifestError):
+        workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+    with pytest.raises(ManifestError):
+        workspace.load_voice_plan(manifest["conversion_id"])
+    path.rmdir()
+    try:
+        path.symlink_to(source_path)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    with pytest.raises(ManifestError):
+        workspace.load_voice_plan(manifest["conversion_id"])
+    with pytest.raises(ManifestError):
+        workspace.persist_voice_plan(manifest["conversion_id"], artifact)
+
+
+def _prepared_speaker_workspace(tmp_path: Path) -> tuple[Workspace, dict, dict, dict, Path]:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    split = text.index("Bob")
+    workspace.persist_analysis(manifest["conversion_id"], {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": split}, {"source_page": 2, "cleaned_start": split, "cleaned_end": len(text)}], "warnings": []})
+    plan = {"schema_version": 1, "mode": "original", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": 3}, {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 2, "end_page": 2, "source_type": "whole", "word_count": 2}], "warnings": []}
+    planned = workspace.persist_chapter_plan(manifest["conversion_id"], plan)
+    artifact = _speaker_analysis_for_workspace(manifest["source_pdf_sha256"], planned["chapter_plan_sha256"], text, plan)
+    manifest = workspace.read_job(manifest["conversion_id"])
+    return workspace, manifest, plan, artifact, workspace.conversion_path(manifest["conversion_id"]) / "speaker-analysis.json"
+
+
+def test_speaker_analysis_round_trip_replacement_and_voice_plan_preservation(tmp_path: Path) -> None:
+    workspace, manifest, plan, artifact, path = _prepared_speaker_workspace(tmp_path)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    voice = _voice_plan_for_workspace(manifest["source_pdf_sha256"], manifest["chapter_plan_sha256"], text, plan)
+    workspace.persist_voice_plan(manifest["conversion_id"], voice)
+    voice_bytes = workspace.conversion_path(manifest["conversion_id"]).joinpath("voice-plan.json").read_bytes()
+    job_before = workspace.job_path(manifest["conversion_id"]).read_bytes()
+
+    assert workspace.persist_speaker_analysis(manifest["conversion_id"], artifact) == artifact
+    assert path.read_bytes() == canonical_json_bytes(artifact)
+    assert workspace.load_speaker_analysis(manifest["conversion_id"]) == artifact
+    assert workspace.job_path(manifest["conversion_id"]).read_bytes() == job_before
+    assert workspace.conversion_path(manifest["conversion_id"]).joinpath("voice-plan.json").read_bytes() == voice_bytes
+
+    replacement = with_canonical_artifact_hash({**artifact, "revision": 2})
+    assert workspace.persist_speaker_analysis(manifest["conversion_id"], replacement) == replacement
+    assert workspace.load_speaker_analysis(manifest["conversion_id"]) == replacement
+    previous_bytes = path.read_bytes()
+    invalid = with_canonical_artifact_hash({**replacement, "artifact": "wrong"})
+    with pytest.raises(ManifestError, match="invalid speaker analysis artifact"):
+        workspace.persist_speaker_analysis(manifest["conversion_id"], invalid)
+    assert path.read_bytes() == previous_bytes
+
+
+def test_speaker_analysis_persist_replaces_oversized_regular_previous_artifact(tmp_path: Path, monkeypatch) -> None:
+    workspace, manifest, _, artifact, path = _prepared_speaker_workspace(tmp_path)
+    path.write_bytes(b"xx")
+    monkeypatch.setattr("pdf_audiobook.workspace.MAX_ARTIFACT_BYTES", 1)
+    assert workspace.persist_speaker_analysis(manifest["conversion_id"], artifact) == artifact
+    monkeypatch.undo()
+    assert workspace.load_speaker_analysis(manifest["conversion_id"]) == artifact
+    assert path.read_bytes() == canonical_json_bytes(artifact)
+
+
+def test_speaker_analysis_rejects_malformed_tampered_and_stale_bindings(tmp_path: Path) -> None:
+    workspace, manifest, plan, artifact, path = _prepared_speaker_workspace(tmp_path)
+    workspace.persist_speaker_analysis(manifest["conversion_id"], artifact)
+    previous_bytes = path.read_bytes()
+
+    path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(ManifestError, match="malformed speaker analysis JSON"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    path.write_bytes(previous_bytes)
+    tampered = json.loads(previous_bytes.decode("utf-8"))
+    tampered["warnings"] = ["changed"]
+    atomic_write_json(path, tampered)
+    with pytest.raises(ManifestError, match="invalid speaker analysis artifact"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    atomic_write_json(path, artifact)
+
+    stale_source = with_canonical_artifact_hash({**artifact, "source_pdf_sha256": "b" * 64})
+    atomic_write_json(path, stale_source)
+    with pytest.raises(ManifestError, match="invalid speaker analysis artifact"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    assert path.read_bytes() != previous_bytes
+    atomic_write_json(path, artifact)
+    with pytest.raises(ManifestError, match="invalid speaker analysis artifact"):
+        workspace.persist_speaker_analysis(manifest["conversion_id"], stale_source)
+    assert path.read_bytes() == previous_bytes
+
+    cleaned_path = workspace.conversion_path(manifest["conversion_id"]) / "cleaned.txt"
+    cleaned_path.write_text("stale cleaned text", encoding="utf-8")
+    with pytest.raises(ManifestError, match="cleaned text hash mismatch"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    cleaned_path.write_text("Narrator speaks. Alice replies! Bob waits.", encoding="utf-8")
+
+    chapter_path = workspace.conversion_path(manifest["conversion_id"]) / "chapters.json"
+    atomic_write_json(chapter_path, {**plan, "warnings": ["stale plan"]})
+    with pytest.raises(ManifestError, match="chapter plan hash mismatch"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    atomic_write_json(chapter_path, plan)
+
+    source_path = workspace.conversion_path(manifest["conversion_id"]) / "source.pdf"
+    source_path.write_bytes(b"tampered")
+    with pytest.raises(ManifestError, match="source PDF hash mismatch"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+
+
+def test_speaker_analysis_unsafe_targets_are_rejected_independently(tmp_path: Path) -> None:
+    workspace, manifest, _, artifact, path = _prepared_speaker_workspace(tmp_path)
+    workspace.persist_speaker_analysis(manifest["conversion_id"], artifact)
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ManifestError):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    with pytest.raises(ManifestError):
+        workspace.persist_speaker_analysis(manifest["conversion_id"], artifact)
+    path.rmdir()
+    source_path = workspace.conversion_path(manifest["conversion_id"]) / "source.pdf"
+    try:
+        path.symlink_to(source_path)
+    except (OSError, NotImplementedError) as exc:
+        return
+    with pytest.raises(ManifestError):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+    with pytest.raises(ManifestError):
+        workspace.persist_speaker_analysis(manifest["conversion_id"], artifact)
+
+
+def test_speaker_analysis_size_limit_is_checked_before_parse(tmp_path: Path, monkeypatch) -> None:
+    workspace, manifest, _, artifact, path = _prepared_speaker_workspace(tmp_path)
+    path.write_bytes(canonical_json_bytes(artifact))
+    monkeypatch.setattr(speaker_analysis_module, "MAX_ARTIFACT_BYTES", 1)
+    monkeypatch.setattr("pdf_audiobook.workspace.MAX_ARTIFACT_BYTES", 1)
+    with pytest.raises(ManifestError, match="speaker analysis artifact too large"):
+        workspace.load_speaker_analysis(manifest["conversion_id"])
+
+
+def test_voice_analysis_status_round_trip_replacement_and_bindings(tmp_path: Path) -> None:
+    workspace, manifest, _, _, _ = _prepared_speaker_workspace(tmp_path)
+    job_before = workspace.job_path(manifest["conversion_id"]).read_bytes()
+    status = _voice_analysis_status_for_workspace(manifest)
+    returned = workspace.persist_voice_analysis_status(manifest["conversion_id"], status)
+    path = workspace.conversion_path(manifest["conversion_id"]) / "voice-analysis-status.json"
+    assert returned == status
+    assert path.read_bytes() == canonical_json_bytes(status)
+    assert workspace.load_voice_analysis_status(manifest["conversion_id"]) == status
+    assert workspace.job_path(manifest["conversion_id"]).read_bytes() == job_before
+    previous = path.read_bytes()
+    invalid = with_canonical_artifact_hash({**status, "analysis_id": "not-a-uuid"})
+    with pytest.raises(ManifestError, match="invalid voice-analysis status"):
+        workspace.persist_voice_analysis_status(manifest["conversion_id"], invalid)
+    assert path.read_bytes() == previous
+    stale = with_canonical_artifact_hash({**status, "chapter_plan_sha256": "b" * 64})
+    with pytest.raises(ManifestError, match="invalid voice-analysis status"):
+        workspace.persist_voice_analysis_status(manifest["conversion_id"], stale)
+    assert path.read_bytes() == previous
+
+
+def test_voice_analysis_status_persist_replaces_oversized_regular_previous(tmp_path: Path, monkeypatch) -> None:
+    workspace, manifest, _, _, _ = _prepared_speaker_workspace(tmp_path)
+    status = _voice_analysis_status_for_workspace(manifest)
+    path = workspace.conversion_path(manifest["conversion_id"]) / "voice-analysis-status.json"
+    path.write_bytes(b"xx")
+    monkeypatch.setattr("pdf_audiobook.workspace.MAX_VOICE_ANALYSIS_STATUS_BYTES", 1)
+    assert workspace.persist_voice_analysis_status(manifest["conversion_id"], status) == status
+    monkeypatch.undo()
+    assert workspace.load_voice_analysis_status(manifest["conversion_id"]) == status
+
+
+def test_voice_analysis_status_malformed_tampered_oversized_and_unsafe(tmp_path: Path, monkeypatch) -> None:
+    workspace, manifest, _, _, _ = _prepared_speaker_workspace(tmp_path)
+    status = _voice_analysis_status_for_workspace(manifest)
+    workspace.persist_voice_analysis_status(manifest["conversion_id"], status)
+    path = workspace.conversion_path(manifest["conversion_id"]) / "voice-analysis-status.json"
+    path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(ManifestError, match="malformed voice-analysis status"):
+        workspace.load_voice_analysis_status(manifest["conversion_id"])
+    path.write_bytes(canonical_json_bytes(status))
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["warnings"] = ["changed"]
+    atomic_write_json(path, tampered)
+    with pytest.raises(ManifestError, match="invalid voice-analysis status"):
+        workspace.load_voice_analysis_status(manifest["conversion_id"])
+    atomic_write_json(path, status)
+    monkeypatch.setattr("pdf_audiobook.workspace.MAX_VOICE_ANALYSIS_STATUS_BYTES", 1)
+    with pytest.raises(ManifestError, match="voice-analysis status too large"):
+        workspace.load_voice_analysis_status(manifest["conversion_id"])
+    monkeypatch.undo()
+    path.unlink()
+    path.mkdir()
+    with pytest.raises(ManifestError):
+        workspace.load_voice_analysis_status(manifest["conversion_id"])
+    with pytest.raises(ManifestError):
+        workspace.persist_voice_analysis_status(manifest["conversion_id"], status)
+
+
+def test_voice_analysis_cancel_marker_is_distinct_safe_and_idempotent(tmp_path: Path) -> None:
+    workspace, manifest, _, _, _ = _prepared_speaker_workspace(tmp_path)
+    marker = workspace.voice_analysis_cancel_marker_path(manifest["conversion_id"])
+    assert marker.name == "voice-analysis.cancel"
+    assert workspace.voice_analysis_cancellation_requested(manifest["conversion_id"]) is False
+    workspace.request_voice_analysis_cancel(manifest["conversion_id"])
+    workspace.request_voice_analysis_cancel(manifest["conversion_id"])
+    assert workspace.voice_analysis_cancellation_requested(manifest["conversion_id"]) is True
+    assert not workspace.cancellation_requested(manifest["conversion_id"])
+    workspace.clear_voice_analysis_cancel_request(manifest["conversion_id"])
+    workspace.clear_voice_analysis_cancel_request(manifest["conversion_id"])
+    assert workspace.voice_analysis_cancellation_requested(manifest["conversion_id"]) is False
+    marker.mkdir()
+    with pytest.raises(UnsafePathError):
+        workspace.request_voice_analysis_cancel(manifest["conversion_id"])
+    with pytest.raises(UnsafePathError):
+        workspace.voice_analysis_cancellation_requested(manifest["conversion_id"])
+    with pytest.raises(UnsafePathError):
+        workspace.clear_voice_analysis_cancel_request(manifest["conversion_id"])
+
+
+def test_voice_analysis_status_and_cancel_symlink_targets_are_rejected_when_supported(tmp_path: Path) -> None:
+    workspace, manifest, _, _, _ = _prepared_speaker_workspace(tmp_path)
+    status = _voice_analysis_status_for_workspace(manifest)
+    status_path = workspace.conversion_path(manifest["conversion_id"]) / "voice-analysis-status.json"
+    status_path.write_bytes(canonical_json_bytes(status))
+    target = workspace.conversion_path(manifest["conversion_id"]) / "source.pdf"
+    try:
+        status_path.unlink()
+        status_path.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pass
+    else:
+        with pytest.raises(ManifestError):
+            workspace.load_voice_analysis_status(manifest["conversion_id"])
+        with pytest.raises(ManifestError):
+            workspace.persist_voice_analysis_status(manifest["conversion_id"], status)
+        status_path.unlink()
+    marker = workspace.voice_analysis_cancel_marker_path(manifest["conversion_id"])
+    try:
+        marker.symlink_to(target)
+    except (OSError, NotImplementedError):
+        return
+    with pytest.raises(UnsafePathError):
+        workspace.voice_analysis_cancellation_requested(manifest["conversion_id"])
+    with pytest.raises(UnsafePathError):
+        workspace.request_voice_analysis_cancel(manifest["conversion_id"])
+    with pytest.raises(UnsafePathError):
+        workspace.clear_voice_analysis_cancel_request(manifest["conversion_id"])
 
 
 def test_load_cleaned_artifacts_verifies_text_and_mapping(tmp_path: Path) -> None:
@@ -485,3 +1014,137 @@ def test_output_manifest_rejects_wrong_filename_or_nonfinite_facts(tmp_path: Pat
     base = workspace.read_job(manifest["conversion_id"])
     atomic_write_json(workspace.job_path(manifest["conversion_id"]), {**base, "schema_version": 4, "output": {"filename": "wrong.m4b", "path": str(tmp_path / "right.m4b"), "size_bytes": 1, "duration_seconds": 1.0, "chapter_count": 1, "codec": "aac", "sha256": "0" * 64}, "status": "completed", "stage": "completed"})
     with pytest.raises(ManifestError): workspace.read_job(manifest["conversion_id"])
+
+
+def _prepare_interactive_generation(tmp_path: Path) -> tuple[Workspace, dict, dict, dict]:
+    workspace, manifest, plan, analysis, _ = _prepared_speaker_workspace(tmp_path)
+    text = "Narrator speaks. Alice replies! Bob waits."
+    voice_plan = _voice_plan_for_workspace(manifest["source_pdf_sha256"], manifest["chapter_plan_sha256"], text, plan)
+    workspace.persist_voice_plan(manifest["conversion_id"], voice_plan)
+    workspace.persist_speaker_analysis(manifest["conversion_id"], analysis)
+    return workspace, manifest, voice_plan, analysis
+
+
+def test_interactive_generation_v5_strict_round_trip_and_update(tmp_path: Path) -> None:
+    workspace, manifest, voice_plan, analysis = _prepare_interactive_generation(tmp_path)
+    registry_revision = "a" * 64
+    configured = workspace.configure_interactive_generation(
+        manifest["conversion_id"],
+        tts=_interactive_tts(),
+        total_chunks=1,
+        voice_registry_revision=registry_revision,
+    )
+    assert configured["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION == 5
+    assert configured["mode"] == "interactive_voices"
+    assert configured["voice_plan_sha256"] == voice_plan["canonical_artifact_sha256"]
+    assert configured["voice_plan_revision"] == voice_plan["revision"]
+    assert configured["speaker_analysis_sha256"] == analysis["canonical_artifact_sha256"]
+    assert configured["cast_voice_ids"] == ["voice-neutral"]
+    assert configured["voice_registry_revision"] == registry_revision
+
+    record = {
+        "chapter_index": 1,
+        "global_index": 0,
+        "local_index": 0,
+        "span_id": "s2",
+        "audio_input_hash": "d" * 64,
+        "input_hash": "b" * 64,
+        "relative_path": "chunks/0000.wav",
+        "duration_seconds": 1.0,
+        "wav_sha256": "c" * 64,
+        "speaker_id": "alice",
+        "voice_id": "voice-neutral",
+        "segment_type": "dialogue",
+        "source_start": 10,
+        "source_end": 20,
+    }
+    updated = workspace.update_generation(
+        manifest["conversion_id"],
+        completed_chunks=[record],
+        progress={"completed": 1, "current": 1, "total": 1},
+    )
+    assert validate_interactive_generation_manifest(updated) == updated
+    assert workspace.read_job(manifest["conversion_id"]) == updated
+
+    thought = {**record, "segment_type": "thought"}
+    thought_manifest = {**updated, "completed_chunks": [thought]}
+    assert validate_interactive_generation_manifest(thought_manifest) == thought_manifest
+
+    unknown = dict(updated)
+    unknown["unexpected"] = True
+    with pytest.raises(ManifestError):
+        validate_interactive_generation_manifest(unknown)
+    malformed = dict(updated)
+    malformed["completed_chunks"] = [{**record, "span_id": "", "segment_type": []}]
+    with pytest.raises(ManifestError):
+        validate_interactive_generation_manifest(malformed)
+    malformed_hash = dict(updated)
+    malformed_hash["completed_chunks"] = [{**record, "audio_input_hash": "D" * 64}]
+    with pytest.raises(ManifestError, match="audio_input_hash"):
+        validate_interactive_generation_manifest(malformed_hash)
+    wrong_voice = {**updated, "completed_chunks": [{**record, "voice_id": "not-cast"}]}
+    with pytest.raises(ManifestError, match="cast_voice_ids"):
+        validate_interactive_generation_manifest(wrong_voice)
+    wrong_tts_voice = {**updated, "tts": {**updated["tts"], "voice": "not-cast"}}
+    with pytest.raises(ManifestError, match="cast_voice_ids"):
+        validate_interactive_generation_manifest(wrong_tts_voice)
+
+
+def test_interactive_generation_requires_approval_and_reconfigure_resets_changed_facts(tmp_path: Path) -> None:
+    workspace, manifest, voice_plan, _ = _prepare_interactive_generation(tmp_path)
+    draft = {**voice_plan, "approval": {"state": "draft", "approved_at": None, "approved_revision": None}}
+    workspace.persist_voice_plan(manifest["conversion_id"], with_canonical_artifact_hash(draft))
+    with pytest.raises(ManifestError, match="approved voice plan"):
+        workspace.configure_interactive_generation(
+            manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1, voice_registry_revision="a" * 64
+        )
+
+    workspace.persist_voice_plan(manifest["conversion_id"], voice_plan)
+    workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1, voice_registry_revision="a" * 64
+    )
+    before = workspace.read_job(manifest["conversion_id"])
+    evidence = {"chapter_index": 1, "global_index": 0, "local_index": 0, "span_id": "s2", "audio_input_hash": "d" * 64, "input_hash": "b" * 64, "relative_path": "chunks/0000.wav", "duration_seconds": 1.0, "wav_sha256": "c" * 64, "speaker_id": "alice", "voice_id": "voice-neutral", "segment_type": "dialogue", "source_start": 10, "source_end": 20}
+    workspace.update_generation(manifest["conversion_id"], completed_chunks=[evidence], progress={"completed": 1, "current": 1, "total": 1})
+    same = workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1, voice_registry_revision="a" * 64
+    )
+    assert same["completed_chunks"] == [evidence]
+    changed = workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1, voice_registry_revision="d" * 64
+    )
+    assert changed["completed_chunks"] == [evidence]
+    assert changed["progress"] == {"completed": 1, "current": 0, "total": 1}
+    assert before["completed_chunks"] == []
+
+
+def test_interactive_generation_reconfigure_rejects_active_and_completed_state_changes(tmp_path: Path) -> None:
+    workspace, manifest, _, _ = _prepare_interactive_generation(tmp_path)
+    workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=0, voice_registry_revision="a" * 64
+    )
+    workspace.update_generation(manifest["conversion_id"], status="synthesizing")
+    with pytest.raises(ManifestError, match="active interactive"):
+        workspace.configure_interactive_generation(
+            manifest["conversion_id"], tts=_interactive_tts(), total_chunks=0, voice_registry_revision="b" * 64
+        )
+    workspace.update_generation(manifest["conversion_id"], status="completed", stage="synthesis_complete")
+    with pytest.raises(ManifestError, match="completed interactive"):
+        workspace.configure_interactive_generation(
+            manifest["conversion_id"], tts=_interactive_tts(), total_chunks=0, voice_registry_revision="b" * 64
+        )
+
+
+def test_interactive_generation_changed_facts_filter_out_of_range_candidates(tmp_path: Path) -> None:
+    workspace, manifest, _, _ = _prepare_interactive_generation(tmp_path)
+    workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=2, voice_registry_revision="a" * 64
+    )
+    first = {"chapter_index": 1, "global_index": 0, "local_index": 0, "span_id": "s2", "audio_input_hash": "d" * 64, "input_hash": "b" * 64, "relative_path": "chunks/0000.wav", "duration_seconds": 1.0, "wav_sha256": "c" * 64, "speaker_id": "alice", "voice_id": "voice-neutral", "segment_type": "dialogue", "source_start": 10, "source_end": 20}
+    second = {**first, "global_index": 1, "local_index": 1, "span_id": "s3", "audio_input_hash": "e" * 64, "relative_path": "chunks/0001.wav", "source_start": 20, "source_end": 30}
+    workspace.update_generation(manifest["conversion_id"], completed_chunks=[first, second], progress={"completed": 2, "current": 2, "total": 2})
+    changed = workspace.configure_interactive_generation(
+        manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1, voice_registry_revision="b" * 64
+    )
+    assert changed["completed_chunks"] == [first]
+    assert changed["progress"] == {"completed": 1, "current": 0, "total": 1}

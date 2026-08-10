@@ -23,8 +23,11 @@ from pdf_audiobook.m4b import (
     verify_m4b,
     finalize_conversion,
 )
+from pdf_audiobook.audio import write_pcm_wav
 from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks
 from pdf_audiobook.chapters import select_chapter_range
+from pdf_audiobook.tts import plan_interactive_chunks
+from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.worker import ConversionWorker
 from pdf_audiobook.workspace import Workspace
 from pdf_audiobook.workspace import atomic_write_json
@@ -296,5 +299,121 @@ def test_verify_failure_does_not_publish(monkeypatch) -> None:
         destination = root / "published"
         with pytest.raises(M4BError): m4b.finalize_conversion(workspace, conversion_id, destination=destination)
         assert not destination.exists() or not list(destination.rglob("*.m4b"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _v5_fixture(monkeypatch, *, thought: bool = False) -> tuple[object, dict, list[object], Path]:
+    import pdf_audiobook.m4b as m4b
+
+    text = "One. Two. Three."
+    split = text.index("Two")
+    chapter_plan = {
+        "schema_version": 1,
+        "mode": "original",
+        "requested_count": None,
+        "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "warnings": [],
+        "chapters": [
+            {"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "original", "word_count": 1},
+            {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "original", "word_count": 2},
+        ]
+    }
+    selected_span = {"span_id": "s2", "source_start": split, "source_end": len(text), "type": "thought" if thought else "narration", "speaker_id": "narrator"}
+    if thought:
+        selected_span["override"] = {}
+    voice_plan = with_canonical_artifact_hash({
+        "schema_version": 1,
+        "artifact": "voice-plan",
+        "revision": 2,
+        "approval": {"state": "approved", "approved_revision": 2},
+        "cast": [{"cast_id": "narrator", "voice_id": "af_heart", "voice_settings": {"speed": 1.0}}],
+        "chapters": [
+            {"chapter_index": 1, "source_start": 0, "source_end": split, "spans": [{"span_id": "s1", "source_start": 0, "source_end": split, "type": "narration", "speaker_id": "narrator"}]},
+            {"chapter_index": 2, "source_start": split, "source_end": len(text), "spans": [selected_span]},
+        ],
+    })
+    facts = {"af_heart": {"id": "af_heart", "engine": "kokoro", "package": "kokoro", "package_version": "0.9.4", "model": "model", "model_revision": "r1", "model_checksum": "m1", "voice_version": "v1", "voice_checksum": "w1", "sample_rate": 24000, "enabled": True}}
+    registry = "a" * 64
+    monkeypatch.setattr(m4b, "get_generation_facts", lambda voice_id: facts[voice_id])
+    monkeypatch.setattr(m4b, "registry_revision", lambda: registry)
+    chunks = plan_interactive_chunks(text, voice_plan, facts, registry, chapter_range=(2, 2), cap=5)
+    root = Path("tests") / f".pytest-phase5-v5-{uuid.uuid4().hex}"
+    root.mkdir()
+    records = []
+    for chunk in chunks:
+        path = root / f"chunks/chapter-{chunk.chapter_index:03d}-chunk-{chunk.local_index:04d}.wav"
+        info = write_pcm_wav(path, b"\0\0" * 240, 24000)
+        relative = path.relative_to(root).as_posix()
+        records.append({**chunk.manifest_record(relative, info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    job = {
+        "schema_version": 5,
+        "tts": {"sample_rate": 24000, "chunk_cap": 5, "settings": {"chapter_start": 2, "chapter_end": 2}},
+        "total_chunks": len(chunks),
+        "completed_chunks": records,
+        "voice_plan_sha256": voice_plan["canonical_artifact_sha256"],
+        "voice_plan_revision": voice_plan["revision"],
+        "speaker_analysis_sha256": "b" * 64,
+        "cast_voice_ids": ["af_heart"],
+        "voice_registry_revision": registry,
+    }
+
+    class FakeWorkspace:
+        def read_job(self, _conversion_id): return job
+        def load_cleaned_artifacts(self, _conversion_id): return text, []
+        def load_chapter_plan(self, _conversion_id): return chapter_plan
+        def load_voice_plan(self, _conversion_id): return voice_plan
+        def load_speaker_analysis(self, _conversion_id): return {"canonical_artifact_sha256": "b" * 64, "revision": 3}
+        def conversion_path(self, _conversion_id): return root
+
+    return FakeWorkspace(), job, chunks, root
+
+
+def test_v5_assembly_replans_selected_chapters_and_preserves_global_pcm_order(monkeypatch) -> None:
+    workspace, job, chunks, root = _v5_fixture(monkeypatch)
+    try:
+        assembly = assemble_chapters(workspace, "conversion")
+        assert [chunk.global_index for chunk in chunks] == [0, 1]
+        assert [chapter.title for chapter in assembly.chapters] == ["Two"]
+        assert len(assembly.chapters) == 1
+        assert build_ffmetadata(assembly.chapters).count("[CHAPTER]") == 1
+        assert assembly.frames == sum(240 for _ in chunks) + round(24000 * 150 / 1000)
+        assert job["completed_chunks"][0]["source_start"] == chunks[0].source_start
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_approved_manual_thought_record_is_accepted(monkeypatch) -> None:
+    workspace, job, _chunks, root = _v5_fixture(monkeypatch, thought=True)
+    try:
+        assemble_chapters(workspace, "conversion")
+        assert job["completed_chunks"][0]["segment_type"] == "thought"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("field", ["input_hash", "audio_input_hash", "span_id", "speaker_id", "voice_id", "segment_type", "source_start", "source_end"])
+def test_v5_tampered_chunk_metadata_is_rejected(monkeypatch, field: str) -> None:
+    workspace, job, _chunks, root = _v5_fixture(monkeypatch)
+    try:
+        value = job["completed_chunks"][0][field]
+        job["completed_chunks"][0][field] = (value + "x") if isinstance(value, str) else value + 1
+        with pytest.raises(M4BError):
+            assemble_chapters(workspace, "conversion")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_registry_and_wav_tampering_are_rejected(monkeypatch) -> None:
+    workspace, job, _chunks, root = _v5_fixture(monkeypatch)
+    try:
+        job["voice_registry_revision"] = "c" * 64
+        with pytest.raises(M4BError):
+            assemble_chapters(workspace, "conversion")
+        job["voice_registry_revision"] = "a" * 64
+        path = root / job["completed_chunks"][0]["relative_path"]
+        path.write_bytes(b"not-wav")
+        with pytest.raises((M4BError, ValueError)):
+            assemble_chapters(workspace, "conversion")
     finally:
         shutil.rmtree(root, ignore_errors=True)

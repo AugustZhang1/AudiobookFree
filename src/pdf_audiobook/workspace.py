@@ -19,16 +19,24 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import time
 import uuid
 from typing import Any, Literal
+
+from .speaker_analysis import MAX_ARTIFACT_BYTES, SpeakerAnalysisError, validate_speaker_analysis
+from .voice_analysis import MAX_ARTIFACT_BYTES as MAX_VOICE_ANALYSIS_STATUS_BYTES, VoiceAnalysisError, validate_voice_analysis_status
+from .voice_plan import VoicePlanError, validate_voice_plan
 
 
 ACTIVE_SCHEMA_VERSION = 1
 JOB_SCHEMA_VERSION = 2
 LEGACY_GENERATION_SCHEMA_VERSION = 3
 GENERATION_SCHEMA_VERSION = 4
+INTERACTIVE_GENERATION_SCHEMA_VERSION = 5
 _KNOWN_JOB_SCHEMA_VERSION = 1
 COPY_CHUNK_SIZE = 1024 * 1024
+_REPLACE_RETRY_ATTEMPTS = 3
+_REPLACE_RETRY_DELAY_SECONDS = 0.05
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 _ACTIVE_FIELDS = {"schema_version", "conversion_id", "updated_at"}
@@ -66,6 +74,23 @@ _GENERATION_FIELDS_V3 = _JOB_FIELDS | {
 _GENERATION_FIELDS = _GENERATION_FIELDS_V3 | {"output"}
 _COMPLETED_FIELDS_V3 = {"chapter_index", "global_index", "local_index", "input_hash", "relative_path", "duration_seconds"}
 _COMPLETED_FIELDS = _COMPLETED_FIELDS_V3 | {"wav_sha256"}
+_INTERACTIVE_GENERATION_FIELDS = _GENERATION_FIELDS | {
+    "mode",
+    "voice_plan_sha256",
+    "voice_plan_revision",
+    "speaker_analysis_sha256",
+    "cast_voice_ids",
+    "voice_registry_revision",
+}
+_INTERACTIVE_COMPLETED_FIELDS = _COMPLETED_FIELDS | {
+    "audio_input_hash",
+    "span_id",
+    "speaker_id",
+    "voice_id",
+    "segment_type",
+    "source_start",
+    "source_end",
+}
 _OUTPUT_FIELDS = {"filename", "path", "size_bytes", "duration_seconds", "chapter_count", "codec", "sha256"}
 _TTS_FIELDS = {"engine", "package_version", "model", "model_revision", "model_checksum", "voice", "voice_version", "voice_checksum", "sample_rate", "settings", "speed", "chunk_cap"}
 
@@ -319,6 +344,85 @@ def validate_generation_manifest(value: Any) -> dict[str, Any]:
     return result
 
 
+def _validate_generation_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 512 or any(ord(char) < 32 for char in value):
+        raise ManifestError(f"{field} must be a bounded non-empty identifier")
+    return value
+
+
+def validate_interactive_generation_manifest(value: Any) -> dict[str, Any]:
+    """Validate the strict schema-v5 Interactive Voices recovery manifest."""
+
+    result = _validate_generation_common(
+        value,
+        _INTERACTIVE_GENERATION_FIELDS,
+        _INTERACTIVE_COMPLETED_FIELDS,
+        INTERACTIVE_GENERATION_SCHEMA_VERSION,
+    )
+    if value["mode"] != "interactive_voices":
+        raise ManifestError("interactive generation mode is invalid")
+    _validate_sha(value["voice_plan_sha256"], "voice_plan_sha256")
+    if type(value["voice_plan_revision"]) is not int or value["voice_plan_revision"] <= 0:
+        raise ManifestError("voice_plan_revision must be a positive integer")
+    _validate_sha(value["speaker_analysis_sha256"], "speaker_analysis_sha256")
+    _validate_sha(value["voice_registry_revision"], "voice_registry_revision")
+    cast_voice_ids = value["cast_voice_ids"]
+    if not isinstance(cast_voice_ids, list) or not cast_voice_ids:
+        raise ManifestError("cast_voice_ids must be a non-empty list")
+    seen_voice_ids: set[str] = set()
+    for voice_id in cast_voice_ids:
+        _validate_generation_identifier(voice_id, "cast_voice_id")
+        if voice_id in seen_voice_ids:
+            raise ManifestError("cast_voice_ids must be ordered and unique")
+        seen_voice_ids.add(voice_id)
+    if not isinstance(value["tts"].get("voice"), str) or value["tts"]["voice"] not in seen_voice_ids:
+        raise ManifestError("tts voice must occur in cast_voice_ids")
+
+    previous_chapter = -1
+    previous_local = -1
+    for record in value["completed_chunks"]:
+        _validate_sha(record["audio_input_hash"], "audio_input_hash")
+        _validate_generation_identifier(record["span_id"], "span_id")
+        _validate_generation_identifier(record["speaker_id"], "speaker_id")
+        _validate_generation_identifier(record["voice_id"], "voice_id")
+        if record["voice_id"] not in seen_voice_ids:
+            raise ManifestError("completed chunk voice_id must occur in cast_voice_ids")
+        if not isinstance(record["segment_type"], str) or record["segment_type"] not in {"narration", "dialogue", "thought", "unknown"}:
+            raise ManifestError("segment_type is invalid")
+        if type(record["source_start"]) is not int or type(record["source_end"]) is not int:
+            raise ManifestError("completed chunk source offsets are invalid")
+        if record["source_start"] < 0 or record["source_end"] <= record["source_start"]:
+            raise ManifestError("completed chunk source range must be non-empty and non-negative")
+        chapter = record["chapter_index"]
+        local = record["local_index"]
+        if chapter < previous_chapter or (chapter == previous_chapter and local <= previous_local):
+            raise ManifestError("completed chunks must be ordered by chapter and local index")
+        previous_chapter = chapter
+        previous_local = local
+
+    output = _validate_output(value["output"])
+    if value["status"] == "completed":
+        if value["stage"] == "synthesis_complete":
+            if output is not None:
+                raise ManifestError("synthesis-complete generation cannot include final output")
+        elif value["stage"] == "completed":
+            if output is None:
+                raise ManifestError("final completed generation must include output facts")
+        else:
+            raise ManifestError("completed generation has an invalid final stage")
+        if value["progress"]["completed"] != value["total_chunks"] or value["progress"]["current"] != value["total_chunks"] or len(value["completed_chunks"]) != value["total_chunks"]:
+            raise ManifestError("completed generation progress is incomplete")
+    elif output is not None:
+        raise ManifestError("output is only valid for a completed generation")
+    return result
+
+
+def validate_generation_manifest_v5(value: Any) -> dict[str, Any]:
+    """Compatibility name for the strict Interactive Voices v5 validator."""
+
+    return validate_interactive_generation_manifest(value)
+
+
 def _upgrade_generation_manifest(value: dict[str, Any], *, tts: dict[str, Any], total_chunks: int) -> dict[str, Any]:
     upgraded = {**value, "schema_version": GENERATION_SCHEMA_VERSION, "tts": dict(tts), "total_chunks": total_chunks, "completed_chunks": [], "progress": {"completed": 0, "current": 0, "total": total_chunks}, "worker": None, "last_safe_error": value.get("error"), "output": None}
     return validate_generation_manifest(upgraded)
@@ -357,6 +461,8 @@ def _validate_job_for_read(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ManifestError("job manifest must be an object")
     version = value.get("schema_version")
+    if type(version) is int and version == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+        return validate_interactive_generation_manifest(value)
     if type(version) is int and version == GENERATION_SCHEMA_VERSION:
         return validate_generation_manifest(value)
     if type(version) is int and version == LEGACY_GENERATION_SCHEMA_VERSION:
@@ -434,6 +540,20 @@ def _validate_analysis_manifest(value: Any) -> dict[str, Any]:
     return value
 
 
+def _replace_with_retries(source: Path, target: Path) -> None:
+    """Replace a same-directory target, tolerating brief Windows lock races."""
+
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(source, target)
+        except PermissionError:
+            if attempt + 1 >= _REPLACE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
+        else:
+            return
+
+
 def _atomic_write(path: Path, writer: Any) -> Path:
     """Write through a same-directory temporary file and atomically replace."""
 
@@ -448,7 +568,7 @@ def _atomic_write(path: Path, writer: Any) -> Path:
             writer(handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        _replace_with_retries(temporary, target)
         try:
             directory_fd = os.open(target.parent, os.O_RDONLY)
         except OSError:
@@ -610,6 +730,8 @@ class Workspace:
             migrated = _upgrade_v3_generation_manifest(upgraded)
             atomic_write_json(path, migrated)
             return migrated
+        if raw["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+            return validate_interactive_generation_manifest(raw)
         return validate_generation_manifest(raw) if raw["schema_version"] == GENERATION_SCHEMA_VERSION else validate_job_manifest(raw)
 
     def chunks_path(self, conversion_id: str | uuid.UUID) -> Path:
@@ -647,7 +769,7 @@ class Workspace:
             with os.fdopen(fd, "w", encoding="ascii") as handle:
                 handle.write("cancel\n")
                 handle.flush(); os.fsync(handle.fileno())
-            os.replace(temporary, marker)
+            _replace_with_retries(temporary, marker)
         finally:
             temporary.unlink(missing_ok=True)
         return marker
@@ -676,12 +798,63 @@ class Workspace:
             raise UnsafePathError("cancel marker is unsafe")
         marker.unlink()
 
+    def voice_analysis_cancel_marker_path(self, conversion_id: str | uuid.UUID) -> Path:
+        return self.conversion_path(conversion_id) / "voice-analysis.cancel"
+
+    def request_voice_analysis_cancel(self, conversion_id: str | uuid.UUID) -> Path:
+        marker = self.voice_analysis_cancel_marker_path(conversion_id)
+        try:
+            info = marker.lstat()
+        except FileNotFoundError:
+            info = None
+        except OSError as exc:
+            raise UnsafePathError("voice analysis cancel marker is unavailable") from exc
+        if info is not None and (stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISREG(info.st_mode)):
+            raise UnsafePathError("voice analysis cancel marker is unsafe")
+        fd, temporary_name = tempfile.mkstemp(prefix=".voice-analysis.cancel.", dir=marker.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write("cancel\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _replace_with_retries(temporary, marker)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return marker
+
+    def voice_analysis_cancellation_requested(self, conversion_id: str | uuid.UUID) -> bool:
+        marker = self.voice_analysis_cancel_marker_path(conversion_id)
+        try:
+            info = marker.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise UnsafePathError("voice analysis cancel marker is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISREG(info.st_mode):
+            raise UnsafePathError("voice analysis cancel marker is unsafe")
+        return True
+
+    def clear_voice_analysis_cancel_request(self, conversion_id: str | uuid.UUID) -> None:
+        marker = self.voice_analysis_cancel_marker_path(conversion_id)
+        if not marker.exists() and not marker.is_symlink():
+            return
+        try:
+            info = marker.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise UnsafePathError("voice analysis cancel marker is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISREG(info.st_mode):
+            raise UnsafePathError("voice analysis cancel marker is unsafe")
+        marker.unlink()
+
     def configure_generation(self, conversion_id: str | uuid.UUID, *, tts: dict[str, Any], total_chunks: int) -> dict[str, Any]:
         """Upgrade a planned manifest to the current generation schema."""
 
         if type(total_chunks) is not int or total_chunks < 0:
             raise ManifestError("total_chunks must be non-negative")
         current = self.read_job(conversion_id)
+        if current["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+            raise ManifestError("interactive generation requires configure_interactive_generation")
         if current["schema_version"] == GENERATION_SCHEMA_VERSION:
             if current["status"] == "completed" and current.get("stage") == "synthesis_complete" and current.get("output") is None:
                 if current["tts"] != tts or current["total_chunks"] != total_chunks:
@@ -720,13 +893,93 @@ class Workspace:
         self.clear_cancel_request(conversion_id)
         return upgraded
 
+    def configure_interactive_generation(
+        self,
+        conversion_id: str | uuid.UUID,
+        *,
+        tts: dict[str, Any],
+        total_chunks: int,
+        voice_registry_revision: str,
+    ) -> dict[str, Any]:
+        """Bind an approved voice plan and current analysis to schema-v5 generation."""
+
+        if type(total_chunks) is not int or total_chunks < 0:
+            raise ManifestError("total_chunks must be non-negative")
+        _validate_sha(voice_registry_revision, "voice_registry_revision")
+        current = self.read_job(conversion_id)
+        plan = self.load_voice_plan(conversion_id)
+        if plan["approval"]["state"] != "approved":
+            raise ManifestError("interactive generation requires an approved voice plan")
+        analysis = self.load_speaker_analysis(conversion_id)
+        cast_voice_ids: list[str] = []
+        for cast_entry in plan["cast"]:
+            voice_id = cast_entry["voice_id"]
+            if voice_id not in cast_voice_ids:
+                cast_voice_ids.append(voice_id)
+        facts = {
+            "mode": "interactive_voices",
+            "tts": tts,
+            "total_chunks": total_chunks,
+            "voice_plan_sha256": plan["canonical_artifact_sha256"],
+            "voice_plan_revision": plan["revision"],
+            "speaker_analysis_sha256": analysis["canonical_artifact_sha256"],
+            "cast_voice_ids": cast_voice_ids,
+            "voice_registry_revision": voice_registry_revision,
+        }
+        if current.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+            facts_identical = all(current.get(key) == value for key, value in facts.items())
+            if current["status"] == "completed":
+                if current.get("stage") == "synthesis_complete" and current.get("output") is None and facts_identical:
+                    return current
+                raise ManifestError("completed interactive generation cannot be reconfigured")
+            if facts_identical:
+                if current["status"] not in {"synthesizing", "cancelling"}:
+                    self.clear_cancel_request(conversion_id)
+                return current
+            if current["status"] in {"synthesizing", "cancelling"}:
+                raise ManifestError("active interactive generation settings cannot change")
+            if current["status"] not in {"planned", "analyzed", "pending", "cancelled", "failed"}:
+                raise ManifestError("job is not ready for interactive generation")
+        elif current["status"] not in {"planned", "analyzed", "pending", "cancelled", "failed", "synthesizing", "cancelling"}:
+            raise ManifestError("job is not ready for interactive generation")
+
+        candidates: list[dict[str, Any]] = []
+        if current.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION and current["status"] in {"planned", "analyzed", "pending", "cancelled", "failed"}:
+            candidates = [
+                dict(record)
+                for record in current["completed_chunks"]
+                if record["global_index"] < total_chunks
+            ]
+        configured = {
+            **current,
+            "schema_version": INTERACTIVE_GENERATION_SCHEMA_VERSION,
+            **facts,
+            "status": "planned",
+            "stage": "chapter_review",
+            "error": None,
+            "last_safe_error": None,
+            "completed_chunks": candidates,
+            "progress": {"completed": len(candidates), "current": 0, "total": total_chunks},
+            "worker": None,
+            "output": None,
+        }
+        validated = validate_interactive_generation_manifest(configured)
+        atomic_write_json(self.job_path(conversion_id), validated)
+        self.chunks_path(conversion_id)
+        self.clear_cancel_request(conversion_id)
+        return validated
+
     def update_generation(self, conversion_id: str | uuid.UUID, **updates: Any) -> dict[str, Any]:
         current = self.read_job(conversion_id)
-        if current["schema_version"] != GENERATION_SCHEMA_VERSION:
+        if current["schema_version"] not in {GENERATION_SCHEMA_VERSION, INTERACTIVE_GENERATION_SCHEMA_VERSION}:
             raise ManifestError("job is not a generation manifest")
         current.update(updates)
         current["updated_at"] = _timestamp()
-        validated = validate_generation_manifest(current)
+        validated = (
+            validate_interactive_generation_manifest(current)
+            if current["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION
+            else validate_generation_manifest(current)
+        )
         atomic_write_json(self.job_path(conversion_id), validated)
         return validated
 
@@ -809,13 +1062,169 @@ class Workspace:
         _validate_chapter_plan(plan, job["cleaned_text_sha256"])
         return plan
 
+    def persist_voice_plan(self, conversion_id: str | uuid.UUID, plan: dict[str, Any]) -> dict[str, Any]:
+        """Validate and atomically persist a draft or approved Interactive Voices plan."""
+
+        directory = self.conversion_path(conversion_id)
+        target = directory / "voice-plan.json"
+        if target.exists() or target.is_symlink():
+            _validate_regular_manifest_file(target, "voice plan")
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        try:
+            validated = validate_voice_plan(
+                plan,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except VoicePlanError as exc:
+            raise ManifestError("invalid voice plan artifact") from exc
+        atomic_write_json(target, validated)
+        return validated
+
+    def load_voice_plan(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
+        """Load and validate a draft or approved Interactive Voices plan and bindings."""
+
+        directory = self.conversion_path(conversion_id)
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        target = directory / "voice-plan.json"
+        _validate_regular_manifest_file(target, "voice plan")
+        try:
+            artifact = json.loads(target.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ManifestError("malformed voice plan JSON") from exc
+        try:
+            return validate_voice_plan(
+                artifact,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except VoicePlanError as exc:
+            raise ManifestError("invalid voice plan artifact") from exc
+
+    def persist_speaker_analysis(self, conversion_id: str | uuid.UUID, analysis: dict[str, Any]) -> dict[str, Any]:
+        """Validate and atomically persist replaceable machine-only analysis."""
+
+        directory = self.conversion_path(conversion_id)
+        target = directory / "speaker-analysis.json"
+        if target.exists() or target.is_symlink():
+            _validate_regular_manifest_file(target, "speaker analysis")
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        try:
+            validated = validate_speaker_analysis(
+                analysis,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except SpeakerAnalysisError as exc:
+            raise ManifestError("invalid speaker analysis artifact") from exc
+        atomic_write_json(target, validated)
+        return validated
+
+    def load_speaker_analysis(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
+        """Load and validate current replaceable machine-only analysis."""
+
+        directory = self.conversion_path(conversion_id)
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        target = directory / "speaker-analysis.json"
+        _validate_regular_manifest_file(target, "speaker analysis")
+        if target.stat(follow_symlinks=False).st_size > MAX_ARTIFACT_BYTES:
+            raise ManifestError("speaker analysis artifact too large")
+        try:
+            artifact = json.loads(target.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ManifestError("malformed speaker analysis JSON") from exc
+        try:
+            return validate_speaker_analysis(
+                artifact,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except SpeakerAnalysisError as exc:
+            raise ManifestError("invalid speaker analysis artifact") from exc
+
+    def persist_voice_analysis_status(self, conversion_id: str | uuid.UUID, status: dict[str, Any]) -> dict[str, Any]:
+        """Validate and atomically persist the current voice-analysis status."""
+
+        directory = self.conversion_path(conversion_id)
+        target = directory / "voice-analysis-status.json"
+        if target.exists() or target.is_symlink():
+            _validate_regular_manifest_file(target, "voice-analysis status")
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        try:
+            validated = validate_voice_analysis_status(
+                status,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except VoiceAnalysisError as exc:
+            raise ManifestError("invalid voice-analysis status") from exc
+        atomic_write_json(target, validated)
+        return validated
+
+    def load_voice_analysis_status(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
+        """Load and validate the current voice-analysis status."""
+
+        directory = self.conversion_path(conversion_id)
+        job = self.read_job(conversion_id)
+        self.load_analysis(conversion_id)
+        cleaned_text, _ = self.load_cleaned_artifacts(conversion_id)
+        chapter_plan = self.load_chapter_plan(conversion_id)
+        target = directory / "voice-analysis-status.json"
+        _validate_regular_manifest_file(target, "voice-analysis status")
+        if target.stat(follow_symlinks=False).st_size > MAX_VOICE_ANALYSIS_STATUS_BYTES:
+            raise ManifestError("voice-analysis status too large")
+        try:
+            artifact = json.loads(target.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ManifestError("malformed voice-analysis status JSON") from exc
+        try:
+            return validate_voice_analysis_status(
+                artifact,
+                cleaned_text,
+                chapter_plan,
+                expected_source_pdf_sha256=job["source_pdf_sha256"],
+                expected_chapter_plan_sha256=job["chapter_plan_sha256"],
+            )
+        except VoiceAnalysisError as exc:
+            raise ManifestError("invalid voice-analysis status") from exc
+
     def update_job(self, conversion_id: str | uuid.UUID, **updates: Any) -> dict[str, Any]:
         """Atomically update strict job fields without changing its identity."""
 
         current = self.read_job(conversion_id)
         current.update(updates)
         current["updated_at"] = _timestamp()
-        validated = validate_generation_manifest(current) if current.get("schema_version") == GENERATION_SCHEMA_VERSION else validate_job_manifest(current)
+        if current.get("schema_version") == INTERACTIVE_GENERATION_SCHEMA_VERSION:
+            validated = validate_interactive_generation_manifest(current)
+        elif current.get("schema_version") == GENERATION_SCHEMA_VERSION:
+            validated = validate_generation_manifest(current)
+        else:
+            validated = validate_job_manifest(current)
         atomic_write_json(self.job_path(conversion_id), validated)
         return validated
 
@@ -1019,6 +1428,7 @@ __all__ = [
     "JOB_SCHEMA_VERSION",
     "LEGACY_GENERATION_SCHEMA_VERSION",
     "GENERATION_SCHEMA_VERSION",
+    "INTERACTIVE_GENERATION_SCHEMA_VERSION",
     "ManifestError",
     "StartupInspection",
     "UnsafePathError",
@@ -1032,4 +1442,6 @@ __all__ = [
     "validate_job_manifest",
     "validate_generation_manifest",
     "validate_generation_manifest_v3",
+    "validate_generation_manifest_v5",
+    "validate_interactive_generation_manifest",
 ]

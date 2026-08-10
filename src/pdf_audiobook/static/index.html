@@ -87,8 +87,71 @@
         </fieldset>
       </div>
 
+      <fieldset class="panel voice-mode-panel">
+        <legend>Voice mode</legend>
+        <p class="note">Single Voice is the simple default. Interactive Voices is optional and lets you review a local cast before generation.</p>
+        <div class="voice-mode-choice" role="radiogroup" aria-label="Choose voice mode">
+          <label><input type="radio" name="voice-mode" value="single" checked> <span><strong>Single Voice</strong><small>One voice reads the whole book.</small></span></label>
+          <label><input type="radio" name="voice-mode" value="interactive_voices"> <span><strong>Interactive Voices</strong><small>Review speakers, aliases, and per-span choices.</small></span></label>
+        </div>
+        <div id="interactive-entry" class="interactive-entry" hidden>
+          <p id="interactive-entry-status" class="status" role="status" aria-live="polite">Generate a chapter plan before starting voice analysis.</p>
+          <button id="start-voice-analysis" class="secondary" type="button" disabled>Start Interactive Voice Analysis</button>
+        </div>
+      </fieldset>
+
+      <section id="interactive-review" class="interactive-review" hidden aria-labelledby="interactive-review-title">
+        <div class="interactive-review-heading">
+          <div>
+            <h2 id="interactive-review-title">Interactive voice review</h2>
+            <p class="note">Review the local cast and uncertain spans. Distinct voices require a proper named speaker with at least 10 attributed lines; rank- or pronoun-only dialogue uses Narrator. Remove mistakes or merge duplicate and nickname entries (such as Bobby into Bob). Changes are saved against the current plan revision.</p>
+          </div>
+          <p id="interactive-analysis-status" class="status" role="status" aria-live="polite">Analysis has not started.</p>
+        </div>
+        <div id="interactive-analysis-progress" class="analysis-progress" hidden>
+          <div class="progress-heading"><span id="interactive-analysis-stage">Queued</span><strong id="interactive-analysis-percent">0%</strong></div>
+          <div id="interactive-analysis-bar" class="progress-track" role="progressbar" aria-label="Interactive voice analysis progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+          <button id="cancel-voice-analysis" class="secondary" type="button" disabled>Cancel voice analysis</button>
+        </div>
+        <div id="interactive-editor" hidden>
+          <div class="review-toolbar">
+            <p id="interactive-plan-status" class="status" role="status" aria-live="polite">Draft voice plan is loading.</p>
+            <button id="reload-voice-plan" class="secondary" type="button">Refresh voice plan</button>
+          </div>
+          <div class="review-grid">
+            <section class="review-section" aria-labelledby="cast-title">
+              <h3 id="cast-title" class="section-title">Cast and voices</h3>
+              <div id="interactive-cast" class="cast-list"></div>
+            </section>
+            <section class="review-section" aria-labelledby="aliases-title">
+              <h3 id="aliases-title" class="section-title">Aliases</h3>
+              <details id="interactive-aliases-disclosure" class="alias-disclosure">
+                <summary id="interactive-aliases-summary" aria-controls="interactive-aliases">Aliases</summary>
+                <div id="interactive-aliases" class="alias-list" aria-live="polite"></div>
+              </details>
+            </section>
+          </div>
+          <section class="review-section spans-section" aria-labelledby="spans-title">
+            <div class="spans-heading">
+              <h3 id="spans-title" class="section-title">Speaker spans</h3>
+              <div class="span-filters" role="group" aria-label="Filter speaker spans">
+                <label for="span-chapter-filter">Chapter <select id="span-chapter-filter"><option value="">All chapters</option></select></label>
+                <label for="span-confidence-filter">Confidence <select id="span-confidence-filter"><option value="">All confidence</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
+              </div>
+            </div>
+            <p id="span-filter-status" class="status" role="status" aria-live="polite"></p>
+            <div id="interactive-spans" class="span-list"></div>
+            <button id="load-more-spans" class="secondary" type="button" hidden>Load more spans</button>
+          </section>
+          <label class="unresolved-acceptance"><input id="accept-narrator-fallback" type="checkbox"> I reviewed unresolved spans and accept Narrator as their fallback.</label>
+          <p id="interactive-approval-status" class="status" role="status" aria-live="polite"></p>
+          <button id="approve-voice-plan" class="primary" type="button" disabled>Approve Voice Plan</button>
+        </div>
+      </section>
+
       <fieldset class="panel generation-panel">
         <legend>Voice and output</legend>
+        <div id="single-voice-controls">
         <div class="voice-grid" role="radiogroup" aria-label="Voice">
           <div class="voice-card selected"><label class="voice-choice"><input type="radio" name="voice" value="af_heart" checked><span><strong>af_heart</strong><small>Warm, clear</small></span></label><button class="preview-voice" type="button" data-voice="af_heart" aria-label="Preview af_heart">Preview</button></div>
           <div class="voice-card"><label class="voice-choice"><input type="radio" name="voice" value="af_bella"><span><strong>af_bella</strong><small>Bright, measured</small></span></label><button class="preview-voice" type="button" data-voice="af_bella" aria-label="Preview af_bella">Preview</button></div>
@@ -100,6 +163,8 @@
           <label class="speed-control" for="speed">Speed <output id="speed-value" for="speed">1.0&times;</output><input id="speed" type="range" min="0.5" max="2" step="0.1" value="1"></label>
           <div class="output-note"><strong>Default output</strong><span>Saved directly in Downloads; only the final M4B appears there. Work chunks stay hidden in AppData.</span></div>
         </div>
+        </div>
+        <p id="interactive-generation-context" class="interactive-generation-context" hidden>Interactive Voices plan: approval is required before generation.</p>
         <div class="performance-mode" role="radiogroup" aria-labelledby="performance-mode-title">
           <strong id="performance-mode-title">Generation performance</strong>
           <label><input type="radio" name="performance-mode" value="background" checked><span><b>Background</b><small>Recommended; lower CPU use keeps your computer responsive.</small></span></label>

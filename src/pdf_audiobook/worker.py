@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import os
+from collections import OrderedDict
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -12,11 +13,30 @@ from typing import Any, Callable
 from .audio import validate_wav, write_pcm_wav
 from .chapters import select_chapter_range
 from .security import pid_is_alive
-from .tts import EngineMetadata, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks
+from .tts import EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks, plan_interactive_chunks
+from .voice_registry import get_generation_facts, registry_revision
 from .workspace import ManifestError, Workspace, UnsafePathError
 from .m4b import Phase5Cancelled, finalize_conversion
 
 MAX_ATTEMPTS = 3
+VOICE_CACHE_CAP = 2
+
+
+def _validate_captured_voice_facts(tts: dict[str, Any], facts: dict[str, Any], voice_id: str) -> None:
+    """Reject registry drift before a voice can produce audio."""
+
+    if not isinstance(facts, dict) or facts.get("id") != voice_id or facts.get("enabled") is not True:
+        raise RuntimeError("voice facts do not match captured generation")
+    for field in ("engine", "package_version", "model", "model_revision", "model_checksum", "sample_rate"):
+        if facts.get(field) != tts.get(field):
+            raise RuntimeError("voice facts do not match captured generation")
+    if type(facts.get("sample_rate")) is not int or facts["sample_rate"] != tts.get("sample_rate"):
+        raise RuntimeError("voice sample rate does not match captured generation")
+    # Voice version/checksum are voice-specific.  The captured top-level voice
+    # metadata binds those fields only for that voice; other cast voices share
+    # the model/engine/sample-rate capture.
+    if voice_id == tts.get("voice") and any(facts.get(field) != tts.get(field) for field in ("voice_version", "voice_checksum")):
+        raise RuntimeError("voice facts do not match captured generation")
 
 
 class CancellationRequested(Exception):
@@ -46,22 +66,28 @@ class ConversionWorker:
         self.engine_factory = engine_factory
         self.max_attempts = max_attempts
 
+    @staticmethod
+    def _timestamp() -> str:
+        return __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
     def _claim(self, job: dict[str, Any]) -> dict[str, Any]:
         worker = job.get("worker")
         if worker and worker.get("pid") != os.getpid() and pid_is_alive(worker.get("pid", -1)):
             raise WorkerBusyError("a conversion worker is already active")
-        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        now = self._timestamp()
         return self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", worker={"pid": os.getpid(), "started_at": now, "updated_at": now}, error=None, last_safe_error=None)
 
     def _claim_phase5(self, job: dict[str, Any]) -> dict[str, Any]:
         worker = job.get("worker")
         if worker and worker.get("pid") != os.getpid() and pid_is_alive(worker.get("pid", -1)):
             raise WorkerBusyError("a conversion worker is already active")
-        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        now = self._timestamp()
         started = worker.get("started_at", now) if worker else now
         return self.workspace.update_generation(self.conversion_id, status="assembling", stage="assembling", worker={"pid": os.getpid(), "started_at": started, "updated_at": now}, error=None, last_safe_error=None)
 
-    def _planned_chunks(self, job: dict[str, Any]) -> list[TextChunk]:
+    def _planned_chunks(self, job: dict[str, Any]) -> list[TextChunk | InteractiveTextChunk]:
+        if job.get("schema_version") == 5:
+            return self._planned_interactive_chunks(job)
         text, _ = self.workspace.load_cleaned_artifacts(self.conversion_id)
         plan = self.workspace.load_chapter_plan(self.conversion_id)
         tts = job["tts"]
@@ -74,6 +100,37 @@ class ConversionWorker:
         settings = metadata.settings
         chapters = select_chapter_range(plan, settings.get("chapter_start"), settings.get("chapter_end"))
         return plan_chunks(text, chapters, metadata, cap=int(settings.get("chunk_cap", 900)))
+
+    def _planned_interactive_chunks(self, job: dict[str, Any]) -> list[InteractiveTextChunk]:
+        text, _ = self.workspace.load_cleaned_artifacts(self.conversion_id)
+        plan = self.workspace.load_voice_plan(self.conversion_id)
+        analysis = self.workspace.load_speaker_analysis(self.conversion_id)
+        approval = plan.get("approval")
+        if not isinstance(approval, dict) or approval.get("state") != "approved":
+            raise ManifestError("interactive generation requires an approved voice plan")
+        if plan.get("canonical_artifact_sha256") != job.get("voice_plan_sha256") or plan.get("revision") != job.get("voice_plan_revision"):
+            raise ManifestError("voice plan does not match generation manifest")
+        if analysis.get("canonical_artifact_sha256") != job.get("speaker_analysis_sha256"):
+            raise ManifestError("speaker analysis does not match generation manifest")
+        current_registry_revision = registry_revision()
+        if current_registry_revision != job.get("voice_registry_revision"):
+            raise ManifestError("voice registry revision does not match generation manifest")
+        tts = job["tts"]
+        settings = tts.get("settings") if isinstance(tts.get("settings"), dict) else {}
+        chapter_start, chapter_end = settings.get("chapter_start"), settings.get("chapter_end")
+        chapter_range = None
+        if chapter_start is not None or chapter_end is not None:
+            if type(chapter_start) is not int or type(chapter_end) is not int:
+                raise ManifestError("captured chapter range is invalid")
+            chapter_range = (chapter_start, chapter_end)
+        return plan_interactive_chunks(
+            text,
+            plan,
+            get_generation_facts,
+            current_registry_revision,
+            chapter_range=chapter_range,
+            cap=int(tts.get("chunk_cap", settings.get("chunk_cap", 900))),
+        )
 
     def _chunk_path(self, chunk: TextChunk) -> Path:
         return self.workspace.chunks_path(self.conversion_id) / f"chapter-{chunk.chapter_index:03d}-chunk-{chunk.local_index:04d}.wav"
@@ -102,10 +159,49 @@ class ConversionWorker:
             return {**record, "duration_seconds": info.duration_seconds, "wav_sha256": digest}
         return None
 
-    def run(self, *, engine: Any | None = None, full_pipeline: bool | None = None) -> WorkerResult:
-        if full_pipeline is None:
-            full_pipeline = engine is None
-        job = self.workspace.read_job(self.conversion_id)
+    def _existing_interactive(self, job: dict[str, Any], chunk: InteractiveTextChunk) -> dict[str, Any] | None:
+        expected_path = self._chunk_path(chunk).relative_to(self.workspace.conversion_path(self.conversion_id)).as_posix()
+        for record in job["completed_chunks"]:
+            if (
+                record["chapter_index"] != chunk.chapter_index
+                or record["local_index"] != chunk.local_index
+                or record["global_index"] != chunk.global_index
+                or record["relative_path"] != expected_path
+                or record.get("audio_input_hash") != chunk.audio_input_hash
+            ):
+                continue
+            path = self.workspace.conversion_path(self.conversion_id) / expected_path
+            try:
+                info = validate_wav(path, expected_sample_rate=job["tts"]["sample_rate"])
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                return None
+            if record.get("wav_sha256") != digest or info.duration_seconds <= 0:
+                return None
+            # Always project the current planner metadata onto a semantically
+            # reusable WAV.  This drops stale plan/input metadata while
+            # retaining the verified audio and its measured duration.
+            return {**chunk.manifest_record(expected_path, info.duration_seconds), "wav_sha256": digest}
+        return None
+
+    def _sanitize_interactive(self, job: dict[str, Any], chunks: list[InteractiveTextChunk]) -> dict[str, Any]:
+        verified: list[dict[str, Any]] = []
+        for chunk in chunks:
+            candidate = self._existing_interactive(job, chunk)
+            if candidate is not None:
+                verified.append(candidate)
+        if verified == job["completed_chunks"] and job["progress"]["completed"] == len(verified):
+            return job
+        current = verified[-1]["global_index"] + 1 if verified else 0
+        return self.workspace.update_generation(
+            self.conversion_id,
+            completed_chunks=verified,
+            progress={"completed": len(verified), "current": current, "total": len(chunks)},
+        )
+
+    def _run_v4(self, job: dict[str, Any], *, engine: Any | None = None, full_pipeline: bool = True) -> WorkerResult:
+        """Run the legacy schema-v4 flow without interactive voice behavior."""
+
         if job.get("schema_version") != 4:
             raise ManifestError("job must be configured for generation")
         chunks = self._planned_chunks(job)
@@ -165,7 +261,7 @@ class ConversionWorker:
                 relative = path.relative_to(self.workspace.conversion_path(self.conversion_id)).as_posix()
                 completed[chunk.global_index] = {**chunk.manifest_record(relative, info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                 ordered = [completed[index] for index in sorted(completed)]
-                job = self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", completed_chunks=ordered, progress={"completed": len(ordered), "current": chunk.global_index + 1, "total": len(chunks)}, worker={"pid": os.getpid(), "started_at": job["worker"]["started_at"], "updated_at": job["updated_at"]})
+                job = self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", completed_chunks=ordered, progress={"completed": len(ordered), "current": chunk.global_index + 1, "total": len(chunks)}, worker={"pid": os.getpid(), "started_at": job["worker"]["started_at"], "updated_at": self._timestamp()})
             final_records = [completed[index] for index in sorted(completed)]
             self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
             if full_pipeline:
@@ -194,12 +290,169 @@ class ConversionWorker:
                 except Exception:
                     pass
 
+    def _run_v5(self, job: dict[str, Any], *, full_pipeline: bool = True) -> WorkerResult:
+        chunks = self._planned_chunks(job)
+        if len(chunks) != job["total_chunks"]:
+            raise ManifestError("planned chunk count does not match manifest")
+        if job.get("status") in {"assembling", "encoding", "verifying", "publishing"}:
+            if not full_pipeline:
+                return WorkerResult(job["status"], len(job["completed_chunks"]), len(chunks), 0)
+            self._claim_phase5(job)
+            try:
+                finalize_conversion(self.workspace, self.conversion_id)
+            except Phase5Cancelled:
+                return WorkerResult("cancelled", len(job["completed_chunks"]), len(chunks), 0)
+            return WorkerResult("completed", len(job["completed_chunks"]), len(chunks), 0)
+        if job.get("status") == "completed" and job.get("stage") == "synthesis_complete" and job.get("output") is None:
+            if full_pipeline:
+                self._claim_phase5(job)
+                try:
+                    finalize_conversion(self.workspace, self.conversion_id)
+                except Phase5Cancelled:
+                    return WorkerResult("cancelled", len(job["completed_chunks"]), len(chunks), 0)
+                return WorkerResult("completed", len(job["completed_chunks"]), len(chunks), 0)
+            return WorkerResult("completed", len(job["completed_chunks"]), len(chunks), 0)
+
+        # Remove every unverified candidate before claiming the worker.  The
+        # planner's semantic audio hash permits metadata-only reuse.
+        voice_plan = self.workspace.load_voice_plan(self.conversion_id)
+        cast_by_id = {entry["cast_id"]: entry for entry in voice_plan["cast"]}
+        job = self._sanitize_interactive(job, chunks)
+        job = self._claim(job)
+        attempts_total = 0
+        completed = {record["global_index"]: record for record in job["completed_chunks"]}
+        cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        closed: set[int] = set()
+
+        def close_cached(loaded: Any) -> None:
+            marker = id(loaded)
+            if marker in closed:
+                return
+            closed.add(marker)
+            try:
+                close_voice(loaded)
+            except Exception:
+                pass
+
+        def cancellation_check() -> None:
+            if self.workspace.cancellation_requested(self.conversion_id):
+                raise CancellationRequested
+
+        def load_for(chunk: InteractiveTextChunk) -> Any:
+            settings_data = job["tts"].get("settings", {})
+            if not isinstance(settings_data, dict):
+                settings_data = {}
+            cast_entry = cast_by_id.get(chunk.speaker_id)
+            if cast_entry is None or cast_entry.get("voice_id") != chunk.voice_id:
+                raise ManifestError("interactive chunk speaker binding is invalid")
+            cast_settings = cast_entry["voice_settings"]
+            settings = SynthesisSettings(
+                speed=float(cast_settings["speed"]),
+                sample_rate=int(job["tts"]["sample_rate"]),
+                chunk_cap=int(job["tts"].get("chunk_cap", 900)),
+                chunk_mode=str(settings_data.get("chunk_mode", "chapter")),
+                paragraph_pause_ms=int(settings_data.get("paragraph_pause_ms", 0)),
+                sentence_pause_ms=int(settings_data.get("sentence_pause_ms", 0)),
+            )
+            key = (chunk.voice_id, tuple(sorted(settings.as_dict().items())))
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                return cached
+            cancellation_check()
+            facts = get_generation_facts(chunk.voice_id)
+            _validate_captured_voice_facts(job["tts"], facts, chunk.voice_id)
+            cancellation_check()
+            loaded = self.engine_factory(chunk.voice_id, settings, engine=facts["engine"])
+            try:
+                cancellation_check()
+                metadata = getattr(loaded, "metadata", None)
+                if metadata is not None and getattr(metadata, "sample_rate", settings.sample_rate) != settings.sample_rate:
+                    raise RuntimeError("loaded voice sample rate does not match captured generation")
+                while len(cache) >= VOICE_CACHE_CAP:
+                    cancellation_check()
+                    _, evicted = cache.popitem(last=False)
+                    close_cached(evicted)
+                cache[key] = loaded
+                return loaded
+            except Exception:
+                close_cached(loaded)
+                raise
+
+        try:
+            for chunk in chunks:
+                if not isinstance(chunk, InteractiveTextChunk):
+                    raise ManifestError("interactive planner returned an invalid chunk")
+                cancellation_check()
+                reused = self._existing_interactive(job, chunk)
+                if reused is not None:
+                    completed[chunk.global_index] = reused
+                    continue
+                loaded = load_for(chunk)
+                path = self._chunk_path(chunk)
+                pcm = None
+                error: Exception | None = None
+                for _attempt in range(self.max_attempts):
+                    cancellation_check()
+                    attempts_total += 1
+                    try:
+                        pcm = loaded.synthesize(chunk.text)
+                        error = None
+                        break
+                    except Exception as exc:
+                        error = exc
+                if pcm is None:
+                    message = f"chunk {chunk.global_index} failed after {self.max_attempts} attempts"
+                    self.workspace.update_generation(self.conversion_id, status="failed", stage="synthesis", error=message, last_safe_error=message, worker=None)
+                    raise RuntimeError(message) from error
+                info = write_pcm_wav(path, pcm, int(job["tts"]["sample_rate"]), overwrite=True)
+                relative = path.relative_to(self.workspace.conversion_path(self.conversion_id)).as_posix()
+                completed[chunk.global_index] = {**chunk.manifest_record(relative, info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                ordered = [completed[index] for index in sorted(completed)]
+                job = self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", completed_chunks=ordered, progress={"completed": len(ordered), "current": chunk.global_index + 1, "total": len(chunks)}, worker={"pid": os.getpid(), "started_at": job["worker"]["started_at"], "updated_at": self._timestamp()})
+            final_records = [completed[index] for index in sorted(completed)]
+            self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
+            if full_pipeline:
+                self._claim_phase5(self.workspace.read_job(self.conversion_id))
+                try:
+                    finalize_conversion(self.workspace, self.conversion_id)
+                except Phase5Cancelled:
+                    return WorkerResult("cancelled", len(final_records), len(chunks), attempts_total)
+            return WorkerResult("completed", len(final_records), len(chunks), attempts_total)
+        except CancellationRequested:
+            self.workspace.update_generation(self.conversion_id, status="cancelled", stage="cancelled", worker=None, last_safe_error="cancelled")
+            return WorkerResult("cancelled", len(self.workspace.read_job(self.conversion_id)["completed_chunks"]), len(chunks), attempts_total)
+        except Exception as exc:
+            message = "worker failed: " + type(exc).__name__
+            try:
+                current = self.workspace.read_job(self.conversion_id)
+                if current.get("status") != "failed" and current.get("stage") not in {"assembling", "encoding", "verifying", "publishing", "phase5"}:
+                    self.workspace.update_generation(self.conversion_id, status="failed", stage="synthesis", error=message, last_safe_error=message, worker=None)
+            except Exception:
+                pass
+            raise
+        finally:
+            for loaded in list(cache.values()):
+                close_cached(loaded)
+
+    def run(self, *, engine: Any | None = None, full_pipeline: bool | None = None) -> WorkerResult:
+        if full_pipeline is None:
+            full_pipeline = engine is None
+        job = self.workspace.read_job(self.conversion_id)
+        if job.get("schema_version") == 5:
+            if engine is not None:
+                raise ManifestError("schema-v5 requires an engine factory")
+            return self._run_v5(job, full_pipeline=full_pipeline)
+        if job.get("schema_version") != 4:
+            raise ManifestError("job must be configured for generation")
+        return self._run_v4(job, engine=engine, full_pipeline=full_pipeline)
+
 
 def run_worker(workspace_root: str | Path, conversion_id: str) -> WorkerResult:
     return ConversionWorker(Workspace(Path(workspace_root)), conversion_id).run(full_pipeline=True)
 
 
-__all__ = ["MAX_ATTEMPTS", "CancellationRequested", "ConversionWorker", "WorkerBusyError", "WorkerResult", "run_worker"]
+__all__ = ["MAX_ATTEMPTS", "VOICE_CACHE_CAP", "CancellationRequested", "ConversionWorker", "WorkerBusyError", "WorkerResult", "run_worker"]
 
 if __name__ == "__main__":  # pragma: no cover - exercised by the launcher
     import argparse
