@@ -76,6 +76,7 @@
     document.querySelector(".next").disabled = true;
     document.querySelector("#save-labels").disabled = true;
     if (message) document.querySelector("#plan-status").textContent = message;
+    updateModeReadiness();
   };
 
   const resetExistingJob = () => {
@@ -223,7 +224,8 @@
     finally {
       planRequestInFlight = false; setPlanControlsDisabled(false);
       if (chapterPlan && planMatchesSelection(chapterPlan)) { document.querySelector("#save-labels").disabled = !labelsDirty; document.querySelector(".next").disabled = false; }
-      if (interactiveMode) { interactive("#start-voice-analysis").disabled = !chapterPlan; interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis."; updateInteractiveReadiness(); }
+      if (interactiveMode) { interactive("#start-voice-analysis").disabled = !chapterPlan; interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis."; }
+      updateModeReadiness();
     }
   };
 
@@ -257,9 +259,8 @@
     setPlanControlsDisabled(disabled);
     if (!disabled) {
       const active = activeGenerationStates.has(recoveredState);
-      document.querySelector("#start-generation").disabled = active || !chapterPlan || !planMatchesSelection(chapterPlan) || !currentChapterRange().valid;
       document.querySelector("#save-labels").disabled = active || !labelsDirty;
-      if (interactiveMode) updateInteractiveReadiness();
+      updateModeReadiness();
     }
   };
 
@@ -516,16 +517,29 @@
     return new Error(`${error.code}: ${error.message}`);
   };
 
+  const updateSingleVoiceReadiness = () => {
+    if (interactiveMode) return false;
+    const ready = Boolean(chapterPlan && planMatchesSelection(chapterPlan) && currentChapterRange().valid && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
+    document.querySelector("#start-generation").disabled = !ready;
+    return ready;
+  };
+
   const updateInteractiveReadiness = () => {
+    if (!interactiveMode) return false;
     const accepted = Boolean(interactive("#accept-narrator-fallback")?.checked);
     const unresolved = Number(voicePlan?.review?.unresolved_count || 0);
     const approved = voicePlan?.approval?.state === "approved";
     const canApprove = Boolean(voicePlan && !approved && (!unresolved || accepted));
     if (interactive("#approve-voice-plan")) interactive("#approve-voice-plan").disabled = !canApprove;
     const range = currentChapterRange();
-    const ready = Boolean(interactiveMode && approved && range.valid && !generationRequestInFlight && !planRequestInFlight);
+    const ready = Boolean(approved && range.valid && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
     document.querySelector("#start-generation").disabled = !ready;
     return ready;
+  };
+
+  const updateModeReadiness = () => {
+    if (interactiveMode) updateInteractiveReadiness();
+    else updateSingleVoiceReadiness();
   };
 
   const setInteractiveMode = (enabled) => {
@@ -537,10 +551,8 @@
     if (enabled) {
       interactive("#start-voice-analysis").disabled = !chapterPlan || planRequestInFlight;
       interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis.";
-      updateInteractiveReadiness();
-    } else {
-      document.querySelector("#start-generation").disabled = !chapterPlan || !planMatchesSelection(chapterPlan) || !currentChapterRange().valid;
     }
+    updateModeReadiness();
   };
 
   const renderAnalysisProgress = (body) => {
@@ -672,7 +684,7 @@
   const loadVoicePlan = async (append = false) => {
     const chapter = interactive("#span-chapter-filter").value; const confidence = interactive("#span-confidence-filter").value; const params = new URLSearchParams({ limit: "100", offset: String(append ? spanOffset : 0) }); if (chapter) params.set("chapter", chapter); if (confidence) params.set("confidence", confidence);
     const response = await fetch(`/api/voice-plan?${params.toString()}`); if (!response.ok) throw await interactiveError(response); const body = await response.json(); voicePlan = body; voicePlanRevision = body.revision; if (!append) { spanOffset = 0; renderCast(); renderAliases(); const chapters = [...new Set((chapterPlan?.chapters || []).map((entry) => entry.index))]; const select = interactive("#span-chapter-filter"); const selected = select.value; select.replaceChildren(); const all = document.createElement("option"); all.value = ""; all.textContent = "All chapters"; select.append(all); chapters.forEach((index) => { const option = document.createElement("option"); option.value = String(index); option.textContent = `Chapter ${index}`; option.selected = String(index) === selected; select.append(option); }); }
-    spanOffset = Number(body.offset || 0) + (body.spans || []).length; renderSpans(body.spans, body.total, body.has_more, append); updateInteractiveReadiness(); return body;
+    spanOffset = Number(body.offset || 0) + (body.spans || []).length; renderSpans(body.spans, body.total, body.has_more, append); updateModeReadiness(); return body;
   };
 
   const draftVoicePlan = async (revision) => {
@@ -743,7 +755,7 @@
   drop.addEventListener("dragover", (event) => { event.preventDefault(); }); drop.addEventListener("drop", (event) => { event.preventDefault(); chosen(event.dataTransfer.files[0]); });
   document.querySelectorAll("input[name=plan-mode]").forEach((control) => control.addEventListener("change", () => { const mode = control.value; document.querySelector(".custom-count").hidden = mode !== "custom"; if (mode === "custom") { invalidatePlan("Choose a count from 2–50, then select Generate plan."); return; } runPlanRequest(mode); }));
   document.querySelector("#chapter-count").addEventListener("input", () => { if (currentPlanSpec().mode === "custom") invalidatePlan("Choose a count from 2–50, then select Generate plan."); });
-  document.querySelectorAll("#chapter-start, #chapter-end").forEach((control) => control.addEventListener("input", () => { updateChapterRange(); updateInteractiveReadiness(); }));
+  document.querySelectorAll("#chapter-start, #chapter-end").forEach((control) => control.addEventListener("input", () => { updateChapterRange(); updateModeReadiness(); }));
   document.querySelector("#regenerate-plan").addEventListener("click", async () => { const selection = currentPlanSpec(); await runPlanRequest(selection.mode, selection.mode === "custom" ? selection.count : undefined); });
   document.querySelector("#save-labels").addEventListener("click", () => saveLabels()); document.querySelector("#start-generation").addEventListener("click", startGeneration);
   document.querySelectorAll("input[name=voice]").forEach((control) => control.addEventListener("change", () => { document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector("input").checked)); }));
