@@ -152,6 +152,35 @@
       <fieldset class="panel generation-panel">
         <legend>Voice and output</legend>
         <div id="single-voice-controls">
+        <fieldset class="engine-choice-panel">
+          <legend>Speech engine</legend>
+          <div class="engine-choice" role="radiogroup" aria-label="Choose speech engine">
+            <label><input type="radio" name="single-engine" value="kokoro" checked> <span><strong>Kokoro</strong><small>Default local English voice engine.</small></span></label>
+            <label><input type="radio" name="single-engine" value="chatterbox" disabled> <span><strong>Chatterbox Nano</strong><small id="chatterbox-installed-status">Optional CPU engine; checking availability...</small></span></label>
+          </div>
+          <p id="engine-status" class="status" role="status" aria-live="polite">Kokoro is selected.</p>
+        </fieldset>
+        <section id="chatterbox-reference-panel" class="chatterbox-reference-panel" hidden aria-labelledby="chatterbox-reference-title">
+          <h3 id="chatterbox-reference-title" class="section-title">Chatterbox Nano voice</h3>
+          <div class="chatterbox-voice-choice" role="radiogroup" aria-label="Choose Chatterbox voice">
+            <div class="chatterbox-voice-card"><label><input type="radio" name="chatterbox-voice" value="builtin" checked> <span><strong>Built-in Chatterbox voice</strong><small>Included with Nano; no reference upload required.</small></span></label><button id="builtin-preview" class="secondary preview-voice chatterbox-preview" type="button">Preview built-in</button><small id="builtin-preview-status" class="status" role="status" aria-live="polite"></small></div>
+            <div class="chatterbox-voice-card"><label><input type="radio" name="chatterbox-voice" value="reference-wav"> <span><strong>Custom cloned voice</strong><small>Use one consented reference WAV for this audiobook.</small></span></label></div>
+          </div>
+          <p class="note">English only, local CPU generation. Speed is fixed at 1.0 with neutral tone, no pitch controls, and the model watermark notice.</p>
+          <div id="chatterbox-custom-reference" hidden>
+            <p class="note">One owned reference WAV is kept per audiobook. Use audio you own or have permission to use.</p>
+            <p class="note">WAV only, mono signed-16 PCM, longer than 5 seconds and up to 25 MiB/60 seconds. About 10 seconds usually works well.</p>
+            <label class="consent-row"><input id="reference-consent" type="checkbox"> I confirm I own or have permission to use this reference audio.</label>
+            <label for="reference-input">Reference WAV <input id="reference-input" type="file" accept="audio/wav,.wav"></label>
+            <div class="reference-actions">
+              <button id="reference-upload" class="secondary" type="button" disabled>Upload reference</button>
+              <button id="reference-revoke" class="secondary" type="button" disabled>Revoke reference</button>
+              <button id="reference-preview" class="secondary" type="button" disabled>Preview reference</button>
+            </div>
+            <p id="reference-status" class="status" role="status" aria-live="polite">No reference uploaded.</p>
+            <p class="note">Custom controls also omit CFG, exaggeration, and emotion tags.</p>
+          </div>
+        </section>
         <div class="voice-grid" role="radiogroup" aria-label="Voice">
           <div class="voice-card selected"><label class="voice-choice"><input type="radio" name="voice" value="af_heart" checked><span><strong>af_heart</strong><small>Warm, clear</small></span></label><button class="preview-voice" type="button" data-voice="af_heart" aria-label="Preview af_heart">Preview</button></div>
           <div class="voice-card"><label class="voice-choice"><input type="radio" name="voice" value="af_bella"><span><strong>af_bella</strong><small>Bright, measured</small></span></label><button class="preview-voice" type="button" data-voice="af_bella" aria-label="Preview af_bella">Preview</button></div>
@@ -209,6 +238,6 @@
     </section>
   </main>
   <footer><span>Local PDF Audiobook &middot; Phase 6</span><span>No cloud processing &middot; No account required</span></footer>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=chatterbox-preview-v5"></script>
 </body>
 </html>

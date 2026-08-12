@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import uuid
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from pdf_audiobook.app import COOKIE_NAME, create_app
+from pdf_audiobook.app import COOKIE_NAME, _store_chatterbox_reference_locked, create_app
 import pdf_audiobook.launcher as launcher
 from pdf_audiobook.launcher import InstanceLock, existing_instance, run_launcher
 from pdf_audiobook.security import (
@@ -48,11 +49,62 @@ def test_static_shell_and_host_guard(tmp_path: Path) -> None:
     with client_for(tmp_path) as client:
         response = client.get("/", headers=local_headers())
         assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
         assert "af_heart" in response.text and "bf_isabella" in response.text
         assert all(url not in response.text for url in ("https://", "http://"))
-        assert client.get("/styles.css", headers=local_headers()).status_code == 200
-        assert client.get("/app.js", headers=local_headers()).status_code == 200
+        styles = client.get("/styles.css", headers=local_headers())
+        script = client.get("/app.js", headers=local_headers())
+        assert styles.status_code == 200 and styles.headers["cache-control"] == "no-store"
+        assert script.status_code == 200 and script.headers["cache-control"] == "no-store"
         assert client.get("/", headers={"Host": "evil.example"}).status_code == 400
+
+
+def test_chatterbox_reference_publish_waits_for_preview_lock() -> None:
+    lock = threading.Lock()
+    state = type("State", (), {"preview_lock": lock, "preview_root": None})()
+    started = threading.Event()
+    completed = threading.Event()
+    results: list[dict] = []
+
+    class WorkspaceStub:
+        def store_chatterbox_reference(self, conversion_id, source, *, consent_confirmed):
+            return {"conversion_id": conversion_id, "consent_confirmed": consent_confirmed}
+
+    lock.acquire()
+    try:
+        def publish() -> None:
+            started.set()
+            results.append(_store_chatterbox_reference_locked(state, WorkspaceStub(), "conversion", Path("reference.wav"), replace=False))
+            completed.set()
+
+        thread = threading.Thread(target=publish)
+        thread.start()
+        assert started.wait(1)
+        assert not completed.wait(0.05)
+    finally:
+        lock.release()
+    thread.join(timeout=1)
+    assert not thread.is_alive() and results == [{"conversion_id": "conversion", "consent_confirmed": True}]
+
+
+def test_chatterbox_reference_lock_contention_reports_busy_reason(tmp_path: Path) -> None:
+    token = "phase1-lock-token-012345678901234567890123"
+    app = create_app(port=PORT, session_token=token, instance_file=tmp_path / "instance.json", data_root=tmp_path / "data")
+    headers = {"Origin": f"http://127.0.0.1:{PORT}", "Content-Type": "audio/wav", "X-Reference-Consent": "confirmed"}
+    with TestClient(app, base_url=f"http://127.0.0.1:{PORT}") as client:
+        assert client.post("/api/session/bootstrap", json={"token": token}, headers=headers).status_code == 200
+        generation_lock = app.state.phase1.generation_lock
+        analysis_lock = app.state.phase1.analysis_lock
+        generation_lock.acquire()
+        try:
+            assert client.post("/api/chatterbox/reference", content=b"", headers=headers).json()["error"]["code"] == "ACTIVE_WORKER"
+        finally:
+            generation_lock.release()
+        analysis_lock.acquire()
+        try:
+            assert client.post("/api/chatterbox/reference", content=b"", headers=headers).json()["error"]["code"] == "BUSY"
+        finally:
+            analysis_lock.release()
 
 
 def test_bootstrap_cookie_and_mutation_origin_checks(tmp_path: Path) -> None:

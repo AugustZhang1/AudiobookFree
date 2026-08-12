@@ -3,10 +3,13 @@
 
   const views = ["add", "configure", "progress"];
   const activeGenerationStates = new Set(["starting", "synthesizing", "cancelling", "assembling", "encoding", "verifying", "publishing"]);
+  const BUILTIN_PREVIEW_WATCHDOG_MS = 120000;
   const status = document.querySelector("#add-status");
   const analyzeButton = document.querySelector(".analyze");
   const input = document.querySelector("#pdf-input");
   const existing = document.querySelector("#existing-state");
+  // Chatterbox controls are an optional asset block; legacy cached HTML may not have them.
+  const chatterboxUi = document.querySelector("#chatterbox-reference-panel");
   let analysis = null;
   let chapterPlan = null;
   let conversionId = null;
@@ -16,6 +19,8 @@
   let generationRequestInFlight = false;
   let pollTimer = null;
   let elapsedTimer = null;
+  let previewElapsedTimer = null;
+  let previewWatchdogTimer = null;
   let activePreview = null;
   let activePreviewButton = null;
   let activePreviewStatus = null;
@@ -24,6 +29,12 @@
   let recoveredRoute = false;
   let structuralPlanLocked = false;
   let analyzedChapterRange = null;
+  let singleEngine = "kokoro";
+  let chatterboxInstalled = false;
+  let chatterboxReference = null;
+  let engineCatalogLoaded = false;
+  let chatterboxVoice = "builtin";
+  let rememberedKokoroVoice = document.querySelector('input[name="voice"]:checked')?.value || "af_heart";
   const typeIsInteger = (value) => typeof value === "number" && Number.isInteger(value);
 
   const currentPlanSpec = () => ({
@@ -259,6 +270,8 @@
 
   const setGenerationControlsDisabled = (disabled) => {
     document.querySelectorAll("#view-configure input, #view-configure button, #view-configure select").forEach((control) => { control.disabled = disabled; });
+    const builtinPreview = document.querySelector("#builtin-preview");
+    if (builtinPreview) builtinPreview.disabled = false;
     setPlanControlsDisabled(disabled);
     if (!disabled) {
       const active = activeGenerationStates.has(recoveredState);
@@ -320,6 +333,7 @@
       const modeControl = document.querySelector('input[name="voice-mode"][value="interactive_voices"]');
       if (modeControl && !modeControl.checked) { modeControl.checked = true; setInteractiveMode(true); }
     }
+    if (body.job?.mode !== "interactive_voices" && body.job?.tts?.engine === "chatterbox") { chatterboxVoice = body.job?.tts?.voice === "reference-wav" ? "reference-wav" : "builtin"; setSingleEngine("chatterbox"); }
     setStructuralPlanLocked(body.job?.schema_version === 4 || body.job?.schema_version === 5);
     if (body.analysis) renderAnalysis(body.analysis);
     if (body.chapter_plan) renderPlan(body.chapter_plan);
@@ -389,8 +403,19 @@
     generationRequestInFlight = true; setGenerationControlsDisabled(true); document.querySelector("#generation-status").textContent = "Preparing local generation...";
     try {
       if (!(await saveLabels())) throw new Error("Labels could not be saved. Generation did not start.");
-      const voice = document.querySelector("input[name=voice]:checked").value; const speed = Number(document.querySelector("#speed").value); const performance_mode = document.querySelector("input[name=performance-mode]:checked").value;
-      const response = await fetch("/api/generation/start", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ voice, speed, performance_mode, chapter_start: range.start, chapter_end: range.end }) });
+      const speed = Number(document.querySelector("#speed").value); const performance_mode = document.querySelector("input[name=performance-mode]:checked").value;
+      let payload;
+      if (singleEngine === "chatterbox") {
+        if (!chatterboxInstalled || (chatterboxVoice === "reference-wav" && !chatterboxReference?.available)) throw new Error("Select an installed Chatterbox voice with a valid reference if using Custom cloned voice.");
+        payload = { engine: "chatterbox", model: "nano", voice: chatterboxVoice, speed: 1, performance_mode, chapter_start: range.start, chapter_end: range.end };
+      } else {
+        const voiceControl = document.querySelector("input[name=voice]:checked");
+        if (!voiceControl) throw new Error("Select a Kokoro voice before generating.");
+        const voice = voiceControl.value;
+        rememberedKokoroVoice = voice;
+        payload = { voice, speed, performance_mode, chapter_start: range.start, chapter_end: range.end };
+      }
+      const response = await fetch("/api/generation/start", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify(payload) });
       if (!response.ok) { const error = await readError(response); throw new Error(`${error.code}: ${error.message}`); }
       const body = await response.json(); conversionId = body.conversion_id || conversionId; const startState = body.status === "planned" ? "starting" : body.status || "starting"; applyStatus({ ...body, state: startState }); show("progress"); startPolling();
     } catch (error) { document.querySelector("#generation-status").textContent = error.message || "Generation could not start."; }
@@ -400,14 +425,61 @@
   const previewStatusFor = (button, statusTarget) => statusTarget || button?.closest(".cast-entry")?.querySelector(".interactive-preview-status") || document.querySelector("#preview-status");
   const previewLabel = (button, active = false) => active ? "Stop preview" : button.classList.contains("interactive-preview") ? "Preview draft" : "Preview";
   const previewAudioError = "Preview unavailable. Check your volume, output device, and browser audio settings.";
+  const clearPreviewElapsedTimer = () => { if (previewElapsedTimer) { clearInterval(previewElapsedTimer); previewElapsedTimer = null; } };
+  const clearPreviewWatchdog = () => { if (previewWatchdogTimer) { clearTimeout(previewWatchdogTimer); previewWatchdogTimer = null; } };
+  const teardownPreviewAudio = (audio) => {
+    if (!audio) return;
+    try { audio.pause(); } catch (_) { /* Audio can already be detached. */ }
+    try { audio.currentTime = 0; } catch (_) { /* The media may not have loaded yet. */ }
+    try { audio.removeAttribute("src"); audio.src = ""; } catch (_) { /* Ignore teardown races. */ }
+    try { audio.load(); } catch (_) { /* Some test doubles do not implement load(). */ }
+  };
+  const startBuiltinPreviewElapsed = (button, targetStatus, requestId) => {
+    clearPreviewElapsedTimer();
+    const startedAt = Date.now();
+    let timer = null;
+    const update = () => {
+      if (requestId !== previewRequest || activePreviewButton !== button) {
+        if (timer && previewElapsedTimer === timer) { clearInterval(timer); previewElapsedTimer = null; }
+        return;
+      }
+      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+      const minutes = Math.floor(elapsed / 60);
+      const seconds = String(elapsed % 60).padStart(2, "0");
+      if (targetStatus) targetStatus.textContent = `Loading Nano on CPU… ${minutes}m ${seconds}s. First preview can take several minutes; later previews are cached.`;
+    };
+    update();
+    timer = setInterval(update, 1000);
+    previewElapsedTimer = timer;
+  };
+  const startBuiltinPreviewWatchdog = (button, targetStatus, requestId) => {
+    clearPreviewWatchdog();
+    const timer = setTimeout(() => {
+      if (previewWatchdogTimer === timer) previewWatchdogTimer = null;
+      if (requestId !== previewRequest || activePreviewButton !== button) return;
+      stopPreview(targetStatus);
+      if (targetStatus) targetStatus.textContent = "Nano preview took too long to start. Nano may continue warming the shared cache; you can try again.";
+    }, BUILTIN_PREVIEW_WATCHDOG_MS);
+    previewWatchdogTimer = timer;
+  };
   const stopPreview = (statusTarget) => {
     const stoppedStatus = activePreviewStatus || statusTarget;
+    const pendingBuiltinPreview = activePreviewButton?.id === "builtin-preview" && activePreviewButton.classList.contains("preview-loading");
     previewRequest += 1;
-    if (activePreview) { activePreview.pause(); activePreview.currentTime = 0; activePreview = null; }
+    clearPreviewElapsedTimer();
+    clearPreviewWatchdog();
+    if (activePreview) { teardownPreviewAudio(activePreview); activePreview = null; }
     activePreviewButton = null;
     activePreviewStatus = null;
-    document.querySelectorAll(".preview-voice").forEach((button) => { button.classList.remove("preview-loading", "preview-buffering", "preview-playing"); button.removeAttribute("aria-busy"); button.textContent = previewLabel(button); });
-    if (stoppedStatus) stoppedStatus.textContent = "Stopped.";
+    document.querySelectorAll(".preview-voice").forEach((button) => { button.classList.remove("preview-loading", "preview-buffering", "preview-playing"); button.removeAttribute("aria-busy"); button.textContent = button.classList.contains("interactive-preview") ? "Preview draft" : "Preview"; });
+    const referencePreview = document.querySelector("#reference-preview");
+    if (referencePreview) { referencePreview.classList.remove("preview-loading", "preview-buffering", "preview-playing"); referencePreview.removeAttribute("aria-busy"); referencePreview.textContent = "Preview reference"; }
+    const builtinPreview = document.querySelector("#builtin-preview");
+    if (builtinPreview) { builtinPreview.classList.remove("preview-loading", "preview-buffering", "preview-playing"); builtinPreview.removeAttribute("aria-busy"); builtinPreview.textContent = "Preview built-in"; }
+    if (stoppedStatus) {
+      if (pendingBuiltinPreview) stoppedStatus.textContent = "Preview stopped in browser. Nano may continue warming the shared cache in the background; the next attempt will reuse it.";
+      else stoppedStatus.textContent = "Stopped.";
+    }
   };
   const previewVoice = (voice, button, statusTarget, settings = null) => {
     settings = settings || button?.__draftSettings || null;
@@ -440,7 +512,7 @@
       if (targetStatus) targetStatus.textContent = previewAudioError;
       return;
     }
-    if (requestId !== previewRequest) { audio.pause(); return; }
+    if (requestId !== previewRequest) { teardownPreviewAudio(audio); return; }
     activePreview = audio;
     const failPreview = () => {
       if (requestId !== previewRequest) return;
@@ -474,7 +546,7 @@
       button.classList.remove("preview-loading", "preview-buffering", "preview-playing");
       button.removeAttribute("aria-busy");
       button.textContent = previewLabel(button);
-      if (targetStatus) targetStatus.textContent = `Finished - ${previewSettingsSummary(settings || { speed: 1, pitch_semitones: 0, tone_preset: "neutral" })}.`;
+      if (targetStatus) targetStatus.textContent = "Finished.";
     }, { once: true });
     try {
       const playPromise = audio.play();
@@ -484,6 +556,122 @@
     } catch (error) {
       failPreview();
     }
+  };
+
+  const setReferenceStatus = (message) => { const target = document.querySelector("#reference-status"); if (target) target.textContent = message; };
+  const loadChatterboxReference = async () => {
+    if (!chatterboxUi) { chatterboxReference = null; return null; }
+    if (!conversionId) { chatterboxReference = null; setReferenceStatus("Analyze a PDF before adding a reference."); updateModeReadiness(); return null; }
+    return fetch("/api/chatterbox/reference").then((response) => response.ok ? response : interactiveError(response).then((error) => { throw error; })).then((response) => response.json()).then((body) => { chatterboxReference = body.reference || body; const reference = chatterboxReference; const uploadButton = document.querySelector("#reference-upload"); if (uploadButton) uploadButton.textContent = reference.available ? "Replace reference" : "Upload reference"; setReferenceStatus(reference.available ? `Reference ready: ${Number(reference.duration_seconds || 0).toFixed(1)} seconds.` : "No reference uploaded."); updateModeReadiness(); return reference; });
+  };
+  const loadEngineCatalog = (force = false) => {
+    if (!chatterboxUi) { chatterboxInstalled = false; return Promise.resolve(); }
+    if (engineCatalogLoaded && !force) return Promise.resolve();
+    return fetch("/api/engines").then((response) => response.ok ? response : interactiveError(response).then((error) => { throw error; })).then((response) => response.json()).then((body) => {
+    const nano = (body.engines || []).find((entry) => entry.engine_id === "chatterbox" && entry.model_id === "nano");
+    chatterboxInstalled = Boolean(nano?.enabled !== false && nano?.installed === true);
+    engineCatalogLoaded = true;
+    const control = document.querySelector('input[name="single-engine"][value="chatterbox"]');
+    if (control) control.disabled = !chatterboxInstalled;
+    const installedStatus = document.querySelector("#chatterbox-installed-status");
+    if (installedStatus) installedStatus.textContent = chatterboxInstalled ? "Optional local CPU engine is installed." : "Optional engine is not installed; run opt-in Chatterbox setup.";
+    if (!chatterboxInstalled && singleEngine === "chatterbox") setSingleEngine("kokoro");
+    updateModeReadiness();
+    });
+  };
+  const setSingleEngine = (engine) => {
+    if (!chatterboxUi) { singleEngine = "kokoro"; return; }
+    if (engine !== "chatterbox") chatterboxVoice = "builtin";
+    singleEngine = engine === "chatterbox" ? "chatterbox" : "kokoro";
+    document.querySelectorAll('input[name="single-engine"]').forEach((control) => { control.checked = control.value === singleEngine; });
+    document.querySelectorAll('input[name="chatterbox-voice"]').forEach((control) => { control.checked = control.value === chatterboxVoice; });
+    const chatterbox = singleEngine === "chatterbox";
+    const kokoroControls = [...document.querySelectorAll('input[name="voice"]')];
+    if (chatterbox) {
+      const currentKokoro = kokoroControls.find((control) => control.checked);
+      if (currentKokoro) rememberedKokoroVoice = currentKokoro.value;
+      kokoroControls.forEach((control) => { control.checked = false; });
+      document.querySelectorAll(".voice-card").forEach((card) => card.classList.remove("selected"));
+    } else {
+      const restoredKokoro = kokoroControls.find((control) => control.value === rememberedKokoroVoice) || kokoroControls[0];
+      if (restoredKokoro) {
+        rememberedKokoroVoice = restoredKokoro.value;
+        kokoroControls.forEach((control) => { control.checked = control === restoredKokoro; });
+        document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector('input[name="voice"]') === restoredKokoro));
+      }
+    }
+    document.querySelector("#chatterbox-reference-panel").hidden = !chatterbox;
+    document.querySelector(".voice-grid").hidden = chatterbox;
+    document.querySelector("#preview-status").hidden = chatterbox;
+    document.querySelector(".settings-row").hidden = chatterbox;
+    document.querySelector("#engine-status").textContent = chatterbox ? "Chatterbox Nano selected." : "Kokoro is selected.";
+    const customPanel = document.querySelector("#chatterbox-custom-reference"); if (customPanel) customPanel.hidden = !chatterbox || chatterboxVoice !== "reference-wav";
+    if (chatterbox && chatterboxVoice === "reference-wav") loadChatterboxReference().catch((error) => setReferenceStatus(error.message || "Reference status is unavailable."));
+    else stopPreview();
+    updateModeReadiness();
+  };
+  const uploadChatterboxReference = () => {
+    if (!chatterboxUi) return;
+    const input = document.querySelector("#reference-input");
+    const file = input?.files?.[0];
+    if (!conversionId || !file) { setReferenceStatus("Choose a WAV reference after analyzing a PDF."); return; }
+    const consent = document.querySelector("#reference-consent")?.checked === true;
+    if (!consent) { setReferenceStatus("Confirm ownership or permission before uploading."); return; }
+    if (file.size > 25 * 1024 * 1024) { setReferenceStatus("Reference WAV exceeds the 25 MiB limit."); return; }
+    const replace = Boolean(chatterboxReference?.available);
+    stopPreview();
+    const button = document.querySelector("#reference-upload"); button.disabled = true; setReferenceStatus(replace ? "Replacing reference..." : "Uploading reference...");
+    fetch("/api/chatterbox/reference", { method: replace ? "PUT" : "POST", headers: { "Content-Type": "audio/wav", "X-Reference-Consent": "confirmed", "Origin": location.origin }, body: file }).then((response) => response.ok ? response : interactiveError(response).then((error) => { throw error; })).then((response) => response.json()).then((body) => { chatterboxReference = body.reference || body; const uploadButton = document.querySelector("#reference-upload"); if (uploadButton) uploadButton.textContent = "Replace reference"; setReferenceStatus(`Reference ready: ${Number(chatterboxReference.duration_seconds || 0).toFixed(1)} seconds.`); if (input) input.value = ""; }).catch((error) => setReferenceStatus(error.message || "Reference upload failed.")).finally(updateModeReadiness);
+  };
+  const revokeChatterboxReference = () => {
+    if (!chatterboxUi) return;
+    if (!conversionId) return;
+    stopPreview();
+    const button = document.querySelector("#reference-revoke"); if (!button) return; button.disabled = true; setReferenceStatus("Revoking reference...");
+    fetch("/api/chatterbox/reference", { method: "DELETE", headers: { "Origin": location.origin } }).then((response) => response.ok ? response : interactiveError(response).then((error) => { throw error; })).then(() => { chatterboxReference = { available: false }; setReferenceStatus("Reference revoked."); }).catch((error) => setReferenceStatus(error.message || "Reference could not be revoked.")).finally(updateModeReadiness);
+  };
+  const previewChatterboxReference = () => {
+    if (!chatterboxUi) return;
+    if (!chatterboxReference?.available) return;
+    const button = document.querySelector("#reference-preview");
+    if (!button) return;
+    if (activePreviewButton === button) { stopPreview(); return; }
+    stopPreview(); activePreviewButton = button; activePreviewStatus = document.querySelector("#reference-status"); button.textContent = "Stop preview"; activePreviewStatus.textContent = "Generating reference preview...";
+    const requestId = ++previewRequest;
+    try { activePreview = new Audio("/api/chatterbox/preview"); activePreview.addEventListener("ended", () => { if (requestId !== previewRequest) return; activePreview = null; activePreviewButton = null; button.textContent = "Preview reference"; activePreviewStatus.textContent = "Finished."; }, { once: true }); activePreview.addEventListener("error", () => { if (requestId !== previewRequest) return; stopPreview(); setReferenceStatus("Reference preview unavailable."); }, { once: true }); const play = activePreview.play(); if (play?.catch) play.catch(() => { if (requestId === previewRequest) { stopPreview(); setReferenceStatus("Reference preview unavailable."); } }); }
+    catch (_) { stopPreview(); setReferenceStatus("Reference preview unavailable."); }
+  };
+
+  const previewChatterboxBuiltin = async () => {
+    if (!chatterboxUi) return;
+    const button = document.querySelector("#builtin-preview");
+    const targetStatus = document.querySelector("#builtin-preview-status");
+    if (!button) return;
+    if (activePreviewButton === button) { stopPreview(targetStatus); return; }
+    if (!chatterboxInstalled) {
+      try { await loadEngineCatalog(true); } catch (_) { /* Keep the cached unavailable state. */ }
+      if (!chatterboxInstalled) { if (targetStatus) targetStatus.textContent = "Optional Nano engine was not detected. Run setup and restart the app."; return; }
+    }
+    if (activeGenerationStates.has(recoveredState)) { if (targetStatus) targetStatus.textContent = "Nano preview is unavailable while audiobook generation is active."; return; }
+    stopPreview();
+    activePreviewButton = button;
+    activePreviewStatus = targetStatus;
+    button.textContent = "Cancel preview";
+    button.classList.add("preview-loading");
+    button.setAttribute("aria-busy", "true");
+    if (targetStatus) targetStatus.textContent = "Generating built-in preview...";
+    const requestId = ++previewRequest;
+    startBuiltinPreviewElapsed(button, targetStatus, requestId);
+    startBuiltinPreviewWatchdog(button, targetStatus, requestId);
+    let audio;
+    try { audio = new Audio("/api/chatterbox/preview/builtin"); } catch (_) { stopPreview(targetStatus); if (targetStatus) targetStatus.textContent = previewAudioError; return; }
+    if (requestId !== previewRequest) { clearPreviewWatchdog(); teardownPreviewAudio(audio); return; }
+    activePreview = audio;
+    const fail = () => { if (requestId !== previewRequest) return; clearPreviewWatchdog(); stopPreview(targetStatus); if (targetStatus) targetStatus.textContent = "Built-in preview unavailable."; };
+    audio.addEventListener("error", fail, { once: true });
+    audio.addEventListener("playing", () => { if (requestId !== previewRequest) return; clearPreviewElapsedTimer(); clearPreviewWatchdog(); button.classList.remove("preview-loading"); button.classList.add("preview-playing"); button.removeAttribute("aria-busy"); button.textContent = "Cancel preview"; if (targetStatus) targetStatus.textContent = "Built-in preview playing."; });
+    audio.addEventListener("ended", () => { if (requestId !== previewRequest) return; clearPreviewElapsedTimer(); clearPreviewWatchdog(); activePreview = null; activePreviewButton = null; activePreviewStatus = null; button.classList.remove("preview-loading", "preview-playing"); button.removeAttribute("aria-busy"); button.textContent = "Preview built-in"; if (targetStatus) targetStatus.textContent = "Finished."; }, { once: true });
+    try { const playPromise = audio.play(); if (playPromise?.catch) playPromise.catch(fail); } catch (_) { fail(); }
   };
 
   const openOutput = async (target) => {
@@ -561,8 +749,12 @@
 
   const updateSingleVoiceReadiness = () => {
     if (interactiveMode) return false;
-    const ready = Boolean(chapterPlan && planMatchesSelection(chapterPlan) && currentChapterRange().valid && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
+    const baseReady = Boolean(chapterPlan && planMatchesSelection(chapterPlan) && currentChapterRange().valid && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
+    const ready = singleEngine === "chatterbox" ? baseReady && chatterboxInstalled && (chatterboxVoice === "builtin" || Boolean(chatterboxReference?.available)) : baseReady;
     document.querySelector("#start-generation").disabled = !ready;
+    document.querySelector("#reference-upload")?.toggleAttribute("disabled", chatterboxVoice !== "reference-wav" || !conversionId || !document.querySelector("#reference-consent")?.checked || !document.querySelector("#reference-input")?.files?.length || !chatterboxInstalled);
+    document.querySelector("#reference-revoke")?.toggleAttribute("disabled", chatterboxVoice !== "reference-wav" || !conversionId || !chatterboxReference?.available || !chatterboxInstalled);
+    document.querySelector("#reference-preview")?.toggleAttribute("disabled", chatterboxVoice !== "reference-wav" || !chatterboxReference?.available);
     return ready;
   };
 
@@ -596,6 +788,7 @@
 
   const setInteractiveMode = (enabled) => {
     interactiveMode = enabled;
+    if (enabled && singleEngine !== "kokoro") setSingleEngine("kokoro");
     interactive("#interactive-entry").hidden = !enabled;
     interactive("#interactive-review").hidden = !enabled;
     interactive("#single-voice-controls").hidden = enabled;
@@ -675,15 +868,17 @@
       const previewStatus = document.createElement("span"); previewStatus.className = "status interactive-preview-status"; previewStatus.setAttribute("role", "status"); previewStatus.setAttribute("aria-live", "polite"); previewStatus.textContent = "";
       preview.addEventListener("click", () => { if (activePreviewButton === preview) stopPreview(previewStatus); else { preview.__draftSettings = { speed: Number(speed.value), pitch_semitones: Number(pitch.value), tone_preset: toneValue() }; previewVoice(voice.value, preview, previewStatus); } });
       voice.addEventListener("change", () => { if (activePreviewButton === preview) stopPreview(previewStatus); });
-      previewControls.append(preview, previewStatus);
+      previewControls.append(preview, previewStatus); voiceField.append(previewControls);
       const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(draft.speed || entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed);
       const previewSettingsAvailable = settingsAwarePreviewAvailable();
       const pitchAvailable = previewSettingsAvailable && voiceShapingCapability.pitch_available === true;
       const toneAvailable = previewSettingsAvailable && voiceShapingCapability.tone_available === true;
       const pitchLabel = document.createElement("label"); pitchLabel.textContent = "Pitch"; const pitch = document.createElement("input"); pitch.type = "range"; pitch.min = "-3"; pitch.max = "3"; pitch.step = "1"; pitch.value = String(Number(draft.pitch_semitones ?? entry.voice_settings?.pitch_semitones ?? 0)); pitch.disabled = !pitchAvailable; pitch.setAttribute("aria-label", `${entry.display_label} pitch in semitones`); const pitchOutput = document.createElement("output"); pitchOutput.textContent = pitch.disabled ? "Unavailable" : `${pitch.value} semitones`; pitchOutput.setAttribute("aria-live", "polite"); pitch.addEventListener("input", () => { pitchOutput.textContent = `${pitch.value} semitones (${Number(pitch.value) < 0 ? "lower" : Number(pitch.value) > 0 ? "higher" : "neutral"})`; }); pitchLabel.append(pitch, pitchOutput); if (pitch.disabled) { const note = document.createElement("small"); note.textContent = !previewSettingsAvailable ? "Restart the local backend to preview voice shaping." : "Pitch unavailable: rubberband support is not installed."; pitchLabel.append(note); }
       const toneField = document.createElement("fieldset"); toneField.className = "tone-control"; const toneLegend = document.createElement("legend"); toneLegend.textContent = "Tone"; toneField.append(toneLegend); const tone = document.createElement("div"); tone.className = "tone-segmented"; tone.setAttribute("role", "radiogroup"); tone.setAttribute("aria-label", `${entry.display_label} tone preset`); const toneInputs = []; ["neutral", "warm", "bright"].forEach((value) => { const label = document.createElement("label"); const radio = document.createElement("input"); radio.type = "radio"; radio.name = `tone-${entry.cast_id}`; radio.value = value; radio.checked = value === (draft.tone_preset || entry.voice_settings?.tone_preset || "neutral"); radio.disabled = value !== "neutral" && !toneAvailable; label.append(radio, document.createTextNode(value[0].toUpperCase() + value.slice(1))); tone.append(label); toneInputs.push(radio); }); if (!toneAvailable) { const note = document.createElement("small"); note.textContent = !previewSettingsAvailable ? "Restart the local backend to preview voice shaping." : "Warm and bright unavailable: shelf filters are not installed."; toneField.append(note); } toneField.append(tone);
-      fields.append(nameLabel, voiceField, speedLabel, pitchLabel, toneField);
-      article.append(fields, previewControls);
+      fields.append(nameLabel, voiceField, speedLabel);
+      fields.append(pitchLabel);
+      fields.append(toneField);
+      article.append(fields);
       const unsaved = document.createElement("small"); unsaved.className = "cast-unsaved"; unsaved.textContent = hasDraft ? "Unsaved changes" : ""; unsaved.setAttribute("aria-live", "polite");
       const toneValue = () => toneInputs.find((radio) => radio.checked)?.value || "neutral";
       const markDraft = () => { if (activePreviewButton === preview) stopPreview(previewStatus); castDrafts.set(entry.cast_id, { display_label: name.value.trim(), voice_id: voice.value, speed: Number(speed.value), pitch_semitones: Number(pitch.value), tone_preset: toneValue(), relationship: relationship?.value || entry.relationship }); unsaved.textContent = "Unsaved changes"; previewStatus.textContent = "Draft ready. Press Preview draft to audition."; };
@@ -840,8 +1035,18 @@
   document.querySelectorAll("#chapter-start, #chapter-end").forEach((control) => control.addEventListener("input", () => { updateChapterRange(); updateModeReadiness(); }));
   document.querySelector("#regenerate-plan").addEventListener("click", async () => { const selection = currentPlanSpec(); await runPlanRequest(selection.mode, selection.mode === "custom" ? selection.count : undefined); });
   document.querySelector("#save-labels").addEventListener("click", () => saveLabels()); document.querySelector("#start-generation").addEventListener("click", startGeneration);
-  document.querySelectorAll("input[name=voice]").forEach((control) => control.addEventListener("change", () => { document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector("input").checked)); }));
-  document.querySelectorAll(".preview-voice").forEach((button) => button.addEventListener("click", () => { if (activePreviewButton === button) stopPreview(); else previewVoice(button.dataset.voice, button); }));
+  if (chatterboxUi) {
+    document.querySelectorAll('input[name="single-engine"]').forEach((control) => control.addEventListener("change", () => { if (control.checked) { stopPreview(); setSingleEngine(control.value); } }));
+    document.querySelectorAll('input[name="chatterbox-voice"]').forEach((control) => control.addEventListener("change", () => { if (control.checked) { stopPreview(); chatterboxVoice = control.value; setSingleEngine("chatterbox"); } }));
+    document.querySelector("#reference-consent")?.addEventListener("change", updateModeReadiness);
+    document.querySelector("#reference-input")?.addEventListener("change", updateModeReadiness);
+    document.querySelector("#reference-upload")?.addEventListener("click", uploadChatterboxReference);
+    document.querySelector("#reference-revoke")?.addEventListener("click", revokeChatterboxReference);
+    document.querySelector("#reference-preview")?.addEventListener("click", previewChatterboxReference);
+    document.querySelector("#builtin-preview")?.addEventListener("click", previewChatterboxBuiltin);
+  }
+  document.querySelectorAll("input[name=voice]").forEach((control) => control.addEventListener("change", () => { if (control.checked) rememberedKokoroVoice = control.value; stopPreview(); document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector("input").checked)); }));
+  document.querySelectorAll(".preview-voice:not(.chatterbox-preview)").forEach((button) => button.addEventListener("click", () => { if (activePreviewButton === button) stopPreview(); else previewVoice(button.dataset.voice, button); }));
   document.querySelector("#speed").addEventListener("input", (event) => { document.querySelector("#speed-value").textContent = `${Number(event.target.value).toFixed(1)}x`; });
   document.querySelector("#cancel-generation").addEventListener("click", () => cancelGeneration(document.querySelector("#cancel-generation"), document.querySelector("#progress-status")));
   document.querySelectorAll('input[name="voice-mode"]').forEach((control) => control.addEventListener("change", () => setInteractiveMode(control.value === "interactive_voices")));
@@ -864,7 +1069,7 @@
     try {
       const response = await fetch(`/api/workspace/${conversionId}`, { method: "DELETE", headers: { "Origin": location.origin } });
       if (!response.ok) { document.querySelector("#output-status").textContent = "The existing conversion could not be reset."; button.disabled = false; return; }
-      stopPolling(); analysis = null; chapterPlan = null; conversionId = null; recoveredState = null; labelsDirty = false; selectedFile = null; input.value = ""; document.querySelector("#completion-card").hidden = true; document.querySelector("#progress-live").hidden = false; document.querySelector("#generation-status").textContent = ""; resetExistingJob(); invalidatePlan("Select a PDF to begin."); show("add");
+      stopPolling(); analysis = null; chapterPlan = null; conversionId = null; recoveredState = null; labelsDirty = false; selectedFile = null; input.value = ""; chatterboxReference = null; document.querySelectorAll("#reference-consent").forEach((control) => { control.checked = false; }); const uploadButton = document.querySelector("#reference-upload"); if (uploadButton) uploadButton.textContent = "Upload reference"; setSingleEngine("kokoro"); document.querySelector("#completion-card").hidden = true; document.querySelector("#progress-live").hidden = false; document.querySelector("#generation-status").textContent = ""; resetExistingJob(); invalidatePlan("Select a PDF to begin."); show("add");
     } catch (_) { document.querySelector("#output-status").textContent = "The existing conversion could not be reset."; button.disabled = false; }
   });
   document.querySelector(".delete-job").addEventListener("click", async () => {
@@ -875,14 +1080,14 @@
       const response = await fetch(endpoint, { method: "DELETE", headers: { "Origin": location.origin } });
       let payload = null;
       try { payload = await response.json(); } catch (_) { /* Treat malformed deletion responses as failures. */ }
-      if (response.ok && payload?.deleted === true) { analysis = null; conversionId = null; recoveredState = null; resetExistingJob(); invalidatePlan("Select a PDF to begin."); status.textContent = "Existing job deleted explicitly."; show("add"); }
+      if (response.ok && payload?.deleted === true) { analysis = null; conversionId = null; recoveredState = null; chatterboxReference = null; document.querySelectorAll("#reference-consent").forEach((control) => { control.checked = false; }); const uploadButton = document.querySelector("#reference-upload"); if (uploadButton) uploadButton.textContent = "Upload reference"; setSingleEngine("kokoro"); resetExistingJob(); invalidatePlan("Select a PDF to begin."); status.textContent = "Existing job deleted explicitly."; show("add"); }
       else { status.textContent = "The existing job could not be deleted right now."; button.disabled = false; }
     } catch (_) { status.textContent = "The existing job could not be deleted right now."; button.disabled = false; }
   });
 
   const token = new URLSearchParams(location.hash.slice(1)).get("session");
   const ready = token ? fetch("/api/session/bootstrap", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ token }) }).then((response) => { if (!response.ok) throw new Error("session bootstrap failed"); history.replaceState(null, "", "#add"); status.textContent = "Secure local session ready."; }) : Promise.resolve();
-  ready.then(loadStatus).then(() => {
+  ready.then(loadEngineCatalog).then(loadStatus).then(() => {
     if (activeGenerationStates.has(recoveredState)) { startPolling(); return; }
     if (recoveredRoute) return;
     const initial = location.hash.slice(1); show(views.includes(initial) ? initial : "add");

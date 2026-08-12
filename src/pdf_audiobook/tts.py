@@ -18,7 +18,14 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, ContextManager, Protocol
 
-from .audio import pcm_from_audio
+from .audio import pcm_from_audio, validate_wav
+from .engine_catalog import (
+    CHATTERBOX_NANO_MODEL,
+    CHATTERBOX_NANO_MODEL_ID,
+    CHATTERBOX_PACKAGE_VERSION,
+    CHATTERBOX_SOURCE_COMMIT,
+    require_enabled,
+)
 from .voice_registry import APPROVED_VOICE_IDS
 from .voice_settings import VoiceSettingsError, canonical_voice_settings
 from .voice_shaping import shaping_capability, shaping_fingerprint
@@ -28,6 +35,11 @@ KOKORO_PACKAGE = "kokoro"
 KOKORO_PACKAGE_VERSION = "0.9.4"
 KOKORO_MODEL = "hexgrad/Kokoro-82M"
 KOKORO_SAMPLE_RATE = 24000
+CHATTERBOX_PACKAGE = "chatterbox-tts"
+CHATTERBOX_SAMPLE_RATE = 24000
+CHATTERBOX_REFERENCE_VOICE = "reference-wav"
+CHATTERBOX_BUILTIN_VOICE = "builtin"
+CHATTERBOX_CHUNK_CAP = 300
 DEFAULT_CHUNK_CAP = 900
 DEFAULT_TORCH_THREADS = 8
 TORCH_THREADS_ENV = "PDF_AUDIOBOOK_TORCH_THREADS"
@@ -149,10 +161,142 @@ class KokoroVoice:
         return None
 
 
-def load_voice(voice: str, settings: SynthesisSettings | None = None, *, engine: str = "kokoro") -> LoadedVoice:
+class ChatterboxVoice:
+    """Lazy-boundary wrapper around Chatterbox Nano's reference prompt API."""
+
+    def __init__(self, model: Any, settings: SynthesisSettings, voice: str, reference_wav: Path | None = None, reference_sha256: str = "unrecorded"):
+        self.model = model
+        self._voice = voice
+        self._reference_wav = reference_wav
+        self._reference_sha256 = reference_sha256
+        self._closed = False
+        sample_rate = getattr(model, "sr", getattr(model, "sampling_rate", CHATTERBOX_SAMPLE_RATE))
+        if sample_rate != CHATTERBOX_SAMPLE_RATE:
+            raise RuntimeError("Chatterbox Nano returned an unsupported sample rate")
+        self.metadata = EngineMetadata(
+            "chatterbox", CHATTERBOX_PACKAGE_VERSION, CHATTERBOX_NANO_MODEL,
+            CHATTERBOX_SOURCE_COMMIT, "unrecorded", voice,
+            CHATTERBOX_SOURCE_COMMIT if voice == CHATTERBOX_REFERENCE_VOICE else "bundled", reference_sha256, sample_rate,
+            {**settings.as_dict(), "chunk_cap": CHATTERBOX_CHUNK_CAP},
+        )
+
+    def synthesize(self, text: str) -> bytes:
+        if self._voice == CHATTERBOX_REFERENCE_VOICE:
+            try:
+                reference_wav, reference_sha256 = _reference_wav_identity(self._reference_wav)
+            except ValueError:
+                raise RuntimeError("Chatterbox reference WAV is invalid or unavailable") from None
+            if reference_sha256 != self._reference_sha256:
+                raise RuntimeError("Chatterbox reference WAV has changed")
+        if not any(character.isalnum() for character in text):
+            return _silence_pcm(self.metadata.sample_rate)
+        try:
+            result = self.model.generate(text, **({"audio_prompt_path": str(reference_wav)} if self._voice == CHATTERBOX_REFERENCE_VOICE else {}))
+        except Exception:
+            raise RuntimeError("Chatterbox generation failed") from None
+        try:
+            pcm = pcm_from_audio(result)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Chatterbox returned empty audio") from exc
+        if not pcm:
+            raise RuntimeError("Chatterbox returned empty audio")
+        return pcm
+
+    def close_voice(self) -> None:
+        if self._closed:
+            return None
+        self._closed = True
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()
+            return None
+        release = getattr(self.model, "release", None)
+        if callable(release):
+            release()
+        return None
+
+
+def _reference_wav_identity(reference_wav: str | os.PathLike[str] | Path) -> tuple[Path, str]:
+    """Validate and hash a caller-provided WAV without putting its path in errors."""
+
+    try:
+        source = Path(reference_wav)
+        wav = validate_wav(source)
+        if wav.duration_seconds <= 5.0 or wav.duration_seconds > 60.0:
+            raise ValueError("reference WAV duration is invalid")
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return source, digest.hexdigest()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("reference WAV is invalid or unsafe") from exc
+
+
+def _load_chatterbox_nano(settings: SynthesisSettings, voice: str, reference_wav: Path | None = None, reference_sha256: str = "unrecorded") -> ChatterboxVoice:
+    model: Any | None = None
+    try:
+        module = importlib.import_module("chatterbox.tts_turbo")
+        model_class = getattr(module, "ChatterboxTurboTTS")
+        model = model_class.from_pretrained(device="cpu", nano=True)
+        return ChatterboxVoice(model, settings, voice, reference_wav, reference_sha256)
+    except Exception as exc:
+        if model is not None:
+            _release_model(model)
+        raise RuntimeError("Chatterbox Nano is unavailable in the isolated worker environment") from exc
+
+
+def _release_model(model: Any) -> None:
+    """Release a model at most once, preferring its explicit close boundary."""
+
+    close = getattr(model, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+        return
+    release = getattr(model, "release", None)
+    if callable(release):
+        try:
+            release()
+        except Exception:
+            pass
+
+
+def load_voice(
+    voice: str,
+    settings: SynthesisSettings | None = None,
+    *,
+    engine: str = "kokoro",
+    reference_wav: str | os.PathLike[str] | Path | None = None,
+) -> LoadedVoice:
     """Load a voice lazily.  No model import occurs until this function runs."""
 
-    settings = settings or SynthesisSettings()
+    if engine == "chatterbox":
+        settings = settings or SynthesisSettings(chunk_cap=CHATTERBOX_CHUNK_CAP)
+    else:
+        settings = settings or SynthesisSettings()
+    if engine == "chatterbox":
+        require_enabled("chatterbox", CHATTERBOX_NANO_MODEL_ID)
+        if voice not in {CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_REFERENCE_VOICE}:
+            raise ValueError("Chatterbox Nano supports builtin or reference-wav voices")
+        if voice == CHATTERBOX_REFERENCE_VOICE and reference_wav is None:
+            raise ValueError("reference WAV is required for the custom Chatterbox voice")
+        if voice == CHATTERBOX_BUILTIN_VOICE and reference_wav is not None:
+            raise ValueError("builtin Chatterbox voice does not use a reference WAV")
+        if settings.speed != 1.0:
+            raise ValueError("Chatterbox Nano supports speed 1.0 only")
+        if settings.pitch_semitones != 0 or settings.tone_preset != "neutral":
+            raise ValueError("Chatterbox Nano supports neutral pitch and tone only")
+        if settings.sample_rate != CHATTERBOX_SAMPLE_RATE:
+            raise ValueError("Chatterbox Nano requires a 24000 Hz sample rate")
+        if settings.chunk_mode not in CHUNK_MODES:
+            raise ValueError(f"unsupported chunk mode: {settings.chunk_mode}")
+        if voice == CHATTERBOX_REFERENCE_VOICE:
+            source, reference_sha256 = _reference_wav_identity(reference_wav)
+            return _load_chatterbox_nano(settings, voice, source, reference_sha256)
+        return _load_chatterbox_nano(settings, voice)
     if voice not in APPROVED_VOICES and not (engine == "fake" and voice == "fake-neutral"):
         raise ValueError(f"voice is not approved: {voice}")
     if not math.isfinite(settings.speed) or not 0.5 <= settings.speed <= 2.0:
@@ -162,9 +306,13 @@ def load_voice(voice: str, settings: SynthesisSettings | None = None, *, engine:
     if settings.chunk_mode not in CHUNK_MODES:
         raise ValueError(f"unsupported chunk mode: {settings.chunk_mode}")
     if engine == "fake":
+        if reference_wav is not None:
+            raise ValueError("Fake does not use reference WAV prompts")
         return FakeVoice(voice, settings)
     if engine != "kokoro":
-        raise ValueError("only Kokoro production engine is supported")
+        raise ValueError("only Kokoro and Chatterbox production engines are supported")
+    if reference_wav is not None:
+        raise ValueError("Kokoro does not use reference WAV prompts")
     torch_threads = _configured_torch_threads()
     try:
         torch = importlib.import_module("torch")

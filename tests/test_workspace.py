@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import uuid
+import wave
 
 import pytest
 
@@ -24,6 +25,7 @@ from pdf_audiobook.workspace import (
     validate_job_manifest,
     validate_interactive_generation_manifest,
 )
+from pdf_audiobook.chatterbox_reference import REFERENCE_DESCRIPTOR_FILENAME, REFERENCE_WAV_FILENAME
 from pdf_audiobook.voice_plan import canonical_json_bytes, canonical_json_text, with_canonical_artifact_hash
 from pdf_audiobook.tts import FakeVoice
 from pdf_audiobook.worker import ConversionWorker
@@ -964,6 +966,153 @@ def test_analysis_load_requires_regular_artifact_and_matching_source_hash(tmp_pa
         pytest.skip(f"symlinks unavailable: {exc}")
     with pytest.raises(ManifestError):
         workspace.load_analysis(manifest["conversion_id"])
+
+
+def _write_reference(path: Path, *, sample_rate: int = 16000, seconds: float = 6.0, value: int = 0) -> None:
+    frames = int(sample_rate * seconds)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes((value.to_bytes(2, "little", signed=True)) * frames)
+
+
+def test_chatterbox_reference_lifecycle_is_owned_strict_and_path_free(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference)
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    conversion_id = manifest["conversion_id"]
+    with pytest.raises(WorkspaceError, match="consent"):
+        workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=False)
+    status = workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    assert status["available"] is True and "path" not in status
+    directory = workspace.conversion_path(conversion_id)
+    assert (directory / REFERENCE_WAV_FILENAME).is_file() and (directory / REFERENCE_DESCRIPTOR_FILENAME).is_file()
+    loaded = workspace.load_chatterbox_reference(conversion_id)
+    assert loaded.descriptor["consent_evidence"] == "user-confirmed-local-reference"
+    assert loaded.descriptor["reference_sha256"] == hashlib.sha256(reference.read_bytes()).hexdigest()
+    assert workspace.chatterbox_reference_status(conversion_id)["reference_sha256"] == loaded.descriptor["reference_sha256"]
+    replacement = tmp_path / "replacement.wav"; _write_reference(replacement, value=1)
+    replaced = workspace.replace_chatterbox_reference(conversion_id, replacement, consent_confirmed=True)
+    assert replaced["reference_sha256"] != status["reference_sha256"]
+    assert workspace.delete_chatterbox_reference(conversion_id) is True
+    assert workspace.chatterbox_reference_status(conversion_id)["available"] is False
+    assert workspace.delete_chatterbox_reference(conversion_id) is False
+
+
+def test_chatterbox_reference_limits_and_mutation_fail_closed(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference, seconds=61)
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    with pytest.raises(WorkspaceError, match="invalid"):
+        workspace.store_chatterbox_reference(manifest["conversion_id"], reference, consent_confirmed=True)
+    _write_reference(reference)
+    workspace.store_chatterbox_reference(manifest["conversion_id"], reference, consent_confirmed=True)
+    workspace.chatterbox_reference_path(manifest["conversion_id"]).write_bytes(b"changed")
+    with pytest.raises(ManifestError, match="reference"):
+        workspace.load_chatterbox_reference(manifest["conversion_id"])
+
+
+def test_chatterbox_reference_requires_more_than_five_seconds(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    _write_reference(reference, seconds=5.0)
+    with pytest.raises(WorkspaceError, match="invalid"):
+        workspace.store_chatterbox_reference(manifest["conversion_id"], reference, consent_confirmed=True)
+    _write_reference(reference, seconds=5.01)
+    status = workspace.store_chatterbox_reference(manifest["conversion_id"], reference, consent_confirmed=True)
+    assert status["available"] is True and status["duration_seconds"] > 5.0
+
+
+def test_builtin_chatterbox_generation_is_not_invalidated_by_reference_lifecycle(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source); conversion_id = manifest["conversion_id"]
+    text = "Built-in voice."
+    workspace.persist_analysis(conversion_id, {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []})
+    plan = {"schema_version": 1, "mode": "whole", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "Book", "start_offset": 0, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": 2}], "warnings": []}
+    workspace.persist_chapter_plan(conversion_id, plan)
+    from pdf_audiobook.tts import CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, EngineMetadata, SynthesisSettings
+    metadata = EngineMetadata("chatterbox", "0.1.7", CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, "unrecorded", "builtin", "bundled", "unrecorded", 24000, SynthesisSettings(sample_rate=24000, chunk_cap=300, chunk_mode="legacy").as_dict())
+    with pytest.raises(ManifestError):
+        workspace.configure_generation(conversion_id, tts={**metadata.as_dict(), "speed": 1.0, "chunk_cap": 300, "settings": {"reference_descriptor_sha256": "x"}}, total_chunks=1)
+    workspace.configure_generation(conversion_id, tts={**metadata.as_dict(), "speed": 1.0, "chunk_cap": 300}, total_chunks=1)
+    reference = tmp_path / "reference.wav"; _write_reference(reference)
+    workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    workspace.replace_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    workspace.delete_chatterbox_reference(conversion_id)
+    assert workspace.read_job(conversion_id)["status"] == "planned"
+
+
+def test_chatterbox_invalid_replacement_preserves_previous_reference(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference)
+    invalid = tmp_path / "invalid.wav"; invalid.write_bytes(b"not wav")
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    conversion_id = manifest["conversion_id"]
+    workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    before = workspace.load_chatterbox_reference(conversion_id).descriptor["reference_sha256"]
+    with pytest.raises(WorkspaceError, match="invalid"):
+        workspace.replace_chatterbox_reference(conversion_id, invalid, consent_confirmed=True)
+    assert workspace.load_chatterbox_reference(conversion_id).descriptor["reference_sha256"] == before
+
+
+def test_chatterbox_descriptor_describes_exact_copy_after_source_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference, value=0)
+    replacement = tmp_path / "replacement.wav"; _write_reference(replacement, value=1)
+    original_digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    conversion_id = manifest["conversion_id"]
+    original_copy = workspace_module.copy_reference_file
+
+    def copy_then_drift(source_path: Path, destination_path: Path, *, chunk_size: int) -> None:
+        original_copy(source_path, destination_path, chunk_size=chunk_size)
+        Path(source_path).write_bytes(replacement.read_bytes())
+
+    monkeypatch.setattr(workspace_module, "copy_reference_file", copy_then_drift)
+    status = workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    assert status["reference_sha256"] == original_digest
+    assert status["reference_sha256"] != hashlib.sha256(replacement.read_bytes()).hexdigest()
+    assert workspace.load_chatterbox_reference(conversion_id).descriptor["reference_sha256"] == status["reference_sha256"]
+
+
+def test_chatterbox_status_rejects_missing_or_mutated_controlled_side(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference)
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    conversion_id = manifest["conversion_id"]
+    workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    controlled = workspace.chatterbox_reference_path(conversion_id)
+    controlled.unlink()
+    with pytest.raises(ManifestError, match="reference"):
+        workspace.chatterbox_reference_status(conversion_id)
+
+
+def test_chatterbox_revoke_removes_corrupt_safe_artifacts_but_refuses_links(tmp_path: Path) -> None:
+    source = tmp_path / "book.pdf"; source.write_bytes(b"source")
+    reference = tmp_path / "reference.wav"; _write_reference(reference)
+    workspace = Workspace(tmp_path / "data"); manifest = workspace.create_conversion(source)
+    conversion_id = manifest["conversion_id"]
+    workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    workspace.chatterbox_reference_descriptor_path(conversion_id).write_text("{broken", encoding="utf-8")
+    workspace.chatterbox_reference_path(conversion_id).write_bytes(b"corrupt but regular")
+    assert workspace.delete_chatterbox_reference(conversion_id) is True
+    assert not workspace.chatterbox_reference_descriptor_path(conversion_id).exists()
+    assert not workspace.chatterbox_reference_path(conversion_id).exists()
+
+    workspace.store_chatterbox_reference(conversion_id, reference, consent_confirmed=True)
+    linked = tmp_path / "outside-reference.wav"; linked.write_bytes(b"keep")
+    target = workspace.chatterbox_reference_path(conversion_id)
+    target.unlink()
+    try:
+        target.symlink_to(linked)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    with pytest.raises(UnsafePathError):
+        workspace.delete_chatterbox_reference(conversion_id)
+    assert linked.read_bytes() == b"keep"
+    assert not workspace.chatterbox_reference_descriptor_path(conversion_id).exists()
 
 
 def test_malformed_active_state_can_be_explicitly_reset_without_deleting_work(tmp_path: Path) -> None:

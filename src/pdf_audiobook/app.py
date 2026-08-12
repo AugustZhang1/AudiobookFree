@@ -5,6 +5,8 @@ from __future__ import annotations
 import hmac
 import asyncio
 from datetime import datetime, timezone
+import hashlib
+import json
 import os
 import secrets
 import stat
@@ -23,9 +25,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from .audio import validate_wav
 from .analysis_runner import AnalyzerDescriptor, VoiceAnalysisRunner
 from .analyzers.booknlp import BookNLPAnalyzer
+from .chatterbox_reference import MAX_REFERENCE_BYTES
+from .engine_catalog import CHATTERBOX_NANO_MODEL_ID, CHATTERBOX_NANO_MODEL, CHATTERBOX_ENGINE_ID, CHATTERBOX_SOURCE_COMMIT, catalog_revision, list_capabilities, require_enabled
 from .pdf import MAX_PDF_BYTES, PdfAnalysisError, analyze_pdf, preflight_pdf
 from .chapters import ChapterPlanError, create_chapter_plan, rename_chapters, select_chapter_range, validate_chapter_plan
-from .tts import APPROVED_VOICES, DEFAULT_CHUNK_CAP, DEFAULT_TORCH_THREADS, EngineMetadata, SynthesisSettings, TORCH_THREADS_ENV, plan_chunks, plan_interactive_chunks
+from .tts import APPROVED_VOICES, CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_CHUNK_CAP, CHATTERBOX_REFERENCE_VOICE, CHATTERBOX_SAMPLE_RATE, DEFAULT_CHUNK_CAP, DEFAULT_TORCH_THREADS, EngineMetadata, SynthesisSettings, TORCH_THREADS_ENV, plan_chunks, plan_interactive_chunks
 from .voice_settings import DEFAULT_VOICE_SETTINGS, VoiceSettingsError, canonical_voice_settings
 from .voice_shaping import PREVIEW_SETTINGS_IMPLEMENTATION, shaping_capability, shaping_fingerprint
 from .security import instance_path, pid_is_alive, remove_instance_if_matches, token_hash
@@ -37,6 +41,11 @@ from .workspace import GENERATION_SCHEMA_VERSION, INTERACTIVE_GENERATION_SCHEMA_
 STATIC_DIR = Path(__file__).with_name("static")
 COOKIE_NAME = "pdf_audiobook_session"
 PREVIEW_GENERATION_TIMEOUT_SECONDS = 120
+# Nano may need several minutes on CPU for its first model load. Keep Kokoro's
+# shorter bound above, while allowing both Chatterbox preview paths to finish
+# warming the shared cache without removing the subprocess safety timeout.
+CHATTERBOX_PREVIEW_GENERATION_TIMEOUT_SECONDS = 600
+CHATTERBOX_BUILTIN_PREVIEW_VERSION = "chatterbox-builtin-preview-v1"
 
 
 @dataclass
@@ -58,6 +67,8 @@ class AppState:
     uvicorn_server: Any = None
     preview_root: Path | None = None
     preview_generator: Any = None
+    chatterbox_preview_generator: Any = None
+    chatterbox_builtin_preview_generator: Any = None
     path_opener: Any = None
 
     @property
@@ -100,10 +111,23 @@ def _spawn_worker(workspace_root: Path, conversion_id: str, performance_mode: st
     if performance_mode not in {"background", "maximum_speed"}:
         raise ValueError("invalid performance_mode")
     repo_root = Path(__file__).resolve().parents[2]
-    configured_interpreter = os.environ.get("PDF_AUDIOBOOK_KOKORO_PYTHON")
-    interpreter = Path(configured_interpreter).expanduser() if configured_interpreter else repo_root / "benchmark" / "environments" / "kokoro" / ".venv" / "Scripts" / "python.exe"
+    engine = "kokoro"
+    try:
+        job = Workspace(workspace_root).read_job(conversion_id)
+        engine = str((job.get("tts") or {}).get("engine") or "kokoro")
+    except Exception:
+        # Preserve the legacy launcher boundary for callers that launch before
+        # a manifest exists (and for isolated launcher tests).
+        engine = "kokoro"
+    selected_engine = "chatterbox" if engine == "chatterbox" else "kokoro"
+    if selected_engine == "chatterbox":
+        configured_interpreter = os.environ.get("PDF_AUDIOBOOK_CHATTERBOX_PYTHON")
+        interpreter = Path(configured_interpreter).expanduser() if configured_interpreter else repo_root / "engine_envs" / "chatterbox" / ".venv" / "Scripts" / "python.exe"
+    else:
+        configured_interpreter = os.environ.get("PDF_AUDIOBOOK_KOKORO_PYTHON")
+        interpreter = Path(configured_interpreter).expanduser() if configured_interpreter else repo_root / "benchmark" / "environments" / "kokoro" / ".venv" / "Scripts" / "python.exe"
     if not _safe_regular_file(interpreter):
-        raise OSError("Kokoro worker interpreter is unavailable")
+        raise OSError(f"{selected_engine.capitalize()} worker interpreter is unavailable")
     package_src = str(repo_root / "src")
     child_env = os.environ.copy()
     existing = child_env.get("PYTHONPATH", "")
@@ -111,6 +135,9 @@ def _spawn_worker(workspace_root: Path, conversion_id: str, performance_mode: st
     cpu_count = os.cpu_count()
     detected_cpus = cpu_count if cpu_count is not None and cpu_count > 0 else 8
     child_env[TORCH_THREADS_ENV] = str(detected_cpus if performance_mode == "maximum_speed" else min(DEFAULT_TORCH_THREADS, detected_cpus))
+    if selected_engine == "chatterbox":
+        child_env["HF_HUB_OFFLINE"] = "1"
+        child_env["TRANSFORMERS_OFFLINE"] = "1"
     return subprocess.Popen([str(interpreter), "-m", "pdf_audiobook.worker", str(workspace_root), conversion_id], shell=False, env=child_env)
 
 
@@ -131,7 +158,7 @@ def _default_preview_generator(voice: str, target: Path, settings: dict[str, Any
     child_env[TORCH_THREADS_ENV] = str(min(DEFAULT_TORCH_THREADS, detected_cpus))
     try:
         subprocess.run(
-            [str(interpreter), "-m", "pdf_audiobook.preview_worker", voice, str(target), __import__("json").dumps(settings if settings is not None else DEFAULT_VOICE_SETTINGS, sort_keys=True, separators=(",", ":"))],
+            [str(interpreter), "-m", "pdf_audiobook.preview_worker", voice, str(target), json.dumps(settings if settings is not None else DEFAULT_VOICE_SETTINGS, sort_keys=True, separators=(",", ":"))],
             shell=False,
             check=True,
             env=child_env,
@@ -145,6 +172,185 @@ def _default_preview_generator(voice: str, target: Path, settings: dict[str, Any
 
 class _PreviewGenerationError(RuntimeError):
     pass
+
+
+class _ReferenceRequestError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int = 409):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+
+
+def _reference_error(error: _ReferenceRequestError) -> JSONResponse:
+    return JSONResponse({"error": {"code": error.code, "message": error.message}}, status_code=error.status_code)
+
+
+def _chatterbox_preview_target(root: Path, identity: str) -> Path:
+    if not _safe_real_directory(root):
+        root.mkdir(parents=True, exist_ok=True)
+    if not _safe_real_directory(root):
+        raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503)
+    cache = root / ".chatterbox-preview-cache"
+    if cache.exists() or cache.is_symlink():
+        if not _safe_real_directory(cache):
+            raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503)
+    else:
+        cache.mkdir()
+    target = cache / f"chatterbox-{identity}.wav"
+    try:
+        target.resolve().relative_to(cache.resolve())
+    except ValueError as exc:
+        raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503) from exc
+    return target
+
+
+def _clear_chatterbox_preview_cache(root: Path | None) -> None:
+    if root is None:
+        return
+    cache = root / ".chatterbox-preview-cache"
+    if not _safe_real_directory(cache):
+        return
+    for entry in list(cache.iterdir()):
+        try:
+            if entry.name.startswith("chatterbox-") and entry.suffix == ".wav" and _safe_regular_file(entry):
+                entry.unlink()
+        except OSError:
+            continue
+
+
+def _store_chatterbox_reference_locked(state: AppState, workspace: Workspace, conversion_id: str, source: Path, *, replace: bool) -> dict[str, Any]:
+    """Publish a reference and invalidate its previews as one serialized operation."""
+
+    with state.preview_lock:
+        if replace:
+            result = workspace.replace_chatterbox_reference(conversion_id, source, consent_confirmed=True)
+        else:
+            result = workspace.store_chatterbox_reference(conversion_id, source, consent_confirmed=True)
+        _clear_chatterbox_preview_cache(state.preview_root)
+        return result
+
+
+def _delete_chatterbox_reference_locked(state: AppState, workspace: Workspace, conversion_id: str) -> bool:
+    """Revoke a reference and invalidate its previews as one serialized operation."""
+
+    with state.preview_lock:
+        deleted = workspace.delete_chatterbox_reference(conversion_id)
+        _clear_chatterbox_preview_cache(state.preview_root)
+        return deleted
+
+
+def _default_chatterbox_preview_generator(reference: Path, target: Path, _descriptor: dict[str, Any] | None = None) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    configured_interpreter = os.environ.get("PDF_AUDIOBOOK_CHATTERBOX_PYTHON")
+    interpreter = Path(configured_interpreter).expanduser() if configured_interpreter else repo_root / "engine_envs" / "chatterbox" / ".venv" / "Scripts" / "python.exe"
+    if not _safe_regular_file(interpreter):
+        raise RuntimeError("preview generator is unavailable")
+    package_src = str(repo_root / "src")
+    child_env = os.environ.copy()
+    existing = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = package_src + (os.pathsep + existing if existing else "")
+    child_env["HF_HUB_OFFLINE"] = "1"
+    child_env["TRANSFORMERS_OFFLINE"] = "1"
+    cpu_count = os.cpu_count()
+    child_env[TORCH_THREADS_ENV] = str(min(DEFAULT_TORCH_THREADS, cpu_count if cpu_count is not None and cpu_count > 0 else 8))
+    try:
+        subprocess.run([str(interpreter), "-m", "pdf_audiobook.chatterbox_preview_worker", str(reference), str(target)], shell=False, check=True, env=child_env, timeout=CHATTERBOX_PREVIEW_GENERATION_TIMEOUT_SECONDS, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        raise RuntimeError("preview generation failed") from exc
+
+
+def _default_chatterbox_builtin_preview_generator(target: Path) -> None:
+    """Generate the bundled Nano preview in the isolated Chatterbox interpreter."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    configured_interpreter = os.environ.get("PDF_AUDIOBOOK_CHATTERBOX_PYTHON")
+    interpreter = Path(configured_interpreter).expanduser() if configured_interpreter else repo_root / "engine_envs" / "chatterbox" / ".venv" / "Scripts" / "python.exe"
+    if not _safe_regular_file(interpreter):
+        raise RuntimeError("preview generator is unavailable")
+    package_src = str(repo_root / "src")
+    child_env = os.environ.copy()
+    existing = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = package_src + (os.pathsep + existing if existing else "")
+    child_env["HF_HUB_OFFLINE"] = "1"
+    child_env["TRANSFORMERS_OFFLINE"] = "1"
+    cpu_count = os.cpu_count()
+    child_env[TORCH_THREADS_ENV] = str(min(DEFAULT_TORCH_THREADS, cpu_count if cpu_count is not None and cpu_count > 0 else 8))
+    try:
+        subprocess.run([str(interpreter), "-m", "pdf_audiobook.chatterbox_preview_worker", "--builtin", str(target)], shell=False, check=True, env=child_env, timeout=CHATTERBOX_PREVIEW_GENERATION_TIMEOUT_SECONDS, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        raise RuntimeError("preview generation failed") from exc
+
+
+def _chatterbox_preview(state: AppState, workspace: Workspace, conversion_id: str) -> Path:
+    with state.preview_lock:
+        reference = workspace.load_chatterbox_reference(conversion_id)
+        target = _chatterbox_preview_target(state.preview_root or workspace.workspace_root, reference.descriptor["descriptor_sha256"])
+        if _safe_regular_file(target):
+            try:
+                validate_wav(target, expected_sample_rate=CHATTERBOX_SAMPLE_RATE)
+                return target
+            except (OSError, ValueError):
+                pass
+        generator = state.chatterbox_preview_generator or _default_chatterbox_preview_generator
+        try:
+            try:
+                signature = inspect.signature(generator)
+                accepts_descriptor = any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()) or len(signature.parameters) >= 3
+            except (TypeError, ValueError):
+                accepts_descriptor = True
+            if accepts_descriptor:
+                generator(reference.path, target, reference.descriptor)
+            else:
+                generator(reference.path, target)
+            validate_wav(target, expected_sample_rate=CHATTERBOX_SAMPLE_RATE)
+        except Exception as exc:
+            raise _PreviewGenerationError("preview generation failed") from exc
+        return target
+
+
+def _chatterbox_builtin_preview_target(root: Path) -> Path:
+    """Return a safe, stable target for the bundled Nano preview."""
+
+    if not _safe_real_directory(root):
+        root.mkdir(parents=True, exist_ok=True)
+    if not _safe_real_directory(root):
+        raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503)
+    cache = root / ".chatterbox-preview-cache"
+    if cache.exists() or cache.is_symlink():
+        if not _safe_real_directory(cache):
+            raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503)
+    else:
+        cache.mkdir()
+    identity = hashlib.sha256(
+        f"{CHATTERBOX_NANO_MODEL_ID}|builtin|{CHATTERBOX_SOURCE_COMMIT}|{CHATTERBOX_BUILTIN_PREVIEW_VERSION}".encode("utf-8")
+    ).hexdigest()
+    # Keep the filename bounded for Windows MAX_PATH while retaining a stable
+    # digest derived from model, voice, revision, and preview version.
+    target = cache / f"chatterbox-builtin-{identity[:24]}.wav"
+    try:
+        target.resolve().relative_to(cache.resolve())
+    except ValueError as exc:
+        raise _ReferenceRequestError("PREVIEW_UNAVAILABLE", "Chatterbox preview is unavailable", 503) from exc
+    return target
+
+
+def _chatterbox_builtin_preview(state: AppState) -> Path:
+    with state.preview_lock:
+        target = _chatterbox_builtin_preview_target(state.preview_root or state.workspace_root)
+        if _safe_regular_file(target):
+            try:
+                validate_wav(target, expected_sample_rate=CHATTERBOX_SAMPLE_RATE)
+                return target
+            except (OSError, ValueError):
+                pass
+        generator = state.chatterbox_builtin_preview_generator or _default_chatterbox_builtin_preview_generator
+        try:
+            generator(target)
+            validate_wav(target, expected_sample_rate=CHATTERBOX_SAMPLE_RATE)
+        except Exception as exc:
+            raise _PreviewGenerationError("preview generation failed") from exc
+        return target
 
 
 def _preview_settings(request: Request) -> dict[str, Any]:
@@ -459,7 +665,7 @@ def _process_staged_pdf(staged: Path, workspace: Workspace, display_name: str, l
         return {"conversion_id": manifest["conversion_id"], "status": job["status"], "job": job, "analysis": _public_analysis(analysis)}
 
 
-def create_app(*, port: int, launch_id: str | None = None, session_token: str | None = None, instance_file: Path | None = None, data_root: Path | None = None, worker_launcher: Any | None = None, preview_root: Path | None = None, preview_generator: Any | None = None, path_opener: Any | None = None, voice_analyzer: Any | None = None) -> FastAPI:
+def create_app(*, port: int, launch_id: str | None = None, session_token: str | None = None, instance_file: Path | None = None, data_root: Path | None = None, worker_launcher: Any | None = None, preview_root: Path | None = None, preview_generator: Any | None = None, path_opener: Any | None = None, voice_analyzer: Any | None = None, chatterbox_preview_generator: Any | None = None, chatterbox_builtin_preview_generator: Any | None = None) -> FastAPI:
     instance_file = instance_file or instance_path()
     workspace_root = Path(data_root or instance_file.parent).expanduser().resolve()
     preview_root = Path(preview_root or (Path(__file__).resolve().parents[2] / "benchmark" / "previews")).expanduser()
@@ -477,6 +683,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         voice_analyzer=voice_analyzer,
         preview_root=preview_root,
         preview_generator=preview_generator or _default_preview_generator,
+        chatterbox_preview_generator=chatterbox_preview_generator,
+        chatterbox_builtin_preview_generator=chatterbox_builtin_preview_generator,
         path_opener=path_opener or _default_path_opener,
     )
     app = FastAPI(title="PDF to Audiobook", docs_url=None, redoc_url=None)
@@ -495,7 +703,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
 
     @app.get("/", response_class=FileResponse)
     async def index():
-        return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+        return FileResponse(STATIC_DIR / "index.html", media_type="text/html", headers={"Cache-Control": "no-store"})
 
     @app.get("/favicon.ico")
     async def favicon():
@@ -503,11 +711,11 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
 
     @app.get("/styles.css", response_class=FileResponse)
     async def styles():
-        return FileResponse(STATIC_DIR / "styles.css", media_type="text/css")
+        return FileResponse(STATIC_DIR / "styles.css", media_type="text/css", headers={"Cache-Control": "no-store"})
 
     @app.get("/app.js", response_class=FileResponse)
     async def script():
-        return FileResponse(STATIC_DIR / "app.js", media_type="text/javascript")
+        return FileResponse(STATIC_DIR / "app.js", media_type="text/javascript", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/session/bootstrap")
     async def bootstrap(request: Request, response: Response):
@@ -525,6 +733,157 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         if not _authenticated(request, state):
             raise HTTPException(401, "authentication required")
         return {"authenticated": True, "launch_id": state.launch_id}
+
+    def _reference_context(workspace: Workspace, *, for_write: bool = False) -> tuple[str, dict[str, Any]]:
+        inspection = workspace.inspect_startup()
+        if inspection.state == "no_active":
+            raise _ReferenceRequestError("NO_ACTIVE", "no active conversion", 409)
+        if inspection.state != "resumable" or not inspection.conversion_id or not inspection.manifest:
+            raise _ReferenceRequestError("REFERENCE_UNAVAILABLE", "active conversion is invalid", 409)
+        manifest = inspection.manifest
+        status_value = manifest.get("status")
+        recorded = manifest.get("worker") or {}
+        try:
+            recorded_live = bool(recorded and pid_is_alive(int(recorded.get("pid", 0))))
+        except (TypeError, ValueError):
+            recorded_live = False
+        local_process = state.worker_process
+        local_live = local_process is not None and (not hasattr(local_process, "poll") or local_process.poll() is None)
+        if recorded_live or local_live or status_value in {"starting", "synthesizing", "cancelling", "assembling", "encoding", "verifying", "publishing"}:
+            raise _ReferenceRequestError("ACTIVE_WORKER", "reference changes are unavailable during generation", 409)
+        if for_write and status_value == "completed" and manifest.get("stage") == "completed" and manifest.get("output") is not None:
+            raise _ReferenceRequestError("REFERENCE_LOCKED", "published completed generation cannot be replaced", 409)
+        return inspection.conversion_id, manifest
+
+    async def _reference_locks() -> tuple[bool, bool, str]:
+        generation_acquired = await asyncio.to_thread(state.generation_lock.acquire, False)
+        if not generation_acquired:
+            return False, False, "generation"
+        analysis_acquired = await asyncio.to_thread(state.analysis_lock.acquire, False)
+        if not analysis_acquired:
+            state.generation_lock.release()
+            return False, False, "analysis"
+        return True, True, "ok"
+
+    def _release_reference_locks(generation_acquired: bool, analysis_acquired: bool) -> None:
+        if analysis_acquired:
+            state.analysis_lock.release()
+        if generation_acquired:
+            state.generation_lock.release()
+
+    @app.get("/api/chatterbox/reference")
+    async def chatterbox_reference_status(request: Request):
+        if not _authenticated(request, state):
+            raise HTTPException(401, "authentication required")
+        try:
+            conversion_id, _manifest = await asyncio.to_thread(_reference_context, Workspace(state.workspace_root))
+            reference = await asyncio.to_thread(Workspace(state.workspace_root).chatterbox_reference_status, conversion_id)
+        except _ReferenceRequestError as exc:
+            return _reference_error(exc)
+        except (WorkspaceError, OSError):
+            return _reference_error(_ReferenceRequestError("REFERENCE_INVALID", "reference status is unavailable", 409))
+        return JSONResponse({"conversion_id": conversion_id, "reference": reference, **reference}, headers={"Cache-Control": "no-store"})
+
+    async def _store_chatterbox_reference(request: Request, *, replace: bool):
+        if not _authenticated(request, state) or not _exact_origin(request, state.port):
+            raise HTTPException(403, "authenticated exact local Origin required")
+        if request.headers.get("content-type") != "audio/wav":
+            return _reference_error(_ReferenceRequestError("INVALID_CONTENT_TYPE", "Content-Type must be exactly audio/wav", 415))
+        if request.headers.get("x-reference-consent") != "confirmed":
+            return _reference_error(_ReferenceRequestError("REFERENCE_CONSENT_REQUIRED", "X-Reference-Consent: confirmed is required", 422))
+        workspace = Workspace(state.workspace_root)
+        generation_acquired, analysis_acquired, contention = await _reference_locks()
+        if contention == "generation":
+            return _reference_error(_ReferenceRequestError("ACTIVE_WORKER", "another generation operation is in progress", 409))
+        if contention == "analysis":
+            return _reference_error(_ReferenceRequestError("BUSY", "another workspace operation is in progress", 409))
+        staged: Path | None = None
+        try:
+            try:
+                conversion_id, _manifest = await asyncio.to_thread(_reference_context, workspace, for_write=True)
+                staging_dir = _staging_directory(state.workspace_root)
+                staged = staging_dir / f"{uuid.uuid4()}.reference.wav"
+                total = 0
+                with staged.open("xb") as handle:
+                    async for chunk in request.stream():
+                        total += len(chunk)
+                        if total > MAX_REFERENCE_BYTES:
+                            return _reference_error(_ReferenceRequestError("REFERENCE_TOO_LARGE", "reference WAV exceeds the 25 MiB size limit", 413))
+                        handle.write(chunk)
+                    handle.flush()
+                result = await asyncio.to_thread(_store_chatterbox_reference_locked, state, workspace, conversion_id, staged, replace=replace)
+                return JSONResponse({"conversion_id": conversion_id, "reference": result, **result}, headers={"Cache-Control": "no-store"})
+            except _ReferenceRequestError as exc:
+                return _reference_error(exc)
+            except (WorkspaceError, OSError, ValueError):
+                return _reference_error(_ReferenceRequestError("REFERENCE_INVALID", "reference WAV is invalid or unavailable", 422))
+        finally:
+            if staged is not None:
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            _release_reference_locks(generation_acquired, analysis_acquired)
+
+    @app.post("/api/chatterbox/reference")
+    async def chatterbox_reference_create(request: Request):
+        return await _store_chatterbox_reference(request, replace=False)
+
+    @app.put("/api/chatterbox/reference")
+    async def chatterbox_reference_replace(request: Request):
+        return await _store_chatterbox_reference(request, replace=True)
+
+    @app.delete("/api/chatterbox/reference")
+    async def chatterbox_reference_delete(request: Request):
+        if not _authenticated(request, state) or not _exact_origin(request, state.port):
+            raise HTTPException(403, "authenticated exact local Origin required")
+        workspace = Workspace(state.workspace_root)
+        generation_acquired, analysis_acquired, contention = await _reference_locks()
+        if contention == "generation":
+            return _reference_error(_ReferenceRequestError("ACTIVE_WORKER", "another generation operation is in progress", 409))
+        if contention == "analysis":
+            return _reference_error(_ReferenceRequestError("BUSY", "another workspace operation is in progress", 409))
+        try:
+            try:
+                conversion_id, _manifest = await asyncio.to_thread(_reference_context, workspace)
+                deleted = await asyncio.to_thread(_delete_chatterbox_reference_locked, state, workspace, conversion_id)
+                return JSONResponse({"conversion_id": conversion_id, "deleted": bool(deleted), "reference": {"available": False}, "available": False}, headers={"Cache-Control": "no-store"})
+            except _ReferenceRequestError as exc:
+                return _reference_error(exc)
+            except (WorkspaceError, OSError, ValueError):
+                return _reference_error(_ReferenceRequestError("REFERENCE_INVALID", "reference could not be revoked", 409))
+        finally:
+            _release_reference_locks(generation_acquired, analysis_acquired)
+
+    @app.get("/api/chatterbox/preview/builtin")
+    async def chatterbox_builtin_preview(request: Request):
+        if not _authenticated(request, state):
+            raise HTTPException(401, "authentication required")
+        try:
+            target = await asyncio.to_thread(_chatterbox_builtin_preview, state)
+            return FileResponse(target, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+        except _ReferenceRequestError as exc:
+            return _reference_error(exc)
+        except _PreviewGenerationError:
+            return _reference_error(_ReferenceRequestError("PREVIEW_FAILED", "built-in preview generation failed", 503))
+        except (OSError, ValueError):
+            return _reference_error(_ReferenceRequestError("PREVIEW_UNAVAILABLE", "built-in preview is unavailable", 503))
+
+    @app.get("/api/chatterbox/preview")
+    async def chatterbox_preview(request: Request):
+        if not _authenticated(request, state):
+            raise HTTPException(401, "authentication required")
+        workspace = Workspace(state.workspace_root)
+        try:
+            conversion_id, _manifest = await asyncio.to_thread(_reference_context, workspace)
+            target = await asyncio.to_thread(_chatterbox_preview, state, workspace, conversion_id)
+            return FileResponse(target, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+        except _ReferenceRequestError as exc:
+            return _reference_error(exc)
+        except (WorkspaceError, OSError, ValueError):
+            return _reference_error(_ReferenceRequestError("REFERENCE_INVALID", "reference preview is unavailable", 409))
+        except _PreviewGenerationError:
+            return _reference_error(_ReferenceRequestError("PREVIEW_FAILED", "reference preview generation failed", 503))
 
     @app.get("/api/voice-preview/{voice}")
     async def voice_preview(voice: str, request: Request):
@@ -600,6 +959,20 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         revision = registry_revision()
         capability = shaping_capability()
         return {"revision": revision, "registry_revision": revision, "voices": entries, "voice_shaping": {"available": capability.available, "pitch_available": capability.rubberband, "tone_available": capability.tone_available, "fingerprint": shaping_fingerprint(), "preview_settings_available": True, "preview_settings_implementation": PREVIEW_SETTINGS_IMPLEMENTATION}}
+
+    @app.get("/api/engines")
+    async def engines(request: Request):
+        if not _authenticated(request, state):
+            raise HTTPException(401, "authentication required")
+        repo_root = Path(__file__).resolve().parents[2]
+        kokoro_interpreter = Path(os.environ.get("PDF_AUDIOBOOK_KOKORO_PYTHON", "")).expanduser() if os.environ.get("PDF_AUDIOBOOK_KOKORO_PYTHON") else repo_root / "benchmark" / "environments" / "kokoro" / ".venv" / "Scripts" / "python.exe"
+        chatterbox_interpreter = Path(os.environ.get("PDF_AUDIOBOOK_CHATTERBOX_PYTHON", "")).expanduser() if os.environ.get("PDF_AUDIOBOOK_CHATTERBOX_PYTHON") else repo_root / "engine_envs" / "chatterbox" / ".venv" / "Scripts" / "python.exe"
+        result: list[dict[str, Any]] = [{"engine": "kokoro", "model": "hexgrad/Kokoro-82M", "installed": _safe_regular_file(kokoro_interpreter)}]
+        for capability in list_capabilities():
+            entry = capability.as_dict()
+            entry["installed"] = _safe_regular_file(chatterbox_interpreter)
+            result.append(entry)
+        return JSONResponse({"revision": catalog_revision(), "engines": result}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
     async def status(request: Request):
@@ -826,7 +1199,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 except OSError:
                     pass
 
-    def _generation_inputs(workspace: Workspace, conversion_id: str, voice: str, speed: float, chapter_start: int | None = None, chapter_end: int | None = None) -> tuple[dict[str, Any], int]:
+    def _generation_inputs(workspace: Workspace, conversion_id: str, voice: str, speed: float, chapter_start: int | None = None, chapter_end: int | None = None, *, engine: str = "kokoro", model: str | None = None) -> tuple[dict[str, Any], int]:
         job = workspace.read_job(conversion_id)
         if job.get("schema_version") != GENERATION_SCHEMA_VERSION and job.get("status") != "planned":
             raise WorkspaceError("generation requires a persisted chapter plan")
@@ -835,8 +1208,29 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         chapters = select_chapter_range(plan, chapter_start, chapter_end)
         normalized_start = 1 if chapter_start is None else chapter_start
         normalized_end = len(plan["chapters"]) if chapter_end is None else chapter_end
-        settings = SynthesisSettings(speed=speed)
-        metadata = EngineMetadata("kokoro", "0.9.4", "hexgrad/Kokoro-82M", "captured-at-download", "unrecorded", voice, "captured-at-download", "unrecorded", settings.sample_rate, settings.as_dict())
+        if engine == "chatterbox":
+            if model != CHATTERBOX_NANO_MODEL_ID or voice not in {CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_REFERENCE_VOICE} or speed != 1.0:
+                raise WorkspaceError("Chatterbox requires model nano, voice builtin or reference-wav, and speed 1.0")
+            analysis = workspace.load_analysis(conversion_id)
+            if analysis.get("detected_language") != "English":
+                raise WorkspaceError("Chatterbox requires English analysis")
+            capability = require_enabled(CHATTERBOX_ENGINE_ID, CHATTERBOX_NANO_MODEL_ID)
+            reference = None
+            if voice == CHATTERBOX_REFERENCE_VOICE:
+                try:
+                    reference = workspace.load_chatterbox_reference(conversion_id)
+                except (WorkspaceError, OSError) as exc:
+                    raise WorkspaceError("Chatterbox generation requires a valid reference") from exc
+            settings = SynthesisSettings(speed=1.0, sample_rate=CHATTERBOX_SAMPLE_RATE, chunk_cap=CHATTERBOX_CHUNK_CAP, chunk_mode="legacy")
+            settings_dict = settings.as_dict()
+            voice_checksum = "unrecorded"
+            if reference is not None:
+                settings_dict["reference_descriptor_sha256"] = reference.descriptor["descriptor_sha256"]
+                voice_checksum = reference.descriptor["voice_checksum"]
+            metadata = EngineMetadata(capability.engine_id, capability.package_version, capability.model, capability.model_revision, capability.model_checksum, voice, "bundled" if voice == CHATTERBOX_BUILTIN_VOICE else capability.model_revision, voice_checksum, CHATTERBOX_SAMPLE_RATE, settings_dict)
+        else:
+            settings = SynthesisSettings(speed=speed)
+            metadata = EngineMetadata("kokoro", "0.9.4", "hexgrad/Kokoro-82M", "captured-at-download", "unrecorded", voice, "captured-at-download", "unrecorded", settings.sample_rate, settings.as_dict())
         chunks = plan_chunks(text, chapters, metadata, cap=settings.chunk_cap)
         tts = {**metadata.as_dict(), "speed": speed, "chunk_cap": settings.chunk_cap}
         if normalized_start != 1 or normalized_end != len(plan["chapters"]):
@@ -1557,14 +1951,26 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         body = await _json_body(request)
         if isinstance(body, dict) and "mode" in body:
             return await _interactive_generation_start(body, Workspace(state.workspace_root))
-        allowed = {"voice", "speed", "chapter_start", "chapter_end", "performance_mode"}
+        allowed = {"engine", "model", "voice", "speed", "chapter_start", "chapter_end", "performance_mode"}
         if body is None or not {"voice", "speed"}.issubset(body) or not set(body).issubset(allowed):
             return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "voice and speed are required"}}, status_code=422)
+        engine, model = body.get("engine", "kokoro"), body.get("model")
         voice, speed = body.get("voice"), body.get("speed")
+        if engine not in {"kokoro", "chatterbox"}:
+            return JSONResponse({"error": {"code": "INVALID_ENGINE", "message": "engine must be kokoro or chatterbox"}}, status_code=422)
+        if engine == "kokoro" and model is not None:
+            return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "model is only valid for Chatterbox"}}, status_code=422)
+        if engine == "chatterbox":
+            if model != CHATTERBOX_NANO_MODEL_ID:
+                return JSONResponse({"error": {"code": "CHATTERBOX_MODEL_REQUIRED", "message": "Chatterbox requires model nano"}}, status_code=422)
+            if voice not in {CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_REFERENCE_VOICE}:
+                return JSONResponse({"error": {"code": "CHATTERBOX_VOICE_REQUIRED", "message": "Chatterbox requires voice builtin or reference-wav"}}, status_code=422)
+            if isinstance(speed, bool) or not isinstance(speed, (int, float)) or float(speed) != 1.0:
+                return JSONResponse({"error": {"code": "CHATTERBOX_SPEED_FIXED", "message": "Chatterbox speed is fixed at 1.0"}}, status_code=422)
         performance_mode = body.get("performance_mode", "background")
         if not isinstance(performance_mode, str) or performance_mode not in {"background", "maximum_speed"}:
             return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "performance_mode must be background or maximum_speed"}}, status_code=422)
-        if voice not in APPROVED_VOICES or isinstance(speed, bool) or type(speed) not in {int, float} or not 0.5 <= float(speed) <= 2.0:
+        if engine == "kokoro" and (voice not in APPROVED_VOICES or isinstance(speed, bool) or type(speed) not in {int, float} or not 0.5 <= float(speed) <= 2.0):
             return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "voice or speed is invalid"}}, status_code=422)
         for key in ("chapter_start", "chapter_end"):
             if key in body and type(body[key]) is not int:
@@ -1598,7 +2004,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             if local_live:
                 return JSONResponse({"error": {"code": "ACTIVE_WORKER", "message": "a generation worker is already active"}}, status_code=409)
             if manifest.get("status") == "completed" and manifest.get("stage") == "synthesis_complete" and manifest.get("output") is None:
-                tts, total = await asyncio.to_thread(_generation_inputs, workspace, inspection.conversion_id, voice, float(speed), body.get("chapter_start"), body.get("chapter_end"))
+                tts, total = await asyncio.to_thread(_generation_inputs, workspace, inspection.conversion_id, voice, float(speed), body.get("chapter_start"), body.get("chapter_end"), engine=engine, model=model)
                 if tts != manifest.get("tts") or total != manifest.get("total_chunks"):
                     return JSONResponse({"error": {"code": "SETTINGS_CHANGED", "message": "synthesis-complete audio must be finalized with its recorded settings"}}, status_code=409)
                 try:
@@ -1608,8 +2014,11 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                     await asyncio.to_thread(workspace.update_generation, inspection.conversion_id, status="failed", stage="generation_start", error=message, last_safe_error=message, worker=None)
                     return JSONResponse({"error": {"code": "WORKER_START_FAILED", "message": message}}, status_code=503)
                 state.worker_process = process
-                return {"conversion_id": inspection.conversion_id, "status": "starting", "job": manifest, "total_chunks": manifest["total_chunks"]}
-            tts, total = await asyncio.to_thread(_generation_inputs, workspace, inspection.conversion_id, voice, float(speed), body.get("chapter_start"), body.get("chapter_end"))
+                result = {"conversion_id": inspection.conversion_id, "status": "starting", "job": manifest, "total_chunks": manifest["total_chunks"]}
+                if engine == "chatterbox":
+                    result["watermark_notice"] = require_enabled(CHATTERBOX_ENGINE_ID, CHATTERBOX_NANO_MODEL_ID).watermark_notice
+                return result
+            tts, total = await asyncio.to_thread(_generation_inputs, workspace, inspection.conversion_id, voice, float(speed), body.get("chapter_start"), body.get("chapter_end"), engine=engine, model=model)
             job = await asyncio.to_thread(workspace.configure_generation, inspection.conversion_id, tts=tts, total_chunks=total)
             try:
                 process = state.worker_launcher(state.workspace_root, inspection.conversion_id, performance_mode)
@@ -1618,7 +2027,10 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 await asyncio.to_thread(workspace.update_generation, inspection.conversion_id, status="failed", stage="generation_start", error=message, last_safe_error=message, worker=None)
                 return JSONResponse({"error": {"code": "WORKER_START_FAILED", "message": message}}, status_code=503)
             state.worker_process = process
-            return {"conversion_id": inspection.conversion_id, "status": "starting", "job": job, "total_chunks": total}
+            result = {"conversion_id": inspection.conversion_id, "status": "starting", "job": job, "total_chunks": total}
+            if engine == "chatterbox":
+                result["watermark_notice"] = require_enabled(CHATTERBOX_ENGINE_ID, CHATTERBOX_NANO_MODEL_ID).watermark_notice
+            return result
         except ChapterPlanError as exc:
             return _chapter_error(exc)
         except (WorkspaceError, ManifestError, OSError) as exc:

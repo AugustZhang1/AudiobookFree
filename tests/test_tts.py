@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+from pathlib import Path
+import wave
 
 import pdf_audiobook.tts as tts
 import pytest
 from pdf_audiobook.tts import EngineMetadata, SynthesisSettings, chunk_input_hash, plan_chunks, plan_interactive_chunks
 from pdf_audiobook import voice_registry
+from pdf_audiobook.engine_catalog import catalog_revision, get_capability, list_capabilities, require_enabled
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.voice_settings import VoiceSettingsError, canonical_voice_settings, voice_settings_digest
 
@@ -84,6 +89,222 @@ def test_plan_chunks_rejects_explicit_unsupported_chunk_mode() -> None:
 def test_load_voice_rejects_unsupported_chunk_mode() -> None:
     with pytest.raises(ValueError, match="unsupported chunk mode"):
         tts.load_voice("fake-neutral", SynthesisSettings(chunk_mode="invalid"), engine="fake")
+
+
+@pytest.fixture
+def reference_dir() -> Path:
+    root = Path(__file__).with_name(f".tts-chatterbox-{os.getpid()}")
+    root.mkdir(exist_ok=True)
+    try:
+        yield root
+    finally:
+        for child in root.iterdir():
+            child.unlink(missing_ok=True)
+        root.rmdir()
+
+
+def _reference_wav(tmp_path: Path, *, channels: int = 1, payload: bytes = b"\x00\x00\x01\x00") -> Path:
+    path = tmp_path / "reference.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(24000)
+        handle.writeframes(payload * max(1, (24000 * 6) // max(1, len(payload) // 2)))
+    return path
+
+
+def test_chatterbox_catalog_is_static_and_only_nano_is_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: (_ for _ in ()).throw(AssertionError("model import")))
+    entries = list_capabilities()
+    assert [entry.model_id for entry in entries] == ["nano", "turbo", "base", "multilingual"]
+    assert entries[0].enabled and not entries[0].reference_wav_required and entries[0].chunk_cap == 300
+    assert entries[0].model_revision == "5de7a54aa4e5e2baadb0182dde554908b48b85c2"
+    assert all(not entry.enabled for entry in entries[1:])
+    assert catalog_revision() == catalog_revision() and len(catalog_revision()) == 64
+    with pytest.raises(ValueError, match="disabled"):
+        require_enabled("chatterbox", "turbo")
+    assert get_capability("chatterbox", "nano").runtime == "cpu"
+
+
+def test_chatterbox_requires_reference_and_fixed_settings(reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+    with pytest.raises(ValueError, match="reference WAV is required"):
+        tts.load_voice("reference-wav", engine="chatterbox")
+    with pytest.raises(ValueError, match="speed 1.0"):
+        tts.load_voice("reference-wav", SynthesisSettings(speed=1.1, chunk_cap=300), engine="chatterbox", reference_wav=reference)
+    with pytest.raises(ValueError, match="neutral pitch"):
+        tts.load_voice("reference-wav", SynthesisSettings(pitch_semitones=1, chunk_cap=300), engine="chatterbox", reference_wav=reference)
+    with pytest.raises(ValueError, match="does not use"):
+        tts.load_voice("builtin", engine="chatterbox", reference_wav=reference)
+    with pytest.raises(ValueError, match="24000 Hz"):
+        tts.load_voice("builtin", SynthesisSettings(sample_rate=16000), engine="chatterbox")
+
+
+def test_chatterbox_builtin_voice_uses_bundled_conditionals_without_reference(monkeypatch) -> None:
+    events: list[object] = []
+    class Model:
+        sr = 24000
+        def generate(self, text: str, **kwargs: object) -> list[float]: events.append((text, kwargs)); return [0.0, 0.5]
+        def close(self) -> None: events.append("close")
+    class ModelClass:
+        @staticmethod
+        def from_pretrained(**kwargs: object) -> Model: events.append(("from_pretrained", kwargs)); return Model()
+    class Module: ChatterboxTurboTTS = ModelClass
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: Module)
+    voice = tts.load_voice("builtin", SynthesisSettings(), engine="chatterbox")
+    assert voice.metadata.voice == "builtin" and voice.metadata.voice_checksum == "unrecorded"
+    assert voice.synthesize("hello") == tts.pcm_from_audio([0.0, 0.5])
+    assert events[-1] == ("hello", {})
+    voice.close_voice(); assert events[-1] == "close"
+
+
+def test_chatterbox_rejects_invalid_or_unsafe_reference_wav(reference_dir: Path) -> None:
+    invalid = reference_dir / "invalid.wav"
+    invalid.write_bytes(b"not a wav")
+    with pytest.raises(ValueError, match="reference WAV is invalid or unsafe") as error:
+        tts.load_voice("reference-wav", engine="chatterbox", reference_wav=invalid)
+    assert str(invalid) not in str(error.value)
+    stereo = _reference_wav(reference_dir, channels=2)
+    with pytest.raises(ValueError, match="reference WAV is invalid or unsafe"):
+        tts.load_voice("reference-wav", engine="chatterbox", reference_wav=stereo)
+
+
+def test_chatterbox_loads_lazily_with_cpu_nano_and_binds_reference_hash(monkeypatch, reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+    events: list[object] = []
+
+    class Model:
+        sr = 24000
+
+        def generate(self, text: str, **kwargs: object) -> list[float]:
+            events.append((text, kwargs))
+            return [0.0, 0.5]
+
+        def release(self) -> None:
+            events.append("release")
+
+    class ModelClass:
+        @staticmethod
+        def from_pretrained(**kwargs: object) -> Model:
+            events.append(("from_pretrained", kwargs))
+            return Model()
+
+    class Module:
+        ChatterboxTurboTTS = ModelClass
+
+    def import_module(name: str) -> object:
+        events.append(("import", name))
+        return Module
+
+    monkeypatch.setattr(tts.importlib, "import_module", import_module)
+    voice = tts.load_voice("reference-wav", SynthesisSettings(), engine="chatterbox", reference_wav=reference)
+    assert events[:2] == [("import", "chatterbox.tts_turbo"), ("from_pretrained", {"device": "cpu", "nano": True})]
+    assert voice.metadata.model_revision == "5de7a54aa4e5e2baadb0182dde554908b48b85c2"
+    assert voice.metadata.voice_checksum == hashlib.sha256(reference.read_bytes()).hexdigest()
+    assert voice.metadata.sample_rate == 24000
+    assert voice.metadata.settings["chunk_cap"] == 300
+    assert voice.synthesize("hello") == tts.pcm_from_audio([0.0, 0.5])
+    assert events[-1][0] == "hello" and events[-1][1]["audio_prompt_path"] == str(reference)
+    assert voice.synthesize("!?\u2026") == b"\x00\x00" * 1200
+    _reference_wav(reference_dir, payload=b"\x02\x00\x03\x00")
+    generate_calls = sum(1 for event in events if isinstance(event, tuple) and event[0] == "hello")
+    with pytest.raises(RuntimeError, match="reference WAV has changed") as error:
+        voice.synthesize("!?\u2026")
+    assert str(reference) not in str(error.value)
+    assert sum(1 for event in events if isinstance(event, tuple) and event[0] == "hello") == generate_calls
+    with pytest.raises(RuntimeError, match="reference WAV has changed") as error:
+        voice.synthesize("changed")
+    assert str(reference) not in str(error.value)
+    assert sum(1 for event in events if isinstance(event, tuple) and event[0] == "hello") == generate_calls
+    voice.close_voice()
+    voice.close_voice()
+    assert events.count("release") == 1
+
+
+def test_chatterbox_load_failure_does_not_expose_reference_path(monkeypatch, reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: (_ for _ in ()).throw(RuntimeError(str(reference))))
+    with pytest.raises(RuntimeError, match="Chatterbox Nano is unavailable") as error:
+        tts.load_voice("reference-wav", engine="chatterbox", reference_wav=reference)
+    assert str(reference) not in str(error.value)
+
+
+def test_chatterbox_generation_failure_is_bounded_and_path_free(monkeypatch, reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+
+    class Model:
+        sr = 24000
+
+        def generate(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError(f"backend failed for {reference}")
+
+    class ModelClass:
+        @staticmethod
+        def from_pretrained(**_kwargs: object) -> Model:
+            return Model()
+
+    class Module:
+        ChatterboxTurboTTS = ModelClass
+
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: Module)
+    voice = tts.load_voice("reference-wav", engine="chatterbox", reference_wav=reference)
+    with pytest.raises(RuntimeError, match="^Chatterbox generation failed$") as error:
+        voice.synthesize("hello")
+    assert str(reference) not in str(error.value)
+
+
+def test_chatterbox_wrapper_failure_releases_loaded_model(monkeypatch, reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+    events: list[str] = []
+
+    class Model:
+        sr = 0
+
+        def release(self) -> None:
+            events.append("release")
+
+    class ModelClass:
+        @staticmethod
+        def from_pretrained(**_kwargs: object) -> Model:
+            return Model()
+
+    class Module:
+        ChatterboxTurboTTS = ModelClass
+
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: Module)
+    with pytest.raises(RuntimeError, match="Chatterbox Nano is unavailable"):
+        tts.load_voice("reference-wav", engine="chatterbox", reference_wav=reference)
+    assert events == ["release"]
+
+
+def test_chatterbox_rejects_model_sample_rate_mismatch(monkeypatch, reference_dir: Path) -> None:
+    reference = _reference_wav(reference_dir)
+    events: list[str] = []
+
+    class Model:
+        sr = 16000
+
+        def release(self) -> None:
+            events.append("release")
+
+    class ModelClass:
+        @staticmethod
+        def from_pretrained(**_kwargs: object) -> Model:
+            return Model()
+
+    class Module:
+        ChatterboxTurboTTS = ModelClass
+
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _name: Module)
+    with pytest.raises(RuntimeError, match="Chatterbox Nano is unavailable") as error:
+        tts.load_voice("reference-wav", engine="chatterbox", reference_wav=reference)
+    assert "sample rate" not in str(error.value).lower()
+    assert events == ["release"]
+
+
+def test_chatterbox_environment_pins_resolved_perth_commit() -> None:
+    declaration = Path("engine_envs/chatterbox/pyproject.toml").read_text(encoding="utf-8")
+    assert "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ce86c49d029f42272c1902eccb675556b9ed2330" in declaration
 
 
 def test_chunks_are_ordered_complete_and_sentence_safe() -> None:

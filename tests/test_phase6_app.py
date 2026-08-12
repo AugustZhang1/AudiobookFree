@@ -883,7 +883,8 @@ def test_voice_shaping_capability_is_path_free_and_rejects_unsupported_preview_s
         assert ".preview-loading,.preview-buffering" in css
         assert "prefers-reduced-motion:reduce" in css
         assert 'previewControls.className = "cast-preview cast-audition-row"' in script
-        assert "article.append(fields, previewControls)" in script
+        assert "previewControls.append(preview, previewStatus); voiceField.append(previewControls)" in script
+        assert "article.append(fields)" in script
         pitch = client.get("/api/voice-preview/af_heart?pitch_semitones=1", headers=headers)
         tone = client.get("/api/voice-preview/af_heart?tone_preset=warm", headers=headers)
         assert pitch.status_code == 422 and pitch.json()["error"]["code"] == "PITCH_UNAVAILABLE"

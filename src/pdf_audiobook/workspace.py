@@ -24,6 +24,18 @@ import uuid
 from typing import Any, Literal
 
 from .speaker_analysis import MAX_ARTIFACT_BYTES, SpeakerAnalysisError, validate_speaker_analysis
+from .chatterbox_reference import (
+    REFERENCE_DESCRIPTOR_FILENAME,
+    REFERENCE_WAV_FILENAME,
+    ReferenceArtifact,
+    build_reference_descriptor,
+    copy_reference_file,
+    public_reference_status,
+    validate_reference_descriptor,
+    validate_reference_file,
+)
+from .engine_catalog import CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT
+from .tts import CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_SAMPLE_RATE
 from .voice_analysis import MAX_ARTIFACT_BYTES as MAX_VOICE_ANALYSIS_STATUS_BYTES, VoiceAnalysisError, validate_voice_analysis_status
 from .voice_plan import VoicePlanError, validate_voice_plan
 
@@ -750,6 +762,145 @@ class Workspace:
             chunks.mkdir(parents=False)
         return chunks
 
+    def chatterbox_reference_path(self, conversion_id: str | uuid.UUID) -> Path:
+        return self.conversion_path(conversion_id) / REFERENCE_WAV_FILENAME
+
+    def chatterbox_reference_descriptor_path(self, conversion_id: str | uuid.UUID) -> Path:
+        return self.conversion_path(conversion_id) / REFERENCE_DESCRIPTOR_FILENAME
+
+    def _read_chatterbox_reference_descriptor(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
+        target = self.chatterbox_reference_descriptor_path(conversion_id)
+        try:
+            _validate_regular_manifest_file(target, "Chatterbox reference descriptor")
+            return validate_reference_descriptor(json.loads(target.read_text(encoding="utf-8")))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ManifestError("invalid Chatterbox reference descriptor") from exc
+
+    def load_chatterbox_reference(self, conversion_id: str | uuid.UUID) -> ReferenceArtifact:
+        """Load the controlled reference and fail closed on descriptor/file drift."""
+
+        descriptor = self._read_chatterbox_reference_descriptor(conversion_id)
+        path = self.chatterbox_reference_path(conversion_id)
+        try:
+            wav, digest = validate_reference_file(path)
+        except ValueError as exc:
+            raise ManifestError("invalid Chatterbox reference WAV") from exc
+        if digest != descriptor["reference_sha256"] or wav.sample_rate != descriptor["sample_rate"] or wav.file_bytes != descriptor["file_bytes"]:
+            raise ManifestError("Chatterbox reference identity mismatch")
+        return ReferenceArtifact(path, descriptor, wav)
+
+    def chatterbox_reference_status(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
+        """Return safe public metadata without exposing the controlled path."""
+
+        descriptor_path = self.chatterbox_reference_descriptor_path(conversion_id)
+        if not descriptor_path.exists() and not descriptor_path.is_symlink():
+            if self.chatterbox_reference_path(conversion_id).exists() or self.chatterbox_reference_path(conversion_id).is_symlink():
+                raise ManifestError("invalid Chatterbox reference descriptor")
+            return public_reference_status(None)
+        return public_reference_status(self.load_chatterbox_reference(conversion_id).descriptor)
+
+    def _invalidate_chatterbox_generation(self, conversion_id: str | uuid.UUID) -> None:
+        job = self.read_job(conversion_id)
+        if job.get("schema_version") != GENERATION_SCHEMA_VERSION or job.get("tts", {}).get("engine") != "chatterbox" or job.get("tts", {}).get("voice") != "reference-wav":
+            return
+        chunks = self.conversion_path(conversion_id) / "chunks"
+        if chunks.exists() or chunks.is_symlink():
+            info = chunks.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+                raise UnsafePathError("chunks directory is unsafe")
+            for entry in list(chunks.iterdir()):
+                child_info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(child_info.st_mode) or _is_reparse(child_info) or not stat.S_ISREG(child_info.st_mode):
+                    raise UnsafePathError("chunk entry is unsafe")
+                entry.unlink()
+        self.update_generation(
+            conversion_id,
+            status="cancelled", stage="reference_changed", worker=None,
+            completed_chunks=[], progress={"completed": 0, "current": 0, "total": job["total_chunks"]},
+            output=None, error="Chatterbox reference changed", last_safe_error="Chatterbox reference changed",
+        )
+
+    def store_chatterbox_reference(
+        self,
+        conversion_id: str | uuid.UUID,
+        source: str | Path,
+        *,
+        consent_confirmed: bool,
+        consent_evidence: str = "user-confirmed-local-reference",
+        consent_recorded_at: str | None = None,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Copy, validate, and atomically own one Chatterbox reference WAV."""
+
+        if consent_confirmed is not True:
+            raise WorkspaceError("explicit reference consent is required")
+        if not isinstance(consent_evidence, str) or not consent_evidence or len(consent_evidence) > 256 or any(ord(char) < 32 for char in consent_evidence):
+            raise WorkspaceError("reference consent evidence is invalid")
+        source_path = Path(source)
+        descriptor_path = self.chatterbox_reference_descriptor_path(conversion_id)
+        reference_path = self.chatterbox_reference_path(conversion_id)
+        exists = descriptor_path.exists() or reference_path.exists() or descriptor_path.is_symlink() or reference_path.is_symlink()
+        if exists and not replace:
+            raise WorkspaceError("Chatterbox reference already exists")
+        for target in (descriptor_path, reference_path):
+            if target.exists() or target.is_symlink():
+                try:
+                    _validate_regular_manifest_file(target, "Chatterbox reference artifact")
+                except ManifestError as exc:
+                    raise UnsafePathError("Chatterbox reference artifact is unsafe") from exc
+        directory = reference_path.parent
+        fd, temporary_name = tempfile.mkstemp(prefix=".chatterbox-reference.", suffix=".tmp", dir=directory)
+        temporary = Path(temporary_name)
+        os.close(fd)
+        try:
+            try:
+                copy_reference_file(source_path, temporary, chunk_size=COPY_CHUNK_SIZE)
+            except ValueError as exc:
+                raise WorkspaceError("reference WAV is invalid or unsafe") from exc
+            try:
+                wav, digest = validate_reference_file(temporary)
+            except ValueError as exc:
+                raise WorkspaceError("reference WAV is invalid or unsafe") from exc
+            now = consent_recorded_at or _timestamp()
+            descriptor = build_reference_descriptor(
+                wav=wav, reference_sha256=digest, engine="chatterbox", model=CHATTERBOX_NANO_MODEL,
+                model_revision=CHATTERBOX_SOURCE_COMMIT, model_checksum="unrecorded", voice="reference-wav",
+                voice_version=CHATTERBOX_SOURCE_COMMIT, speed=1.0, chunk_cap=300,
+                consent_confirmed=True, consent_evidence=consent_evidence, consent_recorded_at=now, created_at=now, updated_at=now,
+            )
+            _replace_with_retries(temporary, reference_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        atomic_write_json(descriptor_path, descriptor)
+        if replace:
+            self._invalidate_chatterbox_generation(conversion_id)
+        return public_reference_status(descriptor)
+
+    def replace_chatterbox_reference(self, conversion_id: str | uuid.UUID, source: str | Path, *, consent_confirmed: bool, consent_evidence: str = "user-confirmed-local-reference", consent_recorded_at: str | None = None) -> dict[str, Any]:
+        return self.store_chatterbox_reference(conversion_id, source, consent_confirmed=consent_confirmed, consent_evidence=consent_evidence, consent_recorded_at=consent_recorded_at, replace=True)
+
+    def delete_chatterbox_reference(self, conversion_id: str | uuid.UUID) -> bool:
+        descriptor_path = self.chatterbox_reference_descriptor_path(conversion_id)
+        reference_path = self.chatterbox_reference_path(conversion_id)
+        if not descriptor_path.exists() and not reference_path.exists() and not descriptor_path.is_symlink() and not reference_path.is_symlink():
+            return False
+        unsafe = False
+        removed = False
+        for target in (descriptor_path, reference_path):
+            if target.exists() or target.is_symlink():
+                try:
+                    _validate_regular_manifest_file(target, "Chatterbox reference artifact")
+                except ManifestError as exc:
+                    unsafe = True
+                    continue
+                target.unlink()
+                removed = True
+        if removed:
+            self._invalidate_chatterbox_generation(conversion_id)
+        if unsafe:
+            raise UnsafePathError("Chatterbox reference artifact is unsafe")
+        return removed
+
     def cancel_marker_path(self, conversion_id: str | uuid.UUID) -> Path:
         return self.conversion_path(conversion_id) / "cancel.request"
 
@@ -852,6 +1003,25 @@ class Workspace:
 
         if type(total_chunks) is not int or total_chunks < 0:
             raise ManifestError("total_chunks must be non-negative")
+        if isinstance(tts, dict) and tts.get("engine") == "chatterbox":
+            if tts.get("voice") == CHATTERBOX_BUILTIN_VOICE:
+                settings = tts.get("settings") if isinstance(tts.get("settings"), dict) else {}
+                if (tts.get("model") != CHATTERBOX_NANO_MODEL or tts.get("model_revision") != CHATTERBOX_SOURCE_COMMIT or tts.get("model_checksum") != "unrecorded" or tts.get("voice_version") != "bundled" or tts.get("voice_checksum") != "unrecorded" or tts.get("sample_rate") != CHATTERBOX_SAMPLE_RATE or tts.get("speed") != 1.0 or tts.get("chunk_cap") != 300 or "reference_descriptor_sha256" in settings):
+                    raise ManifestError("Chatterbox built-in voice identity is invalid")
+            else:
+                try:
+                    reference = self.load_chatterbox_reference(conversion_id)
+                except (ManifestError, UnsafePathError) as exc:
+                    raise ManifestError("Chatterbox generation requires a valid reference") from exc
+                if (tts.get("voice") != "reference-wav" or tts.get("model") != reference.descriptor["model"] or tts.get("model_revision") != reference.descriptor["model_revision"] or tts.get("model_checksum") != reference.descriptor["model_checksum"] or tts.get("voice_version") != reference.descriptor["voice_version"] or tts.get("voice_checksum") != reference.descriptor["voice_checksum"] or tts.get("sample_rate") != CHATTERBOX_SAMPLE_RATE or tts.get("speed") != 1.0 or tts.get("chunk_cap") != 300):
+                    raise ManifestError("Chatterbox reference identity does not match generation settings")
+                tts = dict(tts)
+                settings = dict(tts.get("settings") or {})
+                captured_descriptor = settings.get("reference_descriptor_sha256")
+                if captured_descriptor is not None and captured_descriptor != reference.descriptor["descriptor_sha256"]:
+                    raise ManifestError("Chatterbox reference descriptor does not match generation settings")
+                settings["reference_descriptor_sha256"] = reference.descriptor["descriptor_sha256"]
+                tts["settings"] = settings
         current = self.read_job(conversion_id)
         if current["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION:
             raise ManifestError("interactive generation requires configure_interactive_generation")

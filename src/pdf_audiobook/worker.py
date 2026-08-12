@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .audio import validate_wav, write_pcm_wav
 from .chapters import select_chapter_range
 from .security import pid_is_alive
-from .tts import EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks, plan_interactive_chunks
+from .tts import CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_CHUNK_CAP, CHATTERBOX_NANO_MODEL, CHATTERBOX_REFERENCE_VOICE, CHATTERBOX_SAMPLE_RATE, CHATTERBOX_SOURCE_COMMIT, EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks, plan_interactive_chunks
 from .voice_shaping import shape_pcm, shaping_fingerprint
 from .voice_settings import canonical_voice_settings
 from .voice_registry import get_generation_facts, registry_revision
@@ -231,9 +231,30 @@ class ConversionWorker:
         attempts_total = 0
         loaded = engine
         settings = SynthesisSettings(**{key: job["tts"].get("settings", {}).get(key, value) for key, value in {"speed": job["tts"]["speed"], "pitch_semitones": 0, "tone_preset": "neutral", "sample_rate": job["tts"]["sample_rate"], "chunk_cap": job["tts"].get("chunk_cap", 900), "chunk_mode": "legacy", "paragraph_pause_ms": 0, "sentence_pause_ms": 0}.items()})
+        reference_wav: Path | None = None
+        if job["tts"].get("engine") == "chatterbox":
+            if (settings.speed != 1.0 or settings.chunk_cap != CHATTERBOX_CHUNK_CAP or job["tts"].get("voice") not in {CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_REFERENCE_VOICE} or job["tts"].get("model") != CHATTERBOX_NANO_MODEL or job["tts"].get("model_revision") != CHATTERBOX_SOURCE_COMMIT or job["tts"].get("model_checksum") != "unrecorded" or job["tts"].get("sample_rate") != CHATTERBOX_SAMPLE_RATE):
+                raise ManifestError("Chatterbox generation settings are invalid")
+            if job["tts"].get("voice") == CHATTERBOX_BUILTIN_VOICE and (job["tts"].get("voice_version") != "bundled" or job["tts"].get("voice_checksum") != "unrecorded" or "reference_descriptor_sha256" in (job["tts"].get("settings") or {})):
+                raise ManifestError("Chatterbox built-in voice identity is invalid")
+            if job["tts"].get("voice") == "reference-wav":
+                try:
+                    reference = self.workspace.load_chatterbox_reference(self.conversion_id)
+                except (ManifestError, UnsafePathError) as exc:
+                    raise ManifestError("Chatterbox reference is missing or invalid") from exc
+                tts = job["tts"]
+                descriptor = reference.descriptor
+                if any(tts.get(field) != descriptor.get(expected) for field, expected in (("model", "model"), ("model_revision", "model_revision"), ("model_checksum", "model_checksum"), ("voice_checksum", "voice_checksum"), ("voice_version", "voice_version"))):
+                    raise ManifestError("Chatterbox reference identity does not match generation")
+                if (tts.get("settings") or {}).get("reference_descriptor_sha256") != descriptor["descriptor_sha256"]:
+                    raise ManifestError("Chatterbox reference descriptor does not match generation")
+                reference_wav = reference.path
         try:
             if loaded is None:
-                loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"])
+                if job["tts"].get("engine") == "chatterbox" and job["tts"].get("voice") == "reference-wav":
+                    loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"], reference_wav=reference_wav)
+                else:
+                    loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"])
             completed = {record["global_index"]: record for record in job["completed_chunks"]}
             for chunk in chunks:
                 if self.workspace.cancellation_requested(self.conversion_id):

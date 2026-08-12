@@ -3,7 +3,8 @@ param(
     [switch]$InstallTools,
     [switch]$AllVoices,
     [string[]]$Voice,
-    [switch]$WithBookNLP
+    [switch]$WithBookNLP,
+    [switch]$WithChatterbox
 )
 
 Set-StrictMode -Version Latest
@@ -69,6 +70,10 @@ try {
     )
     if ($WithBookNLP) {
         $expectedFiles += "analyzer_envs\booknlp\pyproject.toml"
+    }
+    if ($WithChatterbox) {
+        $expectedFiles += "engine_envs\chatterbox\pyproject.toml"
+        $expectedFiles += "scripts\setup_chatterbox.py"
     }
     foreach ($relativePath in $expectedFiles) {
         if (-not (Test-Path (Join-Path $root $relativePath) -PathType Leaf)) {
@@ -157,6 +162,10 @@ try {
     Invoke-CheckedCommand $uv @("python", "install", "3.11")
     Invoke-CheckedCommand $uv @("sync", "--group", "test")
     Invoke-CheckedCommand $uv @("sync", "--project", "benchmark/environments/kokoro", "--python", "3.11")
+    if ($WithChatterbox) {
+        Write-Host "Installing optional Chatterbox Nano environment and caching its model (large download)..."
+        Invoke-CheckedCommand $uv @("sync", "--project", "engine_envs/chatterbox", "--python", "3.11")
+    }
     if ($WithBookNLP) {
         Write-Host "Installing optional Interactive Voices analyzer (BookNLP)..."
         Invoke-CheckedCommand $uv @("sync", "--project", "analyzer_envs/booknlp", "--python", "3.11")
@@ -169,6 +178,12 @@ try {
     }
     if (-not (Test-Path $kokoroPython -PathType Leaf)) {
         throw "Kokoro environment was not created: $kokoroPython"
+    }
+    if ($WithChatterbox) {
+        $chatterboxPython = Join-Path $root "engine_envs\chatterbox\.venv\Scripts\python.exe"
+        if (-not (Test-Path $chatterboxPython -PathType Leaf)) { throw "Chatterbox environment was not created: $chatterboxPython" }
+        Invoke-CheckedCommand $chatterboxPython @('-c', 'import sys, importlib.metadata as metadata; import chatterbox.tts_turbo; print("Chatterbox Python " + sys.version.split()[0] + ": " + metadata.version("chatterbox-tts") + ", package ready")')
+        Invoke-CheckedCommand $chatterboxPython @( (Join-Path $root "scripts\setup_chatterbox.py") )
     }
 
     Invoke-CheckedCommand $rootPython @(
@@ -216,6 +231,9 @@ try {
     }
     if (-not $AllVoices) {
         Write-Host "Additional voice assets remain optional; re-run with -AllVoices or -Voice <id>."
+    }
+    if (-not $WithChatterbox) {
+        Write-Host "Chatterbox Nano is optional; re-run with -WithChatterbox to create its isolated environment and cache the model."
     }
 } catch {
     Write-Error ("Setup failed: {0}" -f $_.Exception.Message)

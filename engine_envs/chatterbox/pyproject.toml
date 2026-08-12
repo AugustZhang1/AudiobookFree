@@ -1,0 +1,8 @@
+[project]
+name = "pdf-audiobook-chatterbox"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "chatterbox-tts @ git+https://github.com/resemble-ai/chatterbox.git@5de7a54aa4e5e2baadb0182dde554908b48b85c2",
+    "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ce86c49d029f42272c1902eccb675556b9ed2330",
+]

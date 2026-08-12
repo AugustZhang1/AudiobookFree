@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import shutil
 import uuid
+import wave
 
 import pytest
 
@@ -13,6 +14,7 @@ from pdf_audiobook.chapters import select_chapter_range
 from pdf_audiobook.worker import ConversionWorker
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.workspace import ManifestError, Workspace, atomic_write_json
+from pdf_audiobook.engine_catalog import CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT
 
 
 def _prepared() -> tuple[Path, Workspace, str, EngineMetadata]:
@@ -33,6 +35,85 @@ def _small_chunks(workspace: Workspace, conversion_id: str, metadata: EngineMeta
     settings = {**metadata.settings, "chunk_cap": 16}; changed = {**metadata.as_dict(), "settings": settings, "chunk_cap": 16, "speed": 1.0}
     total = len(plan_chunks(text, plan["chapters"], changed, cap=16)); workspace.configure_generation(conversion_id, tts=changed, total_chunks=total)
     return total
+
+
+def _prepared_chatterbox() -> tuple[Path, Workspace, str, dict, Path]:
+    root = Path("tests") / f".pytest-chatterbox-worker-{uuid.uuid4().hex}"; root.mkdir()
+    source = root / "book.pdf"; source.write_bytes(b"%PDF-1")
+    workspace = Workspace(root / "data"); manifest = workspace.create_conversion(source)
+    text = "First sentence. Second sentence."
+    workspace.persist_analysis(manifest["conversion_id"], {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []})
+    plan = {"schema_version": 1, "mode": "whole", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "Book", "start_offset": 0, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": len(text.split())}], "warnings": []}
+    workspace.persist_chapter_plan(manifest["conversion_id"], plan)
+    reference = root / "reference.wav"
+    with wave.open(str(reference), "wb") as handle:
+        handle.setnchannels(1); handle.setsampwidth(2); handle.setframerate(16000); handle.writeframes(b"\x00\x00" * (16000 * 6))
+    status = workspace.store_chatterbox_reference(manifest["conversion_id"], reference, consent_confirmed=True)
+    descriptor = workspace.load_chatterbox_reference(manifest["conversion_id"]).descriptor
+    settings = SynthesisSettings(sample_rate=24000, chunk_cap=300, chunk_mode="legacy")
+    metadata = EngineMetadata("chatterbox", "0.1.7", CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, "unrecorded", "reference-wav", CHATTERBOX_SOURCE_COMMIT, descriptor["voice_checksum"], 24000, settings.as_dict())
+    total = len(plan_chunks(text, plan["chapters"], metadata, cap=300))
+    tts = {**metadata.as_dict(), "speed": 1.0, "chunk_cap": 300}
+    workspace.configure_generation(manifest["conversion_id"], tts=tts, total_chunks=total)
+    return root, workspace, manifest["conversion_id"], tts, reference
+
+
+def test_v4_chatterbox_worker_binds_controlled_reference_and_input_hash() -> None:
+    root, workspace, conversion_id, tts, reference = _prepared_chatterbox()
+    try:
+        calls: list[dict] = []
+        class RecordingVoice:
+            def synthesize(self, _text: str) -> bytes:
+                return b"\x00\x00" * 1600
+            def close_voice(self) -> None:
+                pass
+        def factory(voice: str, settings: SynthesisSettings, *, engine: str, **kwargs: object) -> RecordingVoice:
+            calls.append({"voice": voice, "settings": settings, "engine": engine, **kwargs})
+            return RecordingVoice()
+        result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and len(calls) == 1
+        assert calls[0]["engine"] == "chatterbox" and calls[0]["reference_wav"] == workspace.chatterbox_reference_path(conversion_id)
+        job = workspace.read_job(conversion_id)
+        planned = ConversionWorker(workspace, conversion_id, engine_factory=factory)._planned_chunks(job)
+        assert all(record["input_hash"] == chunk.input_hash for record, chunk in zip(job["completed_chunks"], planned))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v4_chatterbox_worker_rejects_reference_mutation_before_factory() -> None:
+    root, workspace, conversion_id, _tts, _reference = _prepared_chatterbox()
+    try:
+        workspace.chatterbox_reference_path(conversion_id).write_bytes(b"mutated")
+        calls: list[object] = []
+        with pytest.raises(ManifestError, match="reference"):
+            ConversionWorker(workspace, conversion_id, engine_factory=lambda *args, **kwargs: calls.append((args, kwargs))).run(full_pipeline=False)
+        assert calls == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v4_chatterbox_builtin_worker_needs_no_reference_or_prompt() -> None:
+    root = Path("tests") / f".pytest-chatterbox-worker-builtin-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        source = root / "book.pdf"; source.write_bytes(b"%PDF-1")
+        workspace = Workspace(root / "data"); manifest = workspace.create_conversion(source); conversion_id = manifest["conversion_id"]
+        text = "First sentence. Second sentence."
+        workspace.persist_analysis(conversion_id, {"source_pdf_sha256": manifest["source_pdf_sha256"], "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []})
+        plan = {"schema_version": 1, "mode": "whole", "requested_count": None, "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(), "chapters": [{"index": 1, "title": "Book", "start_offset": 0, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": len(text.split())}], "warnings": []}
+        workspace.persist_chapter_plan(conversion_id, plan)
+        settings = SynthesisSettings(sample_rate=24000, chunk_cap=300, chunk_mode="legacy")
+        metadata = EngineMetadata("chatterbox", "0.1.7", CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, "unrecorded", "builtin", "bundled", "unrecorded", 24000, settings.as_dict())
+        tts = {**metadata.as_dict(), "speed": 1.0, "chunk_cap": 300}
+        workspace.configure_generation(conversion_id, tts=tts, total_chunks=1)
+        calls = []
+        class Voice:
+            def synthesize(self, _text): return b"\0\0" * 1600
+            def close_voice(self): pass
+        def factory(voice, settings, *, engine, **kwargs): calls.append((voice, engine, kwargs)); return Voice()
+        result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and calls == [("builtin", "chatterbox", {})]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 class _CountingEngine:
