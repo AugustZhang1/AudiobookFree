@@ -845,6 +845,30 @@ def test_interactive_voice_registry_auth_and_preview_projection() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_voice_analysis_range_validation_projection_and_full_mode_compatibility() -> None:
+    root = Path("tests") / f".pytest-phase6-analysis-range-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        analyzer = DeterministicFakeAnalyzer()
+        app, client, headers, _ = _app(root, 19897, voice_analyzer=analyzer)
+        _prepare_speaker_review(root)
+        partial = client.post("/api/voice-analysis", json={"mode": "interactive", "chapter_start": 2}, headers=headers)
+        assert partial.status_code == 422
+        boolean = client.post("/api/voice-analysis", json={"mode": "interactive", "chapter_start": True, "chapter_end": 2}, headers=headers)
+        assert boolean.status_code == 422
+        out_of_bounds = client.post("/api/voice-analysis", json={"mode": "interactive", "chapter_start": 1, "chapter_end": 3}, headers=headers)
+        assert out_of_bounds.status_code == 422
+        selected = client.post("/api/voice-analysis", json={"mode": "interactive", "chapter_start": 2, "chapter_end": 2}, headers=headers)
+        assert selected.status_code == 200
+        status = _wait_voice_terminal(app, client, headers)
+        assert status["chapter_start"] == 2 and status["chapter_end"] == 2
+        full = client.post("/api/voice-analysis", json={"mode": "interactive"}, headers=headers)
+        assert full.status_code == 200
+        status = _wait_voice_terminal(app, client, headers)
+        assert status["chapter_start"] == 1 and status["chapter_end"] == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_interactive_voice_plan_pagination_mutations_and_revision_conflicts() -> None:
     root = Path("tests") / f".pytest-phase6-plan-api-{uuid.uuid4().hex}"; root.mkdir()
     try:
@@ -950,6 +974,23 @@ def test_interactive_generation_preserves_requested_chapter_range() -> None:
         assert settings["chapter_start"] == 2 and settings["chapter_end"] == 2
         summary = client.get("/api/status", headers=headers).json()["generation_summary"]
         assert summary["total_chapters"] == 1 and summary["current_chapter"] == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_interactive_generation_is_bounded_by_reviewed_speaker_analysis_range() -> None:
+    root = Path("tests") / f".pytest-phase6-reviewed-range-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        launcher = lambda *_args: type("P", (), {"poll": lambda self: None})()
+        _, client, headers, _ = _app(root, 19896, worker_launcher=launcher)
+        workspace, conversion_id, approved = _prepare_approved_voice_plan(root, client, headers)
+        artifact = workspace.load_speaker_analysis(conversion_id)
+        reviewed = with_canonical_artifact_hash({**artifact, "chapter_start": 2, "chapter_end": 2, "spans": [span for span in artifact["spans"] if span["chapter_index"] == 2]})
+        workspace.persist_speaker_analysis(conversion_id, reviewed)
+        blocked = client.post("/api/generation/start", json={"mode": "interactive_voices", "voice_plan_sha256": approved["canonical_artifact_sha256"], "voice_plan_revision": approved["revision"], "chapter_start": 1, "chapter_end": 1}, headers=headers)
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "ANALYSIS_RANGE_CONFLICT"
+        assert blocked.json()["error"]["analyzed_chapter_start"] == 2
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

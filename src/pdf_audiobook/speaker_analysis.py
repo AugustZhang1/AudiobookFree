@@ -23,7 +23,9 @@ _TOP_FIELDS = {
     "schema_version", "artifact", "revision", "source_pdf_sha256", "cleaned_text_sha256",
     "chapter_plan_sha256", "chapter_plan_schema_version", "analyzer", "characters", "spans",
     "warnings", "canonical_artifact_sha256",
+    "chapter_start", "chapter_end",
 }
+_RANGE_FIELDS = {"chapter_start", "chapter_end"}
 
 
 class SpeakerAnalysisError(ValueError):
@@ -143,7 +145,7 @@ def validate_speaker_analysis(
 ) -> dict[str, Any]:
     """Validate and return a machine-only speaker-analysis artifact unchanged."""
 
-    if not isinstance(artifact, dict) or set(artifact) != _TOP_FIELDS:
+    if not isinstance(artifact, dict) or set(artifact) not in (_TOP_FIELDS, _TOP_FIELDS - _RANGE_FIELDS):
         raise _fail("INVALID_ANALYSIS", "speaker analysis schema mismatch")
     try:
         if len(canonical_json_bytes(artifact)) > MAX_ARTIFACT_BYTES:
@@ -172,6 +174,17 @@ def validate_speaker_analysis(
         raise _fail("CHAPTER_PLAN_HASH_MISMATCH", "current chapter plan hash does not match expected binding")
     if type(artifact["chapter_plan_schema_version"]) is not int or artifact["chapter_plan_schema_version"] != 1:
         raise _fail("CHAPTER_PLAN_SCHEMA_MISMATCH", "chapter plan schema version must be 1")
+    # Missing range fields identify legacy full-plan artifacts.  Accepting a
+    # partial pair would make the persisted scope ambiguous, so reject it.
+    if _RANGE_FIELDS.issubset(artifact):
+        chapter_start, chapter_end = artifact["chapter_start"], artifact["chapter_end"]
+        chapters = chapter_plan.get("chapters") if isinstance(chapter_plan, dict) else None
+        if type(chapter_start) is not int or type(chapter_end) is not int or chapter_start < 1 or chapter_end < chapter_start:
+            raise _fail("INVALID_CHAPTER_RANGE", "analyzed chapter range is invalid")
+        if not isinstance(chapters, list) or chapter_end > len(chapters):
+            raise _fail("INVALID_CHAPTER_RANGE", "analyzed chapter range exceeds the chapter plan")
+    elif set(artifact) & _RANGE_FIELDS:
+        raise _fail("INVALID_ANALYSIS", "speaker analysis range schema mismatch")
     try:
         text_hash = hashlib.sha256(cleaned_text.encode("utf-8")).hexdigest() if isinstance(cleaned_text, str) else None
     except UnicodeError as exc:
@@ -223,11 +236,15 @@ def validate_speaker_analysis(
     if len(spans) > MAX_SPANS:
         raise _fail("ANALYSIS_TOO_LARGE", "spans exceed the size limit")
     span_values: list[speakers.SpeakerSpan] = []
+    analyzed_start = artifact.get("chapter_start", 1)
+    analyzed_end = artifact.get("chapter_end", len(chapter_plan.get("chapters", [])) if isinstance(chapter_plan, dict) else 0)
     for raw in spans:
         value = _object(raw, {"span_id", "chapter_index", "source_start", "source_end", "type", "speaker_id", "confidence", "provenance"}, "span")
         span_id = _stable_id(value["span_id"], "span_id")
         if type(value["chapter_index"]) is not int or value["chapter_index"] < 1:
             raise _fail("INVALID_CHAPTER_INDEX", "chapter_index must be one-based integer")
+        if value["chapter_index"] < analyzed_start or value["chapter_index"] > analyzed_end:
+            raise _fail("CHAPTER_OUTSIDE_ANALYZED_RANGE", "span chapter is outside the analyzed range")
         for field in ("source_start", "source_end"):
             if type(value[field]) is not int:
                 raise _fail("INVALID_SPAN_RANGE", "span offsets must be integers")

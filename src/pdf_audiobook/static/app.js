@@ -23,6 +23,7 @@
   let recoveredState = null;
   let recoveredRoute = false;
   let structuralPlanLocked = false;
+  let analyzedChapterRange = null;
   const typeIsInteger = (value) => typeof value === "number" && Number.isInteger(value);
 
   const currentPlanSpec = () => ({
@@ -52,6 +53,7 @@
     else target.textContent = `${range.end - range.start + 1} chapters selected: ${chapterTitle(range.start)} through ${chapterTitle(range.end)} (inclusive).`;
     const ready = Boolean(chapterPlan && planMatchesSelection(chapterPlan) && range.valid && !planRequestInFlight);
     document.querySelector(".next").disabled = !ready;
+    if (interactiveMode) interactive("#start-voice-analysis").disabled = !chapterPlan || planRequestInFlight || !range.valid;
     return range;
   };
 
@@ -73,6 +75,7 @@
 
   const invalidatePlan = (message) => {
     chapterPlan = null;
+    analyzedChapterRange = null;
     document.querySelector(".next").disabled = true;
     document.querySelector("#save-labels").disabled = true;
     if (message) document.querySelector("#plan-status").textContent = message;
@@ -529,10 +532,20 @@
     const accepted = Boolean(interactive("#accept-narrator-fallback")?.checked);
     const unresolved = Number(voicePlan?.review?.unresolved_count || 0);
     const approved = voicePlan?.approval?.state === "approved";
-    const canApprove = Boolean(voicePlan && !approved && (!unresolved || accepted));
-    if (interactive("#approve-voice-plan")) interactive("#approve-voice-plan").disabled = !canApprove;
     const range = currentChapterRange();
-    const ready = Boolean(approved && range.valid && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
+    const analysisComplete = voiceAnalysis?.status === "completed";
+    const rangeAnalyzed = Boolean(analysisComplete && range.valid && analyzedChapterRange && range.start >= analyzedChapterRange.start && range.end <= analyzedChapterRange.end);
+    const canApprove = Boolean(voicePlan && !approved && rangeAnalyzed && (!unresolved || accepted));
+    if (interactive("#approve-voice-plan")) interactive("#approve-voice-plan").disabled = !canApprove;
+    const context = interactive("#interactive-generation-context");
+    if (context) {
+      context.textContent = rangeAnalyzed
+        ? "Interactive Voices plan: approval is required before generation."
+        : analyzedChapterRange
+          ? `Selected chapters ${range.start}–${range.end} are outside the analyzed range (${analyzedChapterRange.start}–${analyzedChapterRange.end}). Start Interactive Voice Analysis again for this range.`
+          : "Interactive Voices analysis is required for the selected chapter range before approval or generation.";
+    }
+    const ready = Boolean(approved && rangeAnalyzed && !generationRequestInFlight && !planRequestInFlight && !activeGenerationStates.has(recoveredState));
     document.querySelector("#start-generation").disabled = !ready;
     return ready;
   };
@@ -549,13 +562,17 @@
     interactive("#single-voice-controls").hidden = enabled;
     interactive("#interactive-generation-context").hidden = !enabled;
     if (enabled) {
-      interactive("#start-voice-analysis").disabled = !chapterPlan || planRequestInFlight;
+      interactive("#start-voice-analysis").disabled = !chapterPlan || planRequestInFlight || !currentChapterRange().valid;
       interactive("#interactive-entry-status").textContent = chapterPlan ? "Chapter plan ready. Start local voice analysis when you are ready to review the cast." : "Generate a chapter plan before starting voice analysis.";
     }
     updateModeReadiness();
   };
 
   const renderAnalysisProgress = (body) => {
+    const trackedRange = body && typeIsInteger(body.chapter_start) && typeIsInteger(body.chapter_end)
+      ? { start: body.chapter_start, end: body.chapter_end }
+      : null;
+    if (trackedRange) analyzedChapterRange = trackedRange;
     const progress = body.progress || {};
     const completed = Number(progress.completed || 0);
     const total = Number(progress.total || 0);
@@ -566,8 +583,10 @@
     interactive("#interactive-analysis-bar span").style.width = `${percent}%`;
     interactive("#interactive-analysis-progress").hidden = false;
     interactive("#cancel-voice-analysis").disabled = !body.cancelable;
-    const message = body.error?.message || (body.status === "completed" ? "Analysis complete. Preparing a reviewable voice plan." : body.status === "cancelled" ? "Voice analysis was cancelled. You can start it again when ready." : `Voice analysis ${body.status || "is running"}.`);
+    const rangeLabel = analyzedChapterRange ? ` Chapters ${analyzedChapterRange.start}–${analyzedChapterRange.end} are included.` : "";
+    const message = body.error?.message || (body.status === "completed" ? `Analysis complete. Preparing a reviewable voice plan.${rangeLabel}` : body.status === "cancelled" ? "Voice analysis was cancelled. You can start it again when ready." : `Voice analysis ${body.status || "is running"}.${rangeLabel}`);
     interactive("#interactive-analysis-status").textContent = message;
+    updateModeReadiness();
   };
 
   const stopVoiceAnalysisPolling = () => { if (voiceAnalysisPollTimer) { clearTimeout(voiceAnalysisPollTimer); voiceAnalysisPollTimer = null; } };
@@ -606,7 +625,7 @@
       const title = document.createElement("strong"); title.textContent = entry.display_label; header.append(title);
       const meta = document.createElement("small"); meta.textContent = `${entry.role || "character"} · ${entry.relationship || "third_person"}`; header.append(meta); article.append(header);
       const fields = document.createElement("div"); fields.className = "cast-fields";
-      const nameLabel = document.createElement("label"); nameLabel.textContent = "Name"; const name = document.createElement("input"); name.type = "text"; name.value = entry.display_label; name.maxLength = 512; name.setAttribute("aria-label", `${entry.display_label} display name`); nameLabel.append(name); fields.append(nameLabel);
+      const nameLabel = document.createElement("label"); nameLabel.textContent = "Name"; const name = document.createElement("input"); name.type = "text"; name.value = entry.display_label; name.maxLength = 512; name.setAttribute("aria-label", `${entry.display_label} display name`); nameLabel.append(name);
       const voiceField = document.createElement("div"); voiceField.className = "cast-voice-field";
       const voiceLabel = document.createElement("label"); voiceLabel.textContent = "Voice"; const voice = document.createElement("select"); voice.setAttribute("aria-label", `${entry.display_label} voice`); voiceOptions(entry.voice_id).forEach((option) => voice.append(option)); voiceLabel.append(voice); voiceField.append(voiceLabel);
       const previewControls = document.createElement("span"); previewControls.className = "cast-preview";
@@ -614,8 +633,9 @@
       const previewStatus = document.createElement("span"); previewStatus.className = "status interactive-preview-status"; previewStatus.setAttribute("role", "status"); previewStatus.setAttribute("aria-live", "polite"); previewStatus.textContent = "";
       preview.addEventListener("click", () => { if (preview.textContent === "Stop preview") stopPreview(previewStatus); else previewVoice(voice.value, preview, previewStatus); });
       voice.addEventListener("change", () => { if (activePreviewButton === preview) stopPreview(previewStatus); });
-      previewControls.append(preview, previewStatus); voiceField.append(previewControls); fields.append(voiceField);
-      const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed); fields.append(speedLabel);
+      previewControls.append(preview, previewStatus); voiceField.append(previewControls);
+      const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed);
+      fields.append(nameLabel, voiceField, speedLabel);
       article.append(fields);
       const relationshipActions = document.createElement("div"); relationshipActions.className = "cast-action-row cast-primary-actions";
       const relationshipLabel = document.createElement("label"); relationshipLabel.className = "cast-relationship-label"; relationshipLabel.textContent = "Relationship";
@@ -703,9 +723,11 @@
   };
 
   const startVoiceAnalysis = async () => {
+    const range = updateChapterRange();
     if (!chapterPlan || planRequestInFlight) { interactive("#interactive-entry-status").textContent = "Generate a chapter plan before starting voice analysis."; return; }
+    if (!range.valid) { interactive("#interactive-entry-status").textContent = "Choose a valid inclusive chapter range before starting voice analysis."; return; }
     const button = interactive("#start-voice-analysis"); button.disabled = true; interactive("#interactive-entry-status").textContent = "Loading available local voices...";
-    try { await loadVoices(); const response = await fetch("/api/voice-analysis", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ mode: "interactive" }) }); if (!response.ok) throw await interactiveError(response); voiceAnalysis = await response.json(); interactive("#interactive-editor").hidden = true; renderAnalysisProgress(voiceAnalysis); pollVoiceAnalysis(); } catch (error) { interactive("#interactive-entry-status").textContent = error.message || "Interactive voice analysis could not start."; button.disabled = false; }
+    try { await loadVoices(); const response = await fetch("/api/voice-analysis", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ mode: "interactive", chapter_start: range.start, chapter_end: range.end }) }); if (!response.ok) throw await interactiveError(response); voiceAnalysis = await response.json(); analyzedChapterRange = { start: range.start, end: range.end }; interactive("#interactive-editor").hidden = true; renderAnalysisProgress(voiceAnalysis); pollVoiceAnalysis(); } catch (error) { interactive("#interactive-entry-status").textContent = error.message || "Interactive voice analysis could not start."; button.disabled = false; }
   };
 
   const cancelVoiceAnalysis = async () => {
@@ -715,6 +737,10 @@
   };
 
   const approveVoicePlan = async () => {
+    const range = updateChapterRange();
+    const rangeAnalyzed = Boolean(voiceAnalysis?.status === "completed" && range.valid && analyzedChapterRange && range.start >= analyzedChapterRange.start && range.end <= analyzedChapterRange.end);
+    if (!range.valid) { interactive("#interactive-approval-status").textContent = "Choose a valid inclusive chapter range before approving the voice plan."; return; }
+    if (!rangeAnalyzed) { interactive("#interactive-approval-status").textContent = "The selected range was not analyzed. Start Interactive Voice Analysis again before approving."; return; }
     const accepted = Boolean(interactive("#accept-narrator-fallback").checked); const unresolved = Number(voicePlan?.review?.unresolved_count || 0); if (unresolved && !accepted) { interactive("#interactive-approval-status").textContent = "Review unresolved spans and explicitly accept Narrator as their fallback."; return; }
     const button = interactive("#approve-voice-plan"); button.disabled = true; interactive("#interactive-approval-status").textContent = "Approving voice plan...";
     try { const response = await fetch("/api/voice-plan/approve", { method: "POST", headers: { "Content-Type": "application/json", "Origin": location.origin }, body: JSON.stringify({ expected_revision: voicePlanRevision, accept_narrator_fallback: accepted }) }); if (!response.ok) throw await interactiveError(response); const body = await response.json(); voicePlanRevision = body.revision; await loadVoicePlan(); interactive("#interactive-approval-status").textContent = "Voice plan approved. Choose the chapter range and start generation."; updateInteractiveReadiness(); } catch (error) { interactive("#interactive-approval-status").textContent = error.message || "Voice plan approval failed."; updateInteractiveReadiness(); }
@@ -730,6 +756,8 @@
     if (body?.job?.mode !== "interactive_voices") return;
     setInteractiveMode(true);
     try {
+      const analysisResponse = await fetch("/api/voice-analysis/status");
+      if (analysisResponse.ok) { voiceAnalysis = await analysisResponse.json(); renderAnalysisProgress(voiceAnalysis); }
       await loadVoices();
       await loadVoicePlan();
       interactive("#interactive-editor").hidden = false;

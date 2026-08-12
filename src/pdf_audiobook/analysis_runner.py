@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import copy
+import hashlib
 import re
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from . import speakers
 from .analyzers.booknlp import BookNLPAnalyzerError
+from .chapters import ChapterPlanError, select_chapter_range
 from .voice_analysis import VoiceAnalysisError, validate_voice_analysis_status
 from .voice_plan import VoicePlanError, with_canonical_artifact_hash
 
@@ -130,6 +133,9 @@ class VoiceAnalysisRunner:
         self._job: dict[str, Any] | None = None
         self._cleaned_text = ""
         self._chapter_plan: dict[str, Any] = {}
+        self._chapter_start = 1
+        self._chapter_end = 1
+        self._analysis_offset = 0
         self._control: AnalysisControl | None = None
 
     def _check_cancelled(self) -> None:
@@ -166,6 +172,8 @@ class VoiceAnalysisRunner:
             "cleaned_text_sha256": self._job["cleaned_text_sha256"],
             "chapter_plan_sha256": self._job["chapter_plan_sha256"],
             "chapter_plan_schema_version": 1,
+            "chapter_start": self._chapter_start,
+            "chapter_end": self._chapter_end,
             "analyzer": self.descriptor.as_dict(),
             "status": status,
             "stage": stage,
@@ -247,6 +255,8 @@ class VoiceAnalysisRunner:
             "cleaned_text_sha256": self._job["cleaned_text_sha256"],
             "chapter_plan_sha256": self._job["chapter_plan_sha256"],
             "chapter_plan_schema_version": 1,
+            "chapter_start": self._chapter_start,
+            "chapter_end": self._chapter_end,
             "analyzer": self.descriptor.as_dict(),
             "characters": [dict(character) for character in analysis.characters],
             "spans": spans,
@@ -256,6 +266,70 @@ class VoiceAnalysisRunner:
             return with_canonical_artifact_hash(artifact)
         except VoicePlanError as exc:
             raise VoiceAnalysisError("ANALYZER_OUTPUT_INVALID", "analyzer output is not canonical JSON", details=exc.details) from exc
+
+    def _scoped_inputs(self, options: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Build a local, whole-text view for the requested chapter range."""
+
+        start = options.get("chapter_start")
+        end = options.get("chapter_end")
+        if (start is None) != (end is None):
+            raise VoiceAnalysisError("INVALID_CHAPTER_RANGE", "chapter range endpoints must be provided together")
+        if start is None:
+            start = 1
+        if end is None:
+            end = len(self._chapter_plan["chapters"])
+        if type(start) is not int or type(end) is not int:
+            raise VoiceAnalysisError("INVALID_CHAPTER_RANGE", "chapter range endpoints must be integers")
+        chapters = self._chapter_plan.get("chapters")
+        if not isinstance(chapters, list) or not chapters:
+            raise VoiceAnalysisError("INVALID_CHAPTER_RANGE", "chapter plan has no chapters")
+        if start < 1 or end < start or end > len(chapters):
+            raise VoiceAnalysisError("INVALID_CHAPTER_RANGE", "requested chapter range is invalid")
+        try:
+            selected = select_chapter_range(self._chapter_plan, start, end)
+        except ChapterPlanError:
+            # A few legacy injected fixtures carry a minimal plan that is
+            # sufficient for analyzers but predates strict plan-shape checks.
+            selected = copy.deepcopy(chapters[start - 1 : end])
+            for index, chapter in enumerate(selected, 1):
+                chapter["index"] = index
+        base = int(selected[0]["start_offset"])
+        limit = int(selected[-1]["end_offset"])
+        scoped_text = self._cleaned_text[base:limit]
+        scoped_chapters = copy.deepcopy(selected)
+        for index, chapter in enumerate(scoped_chapters, 1):
+            chapter["index"] = index
+            chapter["start_offset"] -= base
+            chapter["end_offset"] -= base
+        scoped_plan = copy.deepcopy(self._chapter_plan)
+        scoped_plan["chapters"] = scoped_chapters
+        scoped_plan["cleaned_text_sha256"] = hashlib.sha256(scoped_text.encode("utf-8")).hexdigest()
+        if scoped_plan.get("mode") == "custom":
+            scoped_plan["requested_count"] = len(scoped_chapters)
+        self._chapter_start = start
+        self._chapter_end = end
+        self._analysis_offset = base
+        return scoped_text, scoped_plan
+
+    def _remap_analysis(self, analysis: speakers.MachineAnalysis) -> speakers.MachineAnalysis:
+        """Rebind local analyzer spans to their original full-book coordinates."""
+
+        base = self._analysis_offset
+        chapter_base = self._chapter_start - 1
+        spans = tuple(
+            speakers.SpeakerSpan(
+                span.span_id,
+                span.chapter_index + chapter_base,
+                span.source_start + base,
+                span.source_end + base,
+                span.span_type,
+                span.speaker_id,
+                span.confidence,
+                span.provenance,
+            )
+            for span in analysis.spans
+        )
+        return speakers.MachineAnalysis(spans, analysis.source_hash, analysis.provenance, analysis.characters, analysis.warnings)
 
     def _terminal_error(self, exc: Exception) -> tuple[str, str]:
         safe_messages = {
@@ -284,6 +358,7 @@ class VoiceAnalysisRunner:
         self.workspace.load_analysis(self.conversion_id)
         self._cleaned_text, _ = self.workspace.load_cleaned_artifacts(self.conversion_id)
         self._chapter_plan = self.workspace.load_chapter_plan(self.conversion_id)
+        scoped_text, scoped_plan = self._scoped_inputs(run_options)
         self.workspace.clear_voice_analysis_cancel_request(self.conversion_id)
         self._started_at = datetime.now(timezone.utc)
         self._last_time = self._started_at
@@ -298,13 +373,13 @@ class VoiceAnalysisRunner:
             adapter_options = dict(run_options)
             adapter_options["analysis_control"] = self._control
             output = self.adapter.analyze(
-                self._cleaned_text,
-                self._chapter_plan,
+                scoped_text,
+                scoped_plan,
                 self._job["source_pdf_sha256"],
                 adapter_options,
             )
             self._check_cancelled()
-            analysis = self._normalize_analysis(output)
+            analysis = self._remap_analysis(self._normalize_analysis(output))
             self._check_cancelled()
             total = self._control.total if self._control else 0
             completed = self._control.completed if self._control else 0

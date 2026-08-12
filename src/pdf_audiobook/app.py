@@ -789,8 +789,10 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         local_live = local_process is not None and (not hasattr(local_process, "poll") or local_process.poll() is None)
         return recorded_live or local_live
 
-    def _voice_status_projection(conversion_id: str, status: dict[str, Any], *, cancel_requested: bool | None = None) -> dict[str, Any]:
+    def _voice_status_projection(conversion_id: str, status: dict[str, Any], *, cancel_requested: bool | None = None, chapter_count: int | None = None) -> dict[str, Any]:
         requested = status["cancel_requested"] if cancel_requested is None else cancel_requested
+        chapter_start = status.get("chapter_start", 1)
+        chapter_end = status.get("chapter_end", chapter_count)
         result: dict[str, Any] = {
             "conversion_id": conversion_id,
             "analysis_id": status["analysis_id"],
@@ -808,6 +810,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             "source_pdf_sha256": status["source_pdf_sha256"],
             "cleaned_text_sha256": status["cleaned_text_sha256"],
             "chapter_plan_sha256": status["chapter_plan_sha256"],
+            "chapter_start": chapter_start,
+            "chapter_end": chapter_end,
             "canonical_artifact_sha256": status["canonical_artifact_sha256"],
         }
         if status["error"] is not None:
@@ -841,6 +845,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         result: dict[str, Any] = {"available": False, "analysis": None, "plan": None}
         try:
             analysis_status = await asyncio.to_thread(workspace.load_voice_analysis_status, conversion_id)
+            chapter_plan = await asyncio.to_thread(workspace.load_chapter_plan, conversion_id)
             result["analysis"] = {
                 "status": analysis_status["status"],
                 "stage": analysis_status["stage"],
@@ -848,6 +853,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 "cancelable": analysis_status["status"] in {"queued", "running"},
                 "revision": analysis_status["revision"],
                 "sha256": analysis_status["canonical_artifact_sha256"],
+                "chapter_start": analysis_status.get("chapter_start", 1),
+                "chapter_end": analysis_status.get("chapter_end", len(chapter_plan["chapters"])),
             }
         except (WorkspaceError, OSError):
             return result
@@ -895,6 +902,12 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 plan = await asyncio.to_thread(workspace.load_voice_plan, conversion_id)
                 text, _ = await asyncio.to_thread(workspace.load_cleaned_artifacts, conversion_id)
                 chapter_plan = await asyncio.to_thread(workspace.load_chapter_plan, conversion_id)
+                try:
+                    scoped_analysis = await asyncio.to_thread(workspace.load_speaker_analysis, conversion_id)
+                except (WorkspaceError, OSError):
+                    # Existing approved plans may predate persisted speaker
+                    # artifacts; those plans represent the complete book.
+                    scoped_analysis = {}
                 if plan["canonical_artifact_sha256"] != body["voice_plan_sha256"] or plan["revision"] != body["voice_plan_revision"] or plan["approval"]["state"] != "approved":
                     return JSONResponse({"error": {"code": "PLAN_CONFLICT", "message": "approved voice plan identity is stale"}}, status_code=409)
                 if manifest.get("status") == "completed" and manifest.get("output") is not None:
@@ -909,6 +922,10 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 start = body["chapter_start"] if "chapter_start" in body else 1
                 end = body["chapter_end"] if "chapter_end" in body else len(chapter_plan["chapters"])
                 select_chapter_range(chapter_plan, start, end)
+                analyzed_start = scoped_analysis.get("chapter_start", 1)
+                analyzed_end = scoped_analysis.get("chapter_end", len(chapter_plan["chapters"]))
+                if start < analyzed_start or end > analyzed_end:
+                    return JSONResponse({"error": {"code": "ANALYSIS_RANGE_CONFLICT", "message": "requested chapters are outside the analyzed range", "analyzed_chapter_start": analyzed_start, "analyzed_chapter_end": analyzed_end}}, status_code=409)
                 narrator = next(item for item in plan["cast"] if item["cast_id"] == "narrator")
                 voice_id = require_enabled_voice_id(narrator["voice_id"])
                 facts = get_generation_facts(voice_id)
@@ -945,8 +962,11 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         if not _authenticated(request, state) or not _exact_origin(request, state.port):
             raise HTTPException(403, "authenticated exact local Origin required")
         body = await _json_body(request)
-        if body is None or set(body) != {"mode"} or body.get("mode") != "interactive":
+        if body is None or set(body) - {"mode", "chapter_start", "chapter_end"} or body.get("mode") != "interactive" or ("chapter_start" in body) != ("chapter_end" in body):
             return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "mode must be interactive"}}, status_code=422)
+        for key in ("chapter_start", "chapter_end"):
+            if key in body and type(body[key]) is not int:
+                return _chapter_error(ChapterPlanError("INVALID_CHAPTER_RANGE", "chapter range endpoints must be integers"))
         analyzer_binding = _voice_analyzer()
         if analyzer_binding is None:
             return JSONResponse({"error": {"code": "ANALYZER_UNAVAILABLE", "message": "voice analysis is unavailable"}}, status_code=503)
@@ -973,6 +993,15 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 return JSONResponse({"error": {"code": "INVALID_ACTIVE", "message": "an analyzed chapter plan is required"}}, status_code=409)
             if _voice_generation_live(manifest):
                 return JSONResponse({"error": {"code": "ACTIVE_WORKER", "message": "a generation worker is already active"}}, status_code=409)
+            try:
+                chapter_plan = await asyncio.to_thread(workspace.load_chapter_plan, conversion_id)
+                start = body.get("chapter_start")
+                end = body.get("chapter_end")
+                select_chapter_range(chapter_plan, start, end)
+                normalized_start = int(body.get("chapter_start") or 1)
+                normalized_end = int(body.get("chapter_end") or len(chapter_plan["chapters"]))
+            except ChapterPlanError as exc:
+                return _chapter_error(exc)
 
             previous: dict[str, Any] | None = None
             try:
@@ -991,6 +1020,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 "cleaned_text_sha256": manifest["cleaned_text_sha256"],
                 "chapter_plan_sha256": manifest["chapter_plan_sha256"],
                 "chapter_plan_schema_version": 1,
+                "chapter_start": normalized_start,
+                "chapter_end": normalized_end,
                 "analyzer": descriptor.as_dict(),
                 "status": "queued",
                 "stage": "queued",
@@ -1006,7 +1037,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 await asyncio.to_thread(workspace.persist_voice_analysis_status, conversion_id, queued_status)
             except (WorkspaceError, OSError):
                 return JSONResponse({"error": {"code": "ANALYSIS_START_FAILED", "message": "voice analysis could not start"}}, status_code=503)
-            runner = VoiceAnalysisRunner(workspace, conversion_id, analyzer, descriptor, analysis_id, revision)
+            runner = VoiceAnalysisRunner(workspace, conversion_id, analyzer, descriptor, analysis_id, revision, {"chapter_start": normalized_start, "chapter_end": normalized_end})
 
             def run_analysis() -> None:
                 try:
@@ -1043,6 +1074,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 "source_pdf_sha256": manifest.get("source_pdf_sha256"),
                 "cleaned_text_sha256": manifest.get("cleaned_text_sha256"),
                 "chapter_plan_sha256": manifest.get("chapter_plan_sha256"),
+                "chapter_start": normalized_start,
+                "chapter_end": normalized_end,
             }
         finally:
             if analysis_acquired:
@@ -1057,10 +1090,11 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         try:
             conversion_id, _ = await asyncio.to_thread(_voice_active_inputs, workspace)
             status = await asyncio.to_thread(workspace.load_voice_analysis_status, conversion_id)
+            chapter_plan = await asyncio.to_thread(workspace.load_chapter_plan, conversion_id)
             cancel_requested = await asyncio.to_thread(workspace.voice_analysis_cancellation_requested, conversion_id)
         except (WorkspaceError, OSError):
             return JSONResponse({"error": {"code": "NO_ANALYSIS", "message": "voice analysis status is unavailable"}}, status_code=404)
-        return _voice_status_projection(conversion_id, status, cancel_requested=cancel_requested or status["cancel_requested"])
+        return _voice_status_projection(conversion_id, status, cancel_requested=cancel_requested or status["cancel_requested"], chapter_count=len(chapter_plan["chapters"]))
 
     @app.get("/api/speaker-analysis")
     async def speaker_analysis_review(request: Request):
@@ -1158,6 +1192,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         try:
             conversion_id, _ = await asyncio.to_thread(_voice_active_inputs, workspace)
             status = await asyncio.to_thread(workspace.load_voice_analysis_status, conversion_id)
+            chapter_plan = await asyncio.to_thread(workspace.load_chapter_plan, conversion_id)
         except (WorkspaceError, OSError):
             return JSONResponse({"error": {"code": "NO_ANALYSIS", "message": "voice analysis status is unavailable"}}, status_code=409)
         if status["analysis_id"] != body["analysis_id"] or status["revision"] != body["revision"]:
@@ -1168,7 +1203,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             await asyncio.to_thread(workspace.request_voice_analysis_cancel, conversion_id)
         except (WorkspaceError, OSError):
             return JSONResponse({"error": {"code": "ANALYSIS_CONFLICT", "message": "voice analysis cancellation failed"}}, status_code=409)
-        return _voice_status_projection(conversion_id, status, cancel_requested=True)
+        return _voice_status_projection(conversion_id, status, cancel_requested=True, chapter_count=len(chapter_plan["chapters"]))
 
     async def _acquire_plan_locks() -> tuple[bool, JSONResponse | None]:
         generation_acquired = await asyncio.to_thread(state.generation_lock.acquire, False)

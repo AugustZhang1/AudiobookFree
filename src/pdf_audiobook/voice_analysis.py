@@ -23,7 +23,9 @@ _FIELDS = {
     "cleaned_text_sha256", "chapter_plan_sha256", "chapter_plan_schema_version",
     "analyzer", "status", "stage", "progress", "cancel_requested", "warnings",
     "error", "started_at", "updated_at", "finished_at", "canonical_artifact_sha256",
+    "chapter_start", "chapter_end",
 }
+_RANGE_FIELDS = {"chapter_start", "chapter_end"}
 _STATES = {
     "queued": "queued",
     "running": {"preparing", "analyzing", "validating", "persisting"},
@@ -114,7 +116,7 @@ def validate_voice_analysis_status(
 ) -> dict[str, Any]:
     """Validate and return a status artifact without repairing it."""
 
-    if not isinstance(artifact, dict) or set(artifact) != _FIELDS:
+    if not isinstance(artifact, dict) or set(artifact) not in (_FIELDS, _FIELDS - _RANGE_FIELDS):
         raise _fail("INVALID_STATUS", "voice-analysis status schema mismatch")
     try:
         if len(canonical_json_bytes(artifact)) > MAX_ARTIFACT_BYTES:
@@ -151,6 +153,18 @@ def validate_voice_analysis_status(
         raise _fail("CHAPTER_PLAN_HASH_MISMATCH", "current chapter plan hash does not match expected binding")
     if type(artifact["chapter_plan_schema_version"]) is not int or artifact["chapter_plan_schema_version"] != 1:
         raise _fail("CHAPTER_PLAN_SCHEMA_MISMATCH", "chapter plan schema version must be 1")
+    # Range fields were added after the initial artifact format.  Artifacts
+    # without either field are legacy full-plan analyses; a partial range is
+    # never accepted because it is ambiguous.
+    if _RANGE_FIELDS.issubset(artifact):
+        chapter_start, chapter_end = artifact["chapter_start"], artifact["chapter_end"]
+        if type(chapter_start) is not int or type(chapter_end) is not int or chapter_start < 1 or chapter_end < chapter_start:
+            raise _fail("INVALID_CHAPTER_RANGE", "analyzed chapter range is invalid")
+        chapters = chapter_plan.get("chapters") if isinstance(chapter_plan, dict) else None
+        if not isinstance(chapters, list) or chapter_end > len(chapters):
+            raise _fail("INVALID_CHAPTER_RANGE", "analyzed chapter range exceeds the chapter plan")
+    elif set(artifact) & _RANGE_FIELDS:
+        raise _fail("INVALID_STATUS", "voice-analysis status range schema mismatch")
     try:
         actual_cleaned_hash = hashlib.sha256(cleaned_text.encode("utf-8")).hexdigest() if isinstance(cleaned_text, str) else None
     except UnicodeError as exc:
