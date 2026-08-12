@@ -7,11 +7,39 @@ import pytest
 from pdf_audiobook.tts import EngineMetadata, SynthesisSettings, chunk_input_hash, plan_chunks, plan_interactive_chunks
 from pdf_audiobook import voice_registry
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
+from pdf_audiobook.voice_settings import VoiceSettingsError, canonical_voice_settings, voice_settings_digest
 
 
 def _metadata() -> EngineMetadata:
     settings = SynthesisSettings(chunk_mode="legacy")
     return EngineMetadata("fake", "builtin", "fake", "r1", "c1", "fake-neutral", "v1", "c2", 24000, settings.as_dict())
+
+
+def test_speed_only_legacy_settings_normalize_to_complete_neutral_defaults() -> None:
+    assert canonical_voice_settings({"speed": 1.2}) == {"speed": 1.2, "pitch_semitones": 0, "tone_preset": "neutral"}
+
+
+def test_empty_voice_settings_are_malformed() -> None:
+    with pytest.raises(VoiceSettingsError, match="schema mismatch"):
+        canonical_voice_settings({})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.49, 2.01])
+def test_speed_is_finite_and_bounded(value: float) -> None:
+    with pytest.raises(VoiceSettingsError):
+        canonical_voice_settings({"speed": value})
+
+
+def test_pitch_and_tone_are_canonical_and_digest_changes() -> None:
+    settings = canonical_voice_settings({"speed": 1, "pitch_semitones": -3, "tone_preset": "warm"})
+    assert settings == {"speed": 1.0, "pitch_semitones": -3, "tone_preset": "warm"}
+    assert voice_settings_digest(settings) != voice_settings_digest({"speed": 1})
+
+
+@pytest.mark.parametrize("value", [{"speed": 1, "pitch_semitones": 1.5, "tone_preset": "neutral"}, {"speed": 1, "pitch_semitones": 4, "tone_preset": "neutral"}, {"speed": 1, "pitch_semitones": 0, "tone_preset": "muddy"}])
+def test_invalid_pitch_and_tone_are_rejected(value: dict) -> None:
+    with pytest.raises(VoiceSettingsError):
+        canonical_voice_settings(value)
 
 
 def test_approved_voices_match_registry_and_all_are_accepted() -> None:
@@ -380,6 +408,17 @@ def test_interactive_audio_hash_changes_for_voice_settings_model_text_and_offset
         {"span_id": "s2", "source_start": 4, "source_end": len(text), "type": "narration", "speaker_id": "narrator"},
     ])
     assert plan_interactive_chunks(text, offset_plan, _interactive_facts(), "a" * 64, cap=100)[0].audio_input_hash != baseline
+
+
+def test_interactive_audio_hash_binds_shaping_but_not_plan_revision() -> None:
+    text = "One. Two."
+    span = {"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}
+    plan = _interactive_plan(text, [span])
+    baseline = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100, shaping_identity="shape-a")[0]
+    changed_shape = plan_interactive_chunks(text, plan, _interactive_facts(), "a" * 64, cap=100, shaping_identity="shape-b")[0]
+    revised = plan_interactive_chunks(text, _interactive_plan(text, [span], revision=2), _interactive_facts(), "a" * 64, cap=100, shaping_identity="shape-a")[0]
+    assert changed_shape.audio_input_hash != baseline.audio_input_hash
+    assert revised.audio_input_hash == baseline.audio_input_hash
 
 
 @pytest.mark.parametrize("mutation", ["draft", "missing-facts", "disabled-facts", "missing-cast"])

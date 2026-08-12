@@ -398,62 +398,91 @@
   };
 
   const previewStatusFor = (button, statusTarget) => statusTarget || button?.closest(".cast-entry")?.querySelector(".interactive-preview-status") || document.querySelector("#preview-status");
+  const previewLabel = (button, active = false) => active ? "Stop preview" : button.classList.contains("interactive-preview") ? "Preview draft" : "Preview";
+  const previewAudioError = "Preview unavailable. Check your volume, output device, and browser audio settings.";
   const stopPreview = (statusTarget) => {
     const stoppedStatus = activePreviewStatus || statusTarget;
     previewRequest += 1;
     if (activePreview) { activePreview.pause(); activePreview.currentTime = 0; activePreview = null; }
     activePreviewButton = null;
     activePreviewStatus = null;
-    document.querySelectorAll(".preview-voice").forEach((button) => { button.textContent = "Preview"; });
+    document.querySelectorAll(".preview-voice").forEach((button) => { button.classList.remove("preview-loading", "preview-buffering", "preview-playing"); button.removeAttribute("aria-busy"); button.textContent = previewLabel(button); });
     if (stoppedStatus) stoppedStatus.textContent = "Stopped.";
   };
-  const previewVoice = (voice, button, statusTarget) => {
+  const previewVoice = (voice, button, statusTarget, settings = null) => {
+    settings = settings || button?.__draftSettings || null;
+    const shapingRequested = settings && (Number(settings.speed ?? 1) !== 1 || Number(settings.pitch_semitones ?? 0) !== 0 || settings.tone_preset !== "neutral");
+    if (shapingRequested && !settingsAwarePreviewAvailable()) {
+      const unavailableStatus = previewStatusFor(button, statusTarget);
+      if (unavailableStatus) unavailableStatus.textContent = "Restart the local backend to preview voice shaping.";
+      return;
+    }
     stopPreview();
     const targetStatus = previewStatusFor(button, statusTarget);
     activePreviewButton = button;
     activePreviewStatus = targetStatus;
-    button.textContent = "Loading...";
-    if (targetStatus) targetStatus.textContent = `Loading ${voice} preview...`;
+    button.classList.add("preview-loading");
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "Cancel preview";
+    if (targetStatus) targetStatus.textContent = `Generating preview...${settings ? ` - ${previewSettingsSummary(settings)}` : ""}`;
     const requestId = previewRequest;
     let audio;
     try {
-      audio = new Audio(`/api/voice-preview/${encodeURIComponent(voice)}`);
+      if (settings) {
+        const query = new URLSearchParams({ speed: String(Number(settings.speed).toFixed(1)), pitch_semitones: String(Number(settings.pitch_semitones)), tone_preset: settings.tone_preset });
+        audio = new Audio(`/api/voice-preview/${encodeURIComponent(voice)}?${query.toString()}`);
+      } else {
+        audio = new Audio(`/api/voice-preview/${encodeURIComponent(voice)}`);
+      }
     } catch (error) {
       if (requestId !== previewRequest) return;
       stopPreview(targetStatus);
-      if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
+      if (targetStatus) targetStatus.textContent = previewAudioError;
       return;
     }
     if (requestId !== previewRequest) { audio.pause(); return; }
     activePreview = audio;
-    audio.addEventListener("error", () => {
+    const failPreview = () => {
       if (requestId !== previewRequest) return;
       stopPreview(targetStatus);
-      if (targetStatus) targetStatus.textContent = "Preview unavailable: the local preview file could not be loaded. Generation is still available.";
-    }, { once: true });
-    button.textContent = "Stop preview";
-    if (targetStatus) targetStatus.textContent = `${voice} preview playing.`;
+      if (targetStatus) targetStatus.textContent = previewAudioError;
+    };
+    audio.addEventListener("error", failPreview, { once: true });
+    const summary = previewSettingsSummary(settings || { speed: 1, pitch_semitones: 0, tone_preset: "neutral" });
+    const markBuffering = () => {
+      if (requestId !== previewRequest) return;
+      button.classList.add("preview-buffering");
+      button.setAttribute("aria-busy", "true");
+      if (targetStatus) targetStatus.textContent = `Buffering preview... - ${summary}`;
+    };
+    const markPlaying = () => {
+      if (requestId !== previewRequest) return;
+      button.classList.remove("preview-loading", "preview-buffering");
+      button.classList.add("preview-playing");
+      button.removeAttribute("aria-busy");
+      button.textContent = previewLabel(button, true);
+      if (targetStatus) targetStatus.textContent = `${voice} preview playing - ${summary}.`;
+    };
+    audio.addEventListener("waiting", markBuffering);
+    audio.addEventListener("stalled", markBuffering);
+    audio.addEventListener("playing", markPlaying);
     audio.addEventListener("ended", () => {
       if (requestId !== previewRequest) return;
       activePreview = null;
       activePreviewButton = null;
       activePreviewStatus = null;
-      button.textContent = "Preview";
-      if (targetStatus) targetStatus.textContent = "Finished.";
+      button.classList.remove("preview-loading", "preview-buffering", "preview-playing");
+      button.removeAttribute("aria-busy");
+      button.textContent = previewLabel(button);
+      if (targetStatus) targetStatus.textContent = `Finished - ${previewSettingsSummary(settings || { speed: 1, pitch_semitones: 0, tone_preset: "neutral" })}.`;
     }, { once: true });
     try {
       const playPromise = audio.play();
       if (playPromise && typeof playPromise.catch === "function") {
-        playPromise.catch((error) => {
-          if (requestId !== previewRequest) return;
-          stopPreview(targetStatus);
-          if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
-        });
+        playPromise.catch(failPreview);
       }
     } catch (error) {
-      if (requestId !== previewRequest) return;
-      stopPreview(targetStatus);
-      if (targetStatus) targetStatus.textContent = `Preview unavailable: ${error.message || "the local preview file could not be played"}. Generation is still available.`;
+      failPreview();
     }
   };
 
@@ -513,11 +542,21 @@
   let voiceAnalysisPollTimer = null;
   let spanOffset = 0;
   let spanTotal = 0;
+  const castDrafts = new Map();
+  const PREVIEW_SETTINGS_IMPLEMENTATION = "voice-preview-settings-v1";
+  let voiceShapingCapability = { preview_settings_available: false, preview_settings_implementation: null, pitch_available: false, tone_available: false };
 
   const interactive = (selector) => document.querySelector(selector);
   const interactiveError = async (response) => {
     const error = await readError(response);
     return new Error(`${error.code}: ${error.message}`);
+  };
+
+  const settingsAwarePreviewAvailable = () => voiceShapingCapability.preview_settings_available === true && voiceShapingCapability.preview_settings_implementation === PREVIEW_SETTINGS_IMPLEMENTATION;
+  const previewSettingsSummary = (settings) => {
+    const pitch = Number(settings?.pitch_semitones || 0);
+    const signedPitch = pitch > 0 ? `+${pitch}` : String(pitch);
+    return `Speed ${Number(settings?.speed || 1).toFixed(1)}x, pitch ${signedPitch} semitones, tone ${settings?.tone_preset || "neutral"}`;
   };
 
   const updateSingleVoiceReadiness = () => {
@@ -597,6 +636,7 @@
     if (!response.ok) throw await interactiveError(response);
     const body = await response.json();
     voiceCatalog = Array.isArray(body.voices) ? body.voices.filter((entry) => entry && entry.enabled !== false) : [];
+    voiceShapingCapability = body.voice_shaping && typeof body.voice_shaping === "object" ? body.voice_shaping : { preview_settings_available: false, preview_settings_implementation: null, pitch_available: false, tone_available: false };
     if (!voiceCatalog.length) throw new Error("VOICE_CATALOG_EMPTY: no local voices are available.");
     return voiceCatalog;
   };
@@ -620,27 +660,41 @@
   const renderCast = () => {
     const target = interactive("#interactive-cast"); target.replaceChildren();
     (voicePlan?.cast || []).forEach((entry) => {
+      const hasDraft = castDrafts.has(entry.cast_id);
+      const draft = hasDraft ? castDrafts.get(entry.cast_id) : {};
       const article = document.createElement("article"); article.className = "cast-entry";
       const header = document.createElement("div"); header.className = "cast-entry-header";
       const title = document.createElement("strong"); title.textContent = entry.display_label; header.append(title);
       const meta = document.createElement("small"); meta.textContent = `${entry.role || "character"} · ${entry.relationship || "third_person"}`; header.append(meta); article.append(header);
-      const fields = document.createElement("div"); fields.className = "cast-fields";
-      const nameLabel = document.createElement("label"); nameLabel.textContent = "Name"; const name = document.createElement("input"); name.type = "text"; name.value = entry.display_label; name.maxLength = 512; name.setAttribute("aria-label", `${entry.display_label} display name`); nameLabel.append(name);
+      const fields = document.createElement("div"); fields.className = "cast-fields cast-shaping-grid";
+      const nameLabel = document.createElement("label"); nameLabel.textContent = "Name"; const name = document.createElement("input"); name.type = "text"; name.value = draft.display_label || entry.display_label; name.maxLength = 512; name.setAttribute("aria-label", `${entry.display_label} display name`); nameLabel.append(name);
       const voiceField = document.createElement("div"); voiceField.className = "cast-voice-field";
-      const voiceLabel = document.createElement("label"); voiceLabel.textContent = "Voice"; const voice = document.createElement("select"); voice.setAttribute("aria-label", `${entry.display_label} voice`); voiceOptions(entry.voice_id).forEach((option) => voice.append(option)); voiceLabel.append(voice); voiceField.append(voiceLabel);
-      const previewControls = document.createElement("span"); previewControls.className = "cast-preview";
-      const preview = document.createElement("button"); preview.className = "preview-voice interactive-preview"; preview.type = "button"; preview.textContent = "Preview"; preview.setAttribute("aria-label", `Preview ${entry.display_label} voice`);
+      const voiceLabel = document.createElement("label"); voiceLabel.textContent = "Voice"; const voice = document.createElement("select"); voice.setAttribute("aria-label", `${entry.display_label} voice`); voiceOptions(draft.voice_id || entry.voice_id).forEach((option) => voice.append(option)); voiceLabel.append(voice); voiceField.append(voiceLabel);
+      const previewControls = document.createElement("span"); previewControls.className = "cast-preview cast-audition-row";
+      const preview = document.createElement("button"); preview.className = "preview-voice interactive-preview"; preview.type = "button"; preview.textContent = "Preview draft"; preview.setAttribute("aria-label", `Preview ${entry.display_label} voice`);
       const previewStatus = document.createElement("span"); previewStatus.className = "status interactive-preview-status"; previewStatus.setAttribute("role", "status"); previewStatus.setAttribute("aria-live", "polite"); previewStatus.textContent = "";
-      preview.addEventListener("click", () => { if (preview.textContent === "Stop preview") stopPreview(previewStatus); else previewVoice(voice.value, preview, previewStatus); });
+      preview.addEventListener("click", () => { if (activePreviewButton === preview) stopPreview(previewStatus); else { preview.__draftSettings = { speed: Number(speed.value), pitch_semitones: Number(pitch.value), tone_preset: toneValue() }; previewVoice(voice.value, preview, previewStatus); } });
       voice.addEventListener("change", () => { if (activePreviewButton === preview) stopPreview(previewStatus); });
-      previewControls.append(preview, previewStatus); voiceField.append(previewControls);
-      const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed);
-      fields.append(nameLabel, voiceField, speedLabel);
-      article.append(fields);
+      previewControls.append(preview, previewStatus);
+      const speedLabel = document.createElement("label"); speedLabel.textContent = "Speed"; const speed = document.createElement("input"); speed.type = "number"; speed.min = "0.5"; speed.max = "2"; speed.step = "0.1"; speed.value = Number(draft.speed || entry.voice_settings?.speed || 1).toFixed(1); speed.setAttribute("aria-label", `${entry.display_label} speed`); speedLabel.append(speed);
+      const previewSettingsAvailable = settingsAwarePreviewAvailable();
+      const pitchAvailable = previewSettingsAvailable && voiceShapingCapability.pitch_available === true;
+      const toneAvailable = previewSettingsAvailable && voiceShapingCapability.tone_available === true;
+      const pitchLabel = document.createElement("label"); pitchLabel.textContent = "Pitch"; const pitch = document.createElement("input"); pitch.type = "range"; pitch.min = "-3"; pitch.max = "3"; pitch.step = "1"; pitch.value = String(Number(draft.pitch_semitones ?? entry.voice_settings?.pitch_semitones ?? 0)); pitch.disabled = !pitchAvailable; pitch.setAttribute("aria-label", `${entry.display_label} pitch in semitones`); const pitchOutput = document.createElement("output"); pitchOutput.textContent = pitch.disabled ? "Unavailable" : `${pitch.value} semitones`; pitchOutput.setAttribute("aria-live", "polite"); pitch.addEventListener("input", () => { pitchOutput.textContent = `${pitch.value} semitones (${Number(pitch.value) < 0 ? "lower" : Number(pitch.value) > 0 ? "higher" : "neutral"})`; }); pitchLabel.append(pitch, pitchOutput); if (pitch.disabled) { const note = document.createElement("small"); note.textContent = !previewSettingsAvailable ? "Restart the local backend to preview voice shaping." : "Pitch unavailable: rubberband support is not installed."; pitchLabel.append(note); }
+      const toneField = document.createElement("fieldset"); toneField.className = "tone-control"; const toneLegend = document.createElement("legend"); toneLegend.textContent = "Tone"; toneField.append(toneLegend); const tone = document.createElement("div"); tone.className = "tone-segmented"; tone.setAttribute("role", "radiogroup"); tone.setAttribute("aria-label", `${entry.display_label} tone preset`); const toneInputs = []; ["neutral", "warm", "bright"].forEach((value) => { const label = document.createElement("label"); const radio = document.createElement("input"); radio.type = "radio"; radio.name = `tone-${entry.cast_id}`; radio.value = value; radio.checked = value === (draft.tone_preset || entry.voice_settings?.tone_preset || "neutral"); radio.disabled = value !== "neutral" && !toneAvailable; label.append(radio, document.createTextNode(value[0].toUpperCase() + value.slice(1))); tone.append(label); toneInputs.push(radio); }); if (!toneAvailable) { const note = document.createElement("small"); note.textContent = !previewSettingsAvailable ? "Restart the local backend to preview voice shaping." : "Warm and bright unavailable: shelf filters are not installed."; toneField.append(note); } toneField.append(tone);
+      fields.append(nameLabel, voiceField, speedLabel, pitchLabel, toneField);
+      article.append(fields, previewControls);
+      const unsaved = document.createElement("small"); unsaved.className = "cast-unsaved"; unsaved.textContent = hasDraft ? "Unsaved changes" : ""; unsaved.setAttribute("aria-live", "polite");
+      const toneValue = () => toneInputs.find((radio) => radio.checked)?.value || "neutral";
+      const markDraft = () => { if (activePreviewButton === preview) stopPreview(previewStatus); castDrafts.set(entry.cast_id, { display_label: name.value.trim(), voice_id: voice.value, speed: Number(speed.value), pitch_semitones: Number(pitch.value), tone_preset: toneValue(), relationship: relationship?.value || entry.relationship }); unsaved.textContent = "Unsaved changes"; previewStatus.textContent = "Draft ready. Press Preview draft to audition."; };
+      [name, voice, speed, pitch].forEach((control) => { control.addEventListener("input", markDraft); control.addEventListener("change", markDraft); });
+      toneInputs.forEach((radio) => radio.addEventListener("change", markDraft));
+      article.append(unsaved);
       const relationshipActions = document.createElement("div"); relationshipActions.className = "cast-action-row cast-primary-actions";
       const relationshipLabel = document.createElement("label"); relationshipLabel.className = "cast-relationship-label"; relationshipLabel.textContent = "Relationship";
-      const relationship = document.createElement("select"); relationship.setAttribute("aria-label", `${entry.display_label} relationship`); ["third_person", "same_as_narrator", "separate_from_narrator"].forEach((value) => { const option = document.createElement("option"); option.value = value; option.textContent = value.replaceAll("_", " "); option.selected = value === entry.relationship; relationship.append(option); }); relationshipLabel.append(relationship); relationshipActions.append(relationshipLabel);
-      const save = document.createElement("button"); save.className = "secondary cast-save"; save.type = "button"; save.textContent = "Save cast"; save.addEventListener("click", async () => { save.disabled = true; interactive("#interactive-plan-status").textContent = "Saving cast changes..."; try { await mutateVoicePlan("/api/voice-plan", { expected_revision: voicePlanRevision, cast_id: entry.cast_id, display_label: name.value.trim(), voice_id: voice.value, speed: Number(speed.value), relationship: relationship.value }); interactive("#interactive-plan-status").textContent = "Cast changes saved."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; } finally { save.disabled = false; } }); relationshipActions.append(save); article.append(relationshipActions);
+      const relationship = document.createElement("select"); relationship.setAttribute("aria-label", `${entry.display_label} relationship`); ["third_person", "same_as_narrator", "separate_from_narrator"].forEach((value) => { const option = document.createElement("option"); option.value = value; option.textContent = value.replaceAll("_", " "); option.selected = value === (draft.relationship || entry.relationship); relationship.append(option); }); relationshipLabel.append(relationship); relationship.addEventListener("change", markDraft); relationshipActions.append(relationshipLabel);
+      const reset = document.createElement("button"); reset.className = "secondary cast-reset"; reset.type = "button"; reset.textContent = "Reset shaping"; reset.addEventListener("click", () => { const current = castDrafts.get(entry.cast_id) || { display_label: name.value.trim(), voice_id: voice.value, relationship: relationship.value }; castDrafts.set(entry.cast_id, { ...current, speed: 1.0, pitch_semitones: 0, tone_preset: "neutral" }); renderCast(); }); relationshipActions.append(reset);
+      const save = document.createElement("button"); save.className = "secondary cast-save"; save.type = "button"; save.textContent = "Save cast"; save.addEventListener("click", async () => { save.disabled = true; interactive("#interactive-plan-status").textContent = "Saving cast changes..."; try { await mutateVoicePlan("/api/voice-plan", { expected_revision: voicePlanRevision, cast_id: entry.cast_id, display_label: name.value.trim(), voice_id: voice.value, voice_settings: { speed: Number(speed.value), pitch_semitones: Number(pitch.value), tone_preset: toneValue() }, relationship: relationship.value }); castDrafts.delete(entry.cast_id); renderCast(); interactive("#interactive-plan-status").textContent = "Cast changes saved; approval is required again."; } catch (error) { interactive("#interactive-plan-status").textContent = error.message; } finally { save.disabled = false; } }); relationshipActions.append(save); article.append(relationshipActions);
       if (entry.role === "character") {
         const characters = (voicePlan?.cast || []).filter((candidate) => candidate.role === "character" && candidate.cast_id !== entry.cast_id);
         const mergeLabel = document.createElement("label"); mergeLabel.textContent = "Merge into";
@@ -787,7 +841,7 @@
   document.querySelector("#regenerate-plan").addEventListener("click", async () => { const selection = currentPlanSpec(); await runPlanRequest(selection.mode, selection.mode === "custom" ? selection.count : undefined); });
   document.querySelector("#save-labels").addEventListener("click", () => saveLabels()); document.querySelector("#start-generation").addEventListener("click", startGeneration);
   document.querySelectorAll("input[name=voice]").forEach((control) => control.addEventListener("change", () => { document.querySelectorAll(".voice-card").forEach((card) => card.classList.toggle("selected", card.querySelector("input").checked)); }));
-  document.querySelectorAll(".preview-voice").forEach((button) => button.addEventListener("click", () => { if (button.textContent === "Stop preview") stopPreview(); else previewVoice(button.dataset.voice, button); }));
+  document.querySelectorAll(".preview-voice").forEach((button) => button.addEventListener("click", () => { if (activePreviewButton === button) stopPreview(); else previewVoice(button.dataset.voice, button); }));
   document.querySelector("#speed").addEventListener("input", (event) => { document.querySelector("#speed-value").textContent = `${Number(event.target.value).toFixed(1)}x`; });
   document.querySelector("#cancel-generation").addEventListener("click", () => cancelGeneration(document.querySelector("#cancel-generation"), document.querySelector("#progress-status")));
   document.querySelectorAll('input[name="voice-mode"]').forEach((control) => control.addEventListener("change", () => setInteractiveMode(control.value === "interactive_voices")));

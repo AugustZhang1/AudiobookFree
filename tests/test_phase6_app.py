@@ -11,11 +11,13 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+import pdf_audiobook.app as app_module
 from pdf_audiobook.app import create_app
 from pdf_audiobook.analysis_runner import DeterministicFakeAnalyzer
 from pdf_audiobook.audio import write_pcm_wav
 from pdf_audiobook.tts import FakeVoice, plan_interactive_chunks
 from pdf_audiobook.voice_plan import build_voice_plan, with_canonical_artifact_hash
+from pdf_audiobook.voice_shaping import ShapingCapability
 from pdf_audiobook.worker import ConversionWorker
 from pdf_audiobook.workspace import Workspace, atomic_write_json
 from test_pdf import make_pdf
@@ -841,6 +843,52 @@ def test_interactive_voice_registry_auth_and_preview_projection() -> None:
         updated = client.get("/api/voices").json()
         assert updated["voices"][0]["preview_available"] is True
         assert client.get("/api/voice-preview/af_heart", headers={**headers, "Origin": "http://localhost:9"}).status_code == 200
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_voice_shaping_capability_is_path_free_and_rejects_unsupported_preview_settings(monkeypatch) -> None:
+    root = Path("tests") / f".pytest-phase6-shaping-capability-{uuid.uuid4().hex}"; root.mkdir()
+    calls: list[tuple] = []
+
+    def generate(*args) -> None:
+        calls.append(args)
+        raise AssertionError("unsupported shaping must not reach the generator")
+
+    capability = ShapingCapability("C:\\secret\\ffmpeg.exe", False, "ffmpeg-test", "", "fingerprint-test", False)
+    monkeypatch.setattr(app_module, "shaping_capability", lambda: capability)
+    monkeypatch.setattr(app_module, "shaping_fingerprint", lambda: capability.fingerprint)
+    try:
+        _, client, headers, _ = _app(root, 19898, preview_generator=generate)
+        catalog = client.get("/api/voices", headers=headers)
+        assert catalog.status_code == 200
+        projected = catalog.json()["voice_shaping"]
+        assert projected["pitch_available"] is False and projected["tone_available"] is False
+        assert projected["preview_settings_available"] is True
+        assert projected["preview_settings_implementation"] == "voice-preview-settings-v1"
+        assert "ffmpeg" not in projected and "C:\\secret" not in catalog.text
+        script = Path("src/pdf_audiobook/static/app.js").read_text(encoding="utf-8")
+        css = Path("src/pdf_audiobook/static/styles.css").read_text(encoding="utf-8")
+        assert "settingsAwarePreviewAvailable" in script
+        assert "Number(settings.speed ?? 1) !== 1" in script
+        assert "Restart the local backend to preview voice shaping." in script
+        assert 'button.textContent = "Cancel preview"' in script
+        assert 'audio.addEventListener("playing", markPlaying)' in script
+        assert 'audio.addEventListener("waiting", markBuffering)' in script
+        assert 'audio.addEventListener("stalled", markBuffering)' in script
+        assert 'button.textContent = previewLabel(button, true)' in script
+        assert 'if (activePreviewButton === preview) stopPreview(previewStatus);' in script
+        assert 'button.setAttribute("aria-busy", "true")' in script
+        assert "previewAudioError" in script
+        assert ".preview-loading,.preview-buffering" in css
+        assert "prefers-reduced-motion:reduce" in css
+        assert 'previewControls.className = "cast-preview cast-audition-row"' in script
+        assert "article.append(fields, previewControls)" in script
+        pitch = client.get("/api/voice-preview/af_heart?pitch_semitones=1", headers=headers)
+        tone = client.get("/api/voice-preview/af_heart?tone_preset=warm", headers=headers)
+        assert pitch.status_code == 422 and pitch.json()["error"]["code"] == "PITCH_UNAVAILABLE"
+        assert tone.status_code == 422 and tone.json()["error"]["code"] == "TONE_UNAVAILABLE"
+        assert not calls
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

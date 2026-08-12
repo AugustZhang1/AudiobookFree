@@ -14,6 +14,8 @@ from .audio import validate_wav, write_pcm_wav
 from .chapters import select_chapter_range
 from .security import pid_is_alive
 from .tts import EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks, plan_interactive_chunks
+from .voice_shaping import shape_pcm, shaping_fingerprint
+from .voice_settings import canonical_voice_settings
 from .voice_registry import get_generation_facts, registry_revision
 from .workspace import ManifestError, Workspace, UnsafePathError
 from .m4b import Phase5Cancelled, finalize_conversion
@@ -228,9 +230,9 @@ class ConversionWorker:
         job = self._claim(job)
         attempts_total = 0
         loaded = engine
+        settings = SynthesisSettings(**{key: job["tts"].get("settings", {}).get(key, value) for key, value in {"speed": job["tts"]["speed"], "pitch_semitones": 0, "tone_preset": "neutral", "sample_rate": job["tts"]["sample_rate"], "chunk_cap": job["tts"].get("chunk_cap", 900), "chunk_mode": "legacy", "paragraph_pause_ms": 0, "sentence_pause_ms": 0}.items()})
         try:
             if loaded is None:
-                settings = SynthesisSettings(**{key: job["tts"].get("settings", {}).get(key, value) for key, value in {"speed": job["tts"]["speed"], "sample_rate": job["tts"]["sample_rate"], "chunk_cap": job["tts"].get("chunk_cap", 900), "chunk_mode": "legacy", "paragraph_pause_ms": 0, "sentence_pause_ms": 0}.items()})
                 loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"])
             completed = {record["global_index"]: record for record in job["completed_chunks"]}
             for chunk in chunks:
@@ -248,7 +250,7 @@ class ConversionWorker:
                 for attempt in range(self.max_attempts):
                     attempts_total += 1
                     try:
-                        pcm = loaded.synthesize(chunk.text)
+                        pcm = shape_pcm(loaded.synthesize(chunk.text), settings.sample_rate, settings.as_dict())
                         error = None
                         break
                     except Exception as exc:  # bounded, factual retry
@@ -316,6 +318,9 @@ class ConversionWorker:
         # Remove every unverified candidate before claiming the worker.  The
         # planner's semantic audio hash permits metadata-only reuse.
         voice_plan = self.workspace.load_voice_plan(self.conversion_id)
+        captured_shaping = (job["tts"].get("settings") or {}).get("shaping_fingerprint")
+        if captured_shaping is not None and captured_shaping != shaping_fingerprint():
+            raise ManifestError("voice shaping capability does not match captured generation")
         cast_by_id = {entry["cast_id"]: entry for entry in voice_plan["cast"]}
         job = self._sanitize_interactive(job, chunks)
         job = self._claim(job)
@@ -345,9 +350,11 @@ class ConversionWorker:
             cast_entry = cast_by_id.get(chunk.speaker_id)
             if cast_entry is None or cast_entry.get("voice_id") != chunk.voice_id:
                 raise ManifestError("interactive chunk speaker binding is invalid")
-            cast_settings = cast_entry["voice_settings"]
+            cast_settings = canonical_voice_settings(cast_entry.get("voice_settings", {"speed": 1.0}))
             settings = SynthesisSettings(
                 speed=float(cast_settings["speed"]),
+                pitch_semitones=int(cast_settings["pitch_semitones"]),
+                tone_preset=str(cast_settings["tone_preset"]),
                 sample_rate=int(job["tts"]["sample_rate"]),
                 chunk_cap=int(job["tts"].get("chunk_cap", 900)),
                 chunk_mode=str(settings_data.get("chunk_mode", "chapter")),
@@ -389,6 +396,7 @@ class ConversionWorker:
                     completed[chunk.global_index] = reused
                     continue
                 loaded = load_for(chunk)
+                active_settings = SynthesisSettings(**canonical_voice_settings(cast_by_id[chunk.speaker_id].get("voice_settings", {"speed": 1.0})), sample_rate=int(job["tts"]["sample_rate"]), chunk_cap=int(job["tts"].get("chunk_cap", 900)))
                 path = self._chunk_path(chunk)
                 pcm = None
                 error: Exception | None = None
@@ -396,7 +404,7 @@ class ConversionWorker:
                     cancellation_check()
                     attempts_total += 1
                     try:
-                        pcm = loaded.synthesize(chunk.text)
+                        pcm = shape_pcm(loaded.synthesize(chunk.text), active_settings.sample_rate, active_settings.as_dict())
                         error = None
                         break
                     except Exception as exc:

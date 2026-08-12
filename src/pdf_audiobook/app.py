@@ -12,6 +12,7 @@ import subprocess
 import threading
 import urllib.parse
 import uuid
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,12 @@ from .analyzers.booknlp import BookNLPAnalyzer
 from .pdf import MAX_PDF_BYTES, PdfAnalysisError, analyze_pdf, preflight_pdf
 from .chapters import ChapterPlanError, create_chapter_plan, rename_chapters, select_chapter_range, validate_chapter_plan
 from .tts import APPROVED_VOICES, DEFAULT_CHUNK_CAP, DEFAULT_TORCH_THREADS, EngineMetadata, SynthesisSettings, TORCH_THREADS_ENV, plan_chunks, plan_interactive_chunks
+from .voice_settings import DEFAULT_VOICE_SETTINGS, VoiceSettingsError, canonical_voice_settings
+from .voice_shaping import PREVIEW_SETTINGS_IMPLEMENTATION, shaping_capability, shaping_fingerprint
 from .security import instance_path, pid_is_alive, remove_instance_if_matches, token_hash
 from .voice_plan import VoicePlanError, approve_voice_plan, assign_cast, build_voice_plan, merge_aliases, merge_cast, override_span, remove_cast, rename_cast, review_summary, split_aliases, with_canonical_artifact_hash
 from .voice_registry import VoiceRegistryError, get_generation_facts, list_public_entries, registry_revision, require_enabled_voice_id, resolve_preview_path, resolve_preview_target
+from .preview_worker import cleanup_preview_cache, preview_cache_target
 from .workspace import GENERATION_SCHEMA_VERSION, INTERACTIVE_GENERATION_SCHEMA_VERSION, ManifestError, Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).with_name("static")
@@ -110,7 +114,7 @@ def _spawn_worker(workspace_root: Path, conversion_id: str, performance_mode: st
     return subprocess.Popen([str(interpreter), "-m", "pdf_audiobook.worker", str(workspace_root), conversion_id], shell=False, env=child_env)
 
 
-def _default_preview_generator(voice: str, target: Path) -> None:
+def _default_preview_generator(voice: str, target: Path, settings: dict[str, Any] | None = None) -> None:
     """Generate a preview in the isolated Kokoro interpreter."""
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -127,7 +131,7 @@ def _default_preview_generator(voice: str, target: Path) -> None:
     child_env[TORCH_THREADS_ENV] = str(min(DEFAULT_TORCH_THREADS, detected_cpus))
     try:
         subprocess.run(
-            [str(interpreter), "-m", "pdf_audiobook.preview_worker", voice, str(target)],
+            [str(interpreter), "-m", "pdf_audiobook.preview_worker", voice, str(target), __import__("json").dumps(settings if settings is not None else DEFAULT_VOICE_SETTINGS, sort_keys=True, separators=(",", ":"))],
             shell=False,
             check=True,
             env=child_env,
@@ -143,28 +147,73 @@ class _PreviewGenerationError(RuntimeError):
     pass
 
 
-def _prepare_preview(state: AppState, voice: str) -> None:
+def _preview_settings(request: Request) -> dict[str, Any]:
+    allowed = {"speed", "pitch_semitones", "tone_preset"}
+    seen: set[str] = set()
+    for key, _value in request.query_params.multi_items():
+        if key in seen:
+            raise VoiceSettingsError("INVALID_VOICE_SETTINGS", "preview settings are invalid")
+        seen.add(key)
+    if any(key not in allowed for key in request.query_params):
+        raise VoiceSettingsError("INVALID_VOICE_SETTINGS", "preview settings are invalid")
+    raw: dict[str, Any] = {}
+    if "speed" in request.query_params:
+        try:
+            raw["speed"] = float(request.query_params["speed"])
+        except ValueError as exc:
+            raise VoiceSettingsError("INVALID_SPEED", "speed is invalid") from exc
+    if "pitch_semitones" in request.query_params:
+        try:
+            raw["pitch_semitones"] = int(request.query_params["pitch_semitones"])
+        except ValueError as exc:
+            raise VoiceSettingsError("INVALID_PITCH", "pitch_semitones is invalid") from exc
+    if "tone_preset" in request.query_params:
+        raw["tone_preset"] = request.query_params["tone_preset"]
+    return canonical_voice_settings({**DEFAULT_VOICE_SETTINGS, **raw})
+
+
+def _validate_shaping_capability(settings: dict[str, Any]) -> None:
+    capability = shaping_capability()
+    if settings["pitch_semitones"] and not capability.rubberband:
+        raise VoiceSettingsError("PITCH_UNAVAILABLE", "pitch shaping requires FFmpeg rubberband support")
+    if settings["tone_preset"] != "neutral" and not capability.tone_available:
+        raise VoiceSettingsError("TONE_UNAVAILABLE", "tone shaping requires FFmpeg shelf filters")
+
+
+def _prepare_preview(state: AppState, voice: str, settings: dict[str, Any] | None = None) -> Path:
     """Serialize cache writes and publish only a validated completed WAV."""
 
     with state.preview_lock:
         if state.preview_root is None:
             raise VoiceRegistryError("preview root is unavailable")
-        existing = resolve_preview_path(voice, state.preview_root)
+        settings = canonical_voice_settings(settings or {"speed": 1.0})
+        cleanup_preview_cache(state.preview_root)
+        neutral = settings == {"speed": 1.0, "pitch_semitones": 0, "tone_preset": "neutral"}
+        existing = resolve_preview_path(voice, state.preview_root) if neutral else None
         if existing is not None:
             try:
                 validate_wav(existing, expected_sample_rate=24000)
-                return
+                return existing
             except (OSError, ValueError):
                 pass
-        target = resolve_preview_target(voice, state.preview_root)
+        target = resolve_preview_target(voice, state.preview_root) if neutral else preview_cache_target(state.preview_root, voice, settings)
         if target is None:
             raise VoiceRegistryError("preview root is unavailable")
         generator = state.preview_generator or _default_preview_generator
         try:
-            generator(voice, target)
+            try:
+                signature = inspect.signature(generator)
+                accepts_settings = any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()) or len(signature.parameters) >= 3
+            except (TypeError, ValueError):
+                accepts_settings = True
+            if accepts_settings:
+                generator(voice, target, settings)
+            else:
+                generator(voice, target)
             validate_wav(target, expected_sample_rate=24000)
         except Exception as exc:
             raise _PreviewGenerationError("preview generation failed") from exc
+        return target
 
 
 async def _json_body(request: Request) -> dict[str, Any] | None:
@@ -489,13 +538,19 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         except VoiceRegistryError:
             return JSONResponse(unavailable, status_code=404)
         try:
-            await asyncio.to_thread(_prepare_preview, state, validated)
+            settings = _preview_settings(request)
+            _validate_shaping_capability(settings)
+        except VoiceSettingsError as exc:
+            return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=422)
+        try:
+            target = await asyncio.to_thread(_prepare_preview, state, validated, settings)
         except VoiceRegistryError:
             return JSONResponse(unavailable, status_code=404)
         except _PreviewGenerationError:
             return JSONResponse({"error": {"code": "VOICE_PREVIEW_FAILED", "message": "voice preview generation failed"}}, status_code=503)
         try:
-            candidate = resolve_preview_path(validated, state.preview_root)
+            neutral = settings == {"speed": 1.0, "pitch_semitones": 0, "tone_preset": "neutral"}
+            candidate = resolve_preview_path(validated, state.preview_root) if neutral else target
             if candidate is None:
                 return JSONResponse(unavailable, status_code=404)
             validate_wav(candidate, expected_sample_rate=24000)
@@ -515,12 +570,20 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         except VoiceRegistryError:
             return JSONResponse(unavailable, status_code=404)
         try:
-            await asyncio.to_thread(_prepare_preview, state, validated)
+            settings = _preview_settings(request)
+            _validate_shaping_capability(settings)
+        except VoiceSettingsError as exc:
+            return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=422)
+        try:
+            await asyncio.to_thread(_prepare_preview, state, validated, settings)
         except VoiceRegistryError:
             return JSONResponse(unavailable, status_code=404)
         except _PreviewGenerationError:
             return JSONResponse({"error": {"code": "VOICE_PREVIEW_FAILED", "message": "voice preview generation failed"}}, status_code=503)
-        return {"voice": validated, "status": "ready"}
+        result = {"voice": validated, "status": "ready"}
+        if settings != {"speed": 1.0, "pitch_semitones": 0, "tone_preset": "neutral"}:
+            result["settings"] = settings
+        return result
 
     @app.get("/api/voices")
     async def voices(request: Request):
@@ -535,7 +598,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 projected["preview_available"] = False
             entries.append(projected)
         revision = registry_revision()
-        return {"revision": revision, "registry_revision": revision, "voices": entries}
+        capability = shaping_capability()
+        return {"revision": revision, "registry_revision": revision, "voices": entries, "voice_shaping": {"available": capability.available, "pitch_available": capability.rubberband, "tone_available": capability.tone_available, "fingerprint": shaping_fingerprint(), "preview_settings_available": True, "preview_settings_implementation": PREVIEW_SETTINGS_IMPLEMENTATION}}
 
     @app.get("/api/status")
     async def status(request: Request):
@@ -917,8 +981,12 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 try:
                     for cast_entry in plan.get("cast", []):
                         require_enabled_voice_id(cast_entry.get("voice_id"))
+                        cast_settings = canonical_voice_settings(cast_entry.get("voice_settings", {"speed": 1.0}))
+                        _validate_shaping_capability(cast_settings)
                 except (VoiceRegistryError, AttributeError):
                     return JSONResponse({"error": {"code": "INVALID_VOICE", "message": "voice plan contains an invalid voice"}}, status_code=422)
+                except VoiceSettingsError as exc:
+                    return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=422)
                 start = body["chapter_start"] if "chapter_start" in body else 1
                 end = body["chapter_end"] if "chapter_end" in body else len(chapter_plan["chapters"])
                 select_chapter_range(chapter_plan, start, end)
@@ -929,11 +997,15 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 narrator = next(item for item in plan["cast"] if item["cast_id"] == "narrator")
                 voice_id = require_enabled_voice_id(narrator["voice_id"])
                 facts = get_generation_facts(voice_id)
-                speed = float(narrator["voice_settings"]["speed"])
-                settings = SynthesisSettings(speed=speed, sample_rate=facts["sample_rate"], chunk_cap=DEFAULT_CHUNK_CAP)
+                try:
+                    narrator_settings = canonical_voice_settings(narrator.get("voice_settings", {"speed": 1.0}))
+                except VoiceSettingsError:
+                    return JSONResponse({"error": {"code": "INVALID_VOICE_SETTINGS", "message": "voice plan contains invalid voice settings"}}, status_code=422)
+                settings = SynthesisSettings(**narrator_settings, sample_rate=facts["sample_rate"], chunk_cap=DEFAULT_CHUNK_CAP)
                 metadata = EngineMetadata(facts["engine"], facts["package_version"], facts["model"], facts["model_revision"], facts["model_checksum"], voice_id, facts["voice_version"], facts["voice_checksum"], facts["sample_rate"], settings.as_dict())
                 chunks = plan_interactive_chunks(text, plan, get_generation_facts, registry_revision(), (start, end), cap=settings.chunk_cap)
-                tts = {**metadata.as_dict(), "speed": speed, "chunk_cap": settings.chunk_cap}
+                tts = {**metadata.as_dict(), "speed": settings.speed, "chunk_cap": settings.chunk_cap}
+                tts["settings"]["shaping_fingerprint"] = shaping_fingerprint()
                 if start != 1 or end != len(chapter_plan["chapters"]):
                     tts["settings"] = {**tts["settings"], "chapter_start": start, "chapter_end": end}
                 job = await asyncio.to_thread(workspace.configure_interactive_generation, conversion_id, tts=tts, total_chunks=len(chunks), voice_registry_revision=registry_revision())
@@ -1360,16 +1432,33 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
                 if plan.get("revision") != expected:
                     return JSONResponse({"error": {"code": "PLAN_CONFLICT", "message": "voice plan revision is stale", "expected_revision": expected, "actual_revision": plan.get("revision")}}, status_code=409)
                 if operation == "edit":
-                    allowed = {"expected_revision", "cast_id", "display_label", "voice_id", "speed", "relationship"}
+                    allowed = {"expected_revision", "cast_id", "display_label", "voice_id", "speed", "pitch_semitones", "tone_preset", "voice_settings", "relationship"}
                     if set(body) - allowed or set(body) <= {"expected_revision", "cast_id"} or not isinstance(body.get("cast_id"), str):
                         return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "cast edit body is invalid"}}, status_code=422)
                     if "voice_id" in body:
                         require_enabled_voice_id(body["voice_id"])
                     if "speed" in body and (isinstance(body["speed"], bool) or not isinstance(body["speed"], (int, float)) or not 0.5 <= float(body["speed"]) <= 2.0):
                         return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "speed is invalid"}}, status_code=422)
+                    if "pitch_semitones" in body and (isinstance(body["pitch_semitones"], bool) or type(body["pitch_semitones"]) is not int or not -3 <= body["pitch_semitones"] <= 3):
+                        return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "pitch_semitones is invalid"}}, status_code=422)
+                    if body.get("pitch_semitones", 0) and not shaping_capability().rubberband:
+                        return JSONResponse({"error": {"code": "PITCH_UNAVAILABLE", "message": "pitch shaping requires FFmpeg rubberband support"}}, status_code=422)
+                    if "tone_preset" in body and body["tone_preset"] not in {"neutral", "warm", "bright"}:
+                        return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "tone_preset is invalid"}}, status_code=422)
+                    if body.get("tone_preset", "neutral") != "neutral" and not shaping_capability().tone_available:
+                        return JSONResponse({"error": {"code": "TONE_UNAVAILABLE", "message": "tone shaping requires FFmpeg shelf filters"}}, status_code=422)
+                    if "voice_settings" in body:
+                        try:
+                            checked_voice_settings = canonical_voice_settings(body["voice_settings"], allow_legacy=False)
+                        except VoiceSettingsError as exc:
+                            return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=422)
+                        if checked_voice_settings["pitch_semitones"] and not shaping_capability().rubberband:
+                            return JSONResponse({"error": {"code": "PITCH_UNAVAILABLE", "message": "pitch shaping requires FFmpeg rubberband support"}}, status_code=422)
+                        if checked_voice_settings["tone_preset"] != "neutral" and not shaping_capability().tone_available:
+                            return JSONResponse({"error": {"code": "TONE_UNAVAILABLE", "message": "tone shaping requires FFmpeg shelf filters"}}, status_code=422)
                     if "relationship" in body and body["relationship"] not in {"third_person", "same_as_narrator", "separate_from_narrator"}:
                         return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "relationship is invalid"}}, status_code=422)
-                    updates = {key: body[key] for key in ("voice_id", "speed", "relationship") if key in body}
+                    updates = {key: body[key] for key in ("voice_id", "speed", "pitch_semitones", "tone_preset", "voice_settings", "relationship") if key in body}
                     if updates:
                         result = assign_cast(plan, body["cast_id"], expected_revision=expected, **updates)
                         if "display_label" in body:

@@ -15,6 +15,7 @@ import re
 from typing import Any, Sequence
 
 from . import speakers
+from .voice_settings import VoiceSettingsError, canonical_voice_settings
 
 
 ROLES = frozenset({"narrator", "character"})
@@ -84,6 +85,8 @@ class CastEntry:
     relationship: str
     voice_id: str
     speed: float
+    pitch_semitones: int = 0
+    tone_preset: str = "neutral"
 
     def __post_init__(self) -> None:
         _text(self.cast_id, "cast_id")
@@ -102,6 +105,12 @@ class CastEntry:
         if not math.isfinite(speed) or speed <= 0:
             raise _fail("INVALID_SPEED", "speed must be finite and positive")
         object.__setattr__(self, "speed", speed)
+        try:
+            settings = canonical_voice_settings({"speed": speed, "pitch_semitones": self.pitch_semitones, "tone_preset": self.tone_preset})
+        except VoiceSettingsError as exc:
+            raise _fail(exc.code, exc.message) from exc
+        object.__setattr__(self, "pitch_semitones", settings["pitch_semitones"])
+        object.__setattr__(self, "tone_preset", settings["tone_preset"])
 
 
 def _cast_sequence(cast: Any) -> tuple[CastEntry, ...]:
@@ -322,9 +331,12 @@ def validate_voice_plan(
     cast_entries: list[CastEntry] = []
     for raw in cast_raw:
         entry = _strict_object(raw, {"cast_id", "display_label", "role", "relationship", "voice_id", "voice_settings"}, "cast_entry")
-        settings = _strict_object(entry["voice_settings"], {"speed"}, "voice_settings")
         try:
-            cast_entries.append(CastEntry(entry["cast_id"], entry["display_label"], entry["role"], entry["relationship"], entry["voice_id"], settings["speed"]))
+            settings = canonical_voice_settings(entry["voice_settings"])
+        except VoiceSettingsError as exc:
+            raise _fail(exc.code, exc.message) from exc
+        try:
+            cast_entries.append(CastEntry(entry["cast_id"], entry["display_label"], entry["role"], entry["relationship"], entry["voice_id"], settings["speed"], settings["pitch_semitones"], settings["tone_preset"]))
         except VoicePlanError:
             raise
         except (TypeError, ValueError) as exc:
@@ -666,7 +678,8 @@ def build_voice_plan(
 
     if not ordered_voices:
         raise _fail("INVALID_VOICE_IDS", "voice_ids must provide at least one voice")
-    cast: list[dict[str, Any]] = [{"cast_id": "narrator", "display_label": "Narrator", "role": "narrator", "relationship": "third_person", "voice_id": ordered_voices[0], "voice_settings": {"speed": 1.0}}]
+    default_settings = canonical_voice_settings({"speed": 1.0})
+    cast: list[dict[str, Any]] = [{"cast_id": "narrator", "display_label": "Narrator", "role": "narrator", "relationship": "third_person", "voice_id": ordered_voices[0], "voice_settings": dict(default_settings)}]
     aliases: list[dict[str, Any]] = []
     original_to_cast: dict[str, str] = {"narrator": "narrator"}
     for position, spec in enumerate(character_specs, start=1):
@@ -675,7 +688,7 @@ def build_voice_plan(
         cast_voice = ordered_voices[position % len(ordered_voices)]
         if relationship == "same_as_narrator":
             cast_voice = ordered_voices[0]
-        cast.append({"cast_id": cast_id, "display_label": label, "role": "character", "relationship": relationship, "voice_id": cast_voice, "voice_settings": {"speed": 1.0}})
+        cast.append({"cast_id": cast_id, "display_label": label, "role": "character", "relationship": relationship, "voice_id": cast_voice, "voice_settings": dict(default_settings)})
         original_to_cast[cast_id] = cast_id
         original_to_cast[label] = cast_id
         original_to_cast[spec["source_id"]] = cast_id
@@ -788,6 +801,9 @@ def assign_cast(
     expected_revision: int,
     voice_id: str | None = None,
     speed: float | None = None,
+    pitch_semitones: int | None = None,
+    tone_preset: str | None = None,
+    voice_settings: dict[str, Any] | None = None,
     relationship: str | None = None,
 ) -> dict[str, Any]:
     result = _edit_copy(artifact, expected_revision)
@@ -798,9 +814,19 @@ def assign_cast(
     if voice_id is not None:
         _text(voice_id, "voice_id")
         entry["voice_id"] = voice_id
-    if speed is not None:
-        checked = CastEntry(cast_id, str(entry.get("display_label", "label")), entry.get("role", "character"), entry.get("relationship", "third_person"), entry.get("voice_id", "voice"), speed)
-        entry["voice_settings"]["speed"] = checked.speed
+    if speed is not None or pitch_semitones is not None or tone_preset is not None or voice_settings is not None:
+        current = canonical_voice_settings(entry.get("voice_settings", {"speed": 1.0}))
+        if voice_settings is not None:
+            current = canonical_voice_settings(voice_settings)
+        else:
+            if speed is not None:
+                current["speed"] = speed
+            if pitch_semitones is not None:
+                current["pitch_semitones"] = pitch_semitones
+            if tone_preset is not None:
+                current["tone_preset"] = tone_preset
+            current = canonical_voice_settings(current, allow_legacy=False)
+        entry["voice_settings"] = current
     if relationship is not None:
         if relationship not in RELATIONSHIPS:
             raise _fail("INVALID_RELATIONSHIP", "relationship is not supported")
@@ -908,7 +934,7 @@ def split_aliases(
         if any(item.get("cast_id") == target_character_id for item in result.get("cast", [])):
             raise _fail("AMBIGUOUS_CAST_ID", "new character ID already exists", cast_id=target_character_id)
         narrator = next(item for item in result["cast"] if item.get("cast_id") == "narrator")
-        result["cast"].append({"cast_id": target_character_id, "display_label": display_label or target_character_id, "role": "character", "relationship": "separate_from_narrator", "voice_id": voice_id or narrator["voice_id"], "voice_settings": {"speed": 1.0}})
+        result["cast"].append({"cast_id": target_character_id, "display_label": display_label or target_character_id, "role": "character", "relationship": "separate_from_narrator", "voice_id": voice_id or narrator["voice_id"], "voice_settings": canonical_voice_settings({"speed": 1.0})})
     elif not any(item.get("cast_id") == target_character_id and item.get("role") == "character" for item in result.get("cast", [])):
         raise _fail("UNKNOWN_CAST_ID", "target character ID does not resolve uniquely")
     for alias in aliases:

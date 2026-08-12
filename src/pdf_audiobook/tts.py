@@ -20,6 +20,8 @@ from typing import Any, Callable, ContextManager, Protocol
 
 from .audio import pcm_from_audio
 from .voice_registry import APPROVED_VOICE_IDS
+from .voice_settings import VoiceSettingsError, canonical_voice_settings
+from .voice_shaping import shaping_capability, shaping_fingerprint
 
 APPROVED_VOICES = APPROVED_VOICE_IDS
 KOKORO_PACKAGE = "kokoro"
@@ -43,11 +45,22 @@ def _silence_pcm(sample_rate: int) -> bytes:
 @dataclass(frozen=True)
 class SynthesisSettings:
     speed: float = 1.0
+    pitch_semitones: int = 0
+    tone_preset: str = "neutral"
     sample_rate: int = KOKORO_SAMPLE_RATE
     chunk_cap: int = DEFAULT_CHUNK_CAP
     chunk_mode: str = "chapter"
     paragraph_pause_ms: int = 0
     sentence_pause_ms: int = 0
+
+    def __post_init__(self) -> None:
+        try:
+            settings = canonical_voice_settings({"speed": self.speed, "pitch_semitones": self.pitch_semitones, "tone_preset": self.tone_preset})
+        except VoiceSettingsError as exc:
+            raise ValueError(exc.message) from exc
+        object.__setattr__(self, "speed", settings["speed"])
+        object.__setattr__(self, "pitch_semitones", settings["pitch_semitones"])
+        object.__setattr__(self, "tone_preset", settings["tone_preset"])
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,7 +155,7 @@ def load_voice(voice: str, settings: SynthesisSettings | None = None, *, engine:
     settings = settings or SynthesisSettings()
     if voice not in APPROVED_VOICES and not (engine == "fake" and voice == "fake-neutral"):
         raise ValueError(f"voice is not approved: {voice}")
-    if not 0.5 <= settings.speed <= 2.0:
+    if not math.isfinite(settings.speed) or not 0.5 <= settings.speed <= 2.0:
         raise ValueError("speed must be between 0.5 and 2.0")
     if settings.sample_rate <= 0 or settings.chunk_cap <= 0:
         raise ValueError("invalid synthesis settings")
@@ -381,6 +394,7 @@ def plan_interactive_chunks(
     cap: int = DEFAULT_CHUNK_CAP,
     *,
     chapter_range: tuple[int, int] | None = None,
+    shaping_identity: str | None = None,
 ) -> list[InteractiveTextChunk]:
     """Plan exact, speaker-bounded chunks from an approved voice plan."""
 
@@ -390,6 +404,9 @@ def plan_interactive_chunks(
         raise ValueError("cap must be positive")
     if not isinstance(registry_revision, str) or re.fullmatch(r"[0-9a-f]{64}", registry_revision) is None:
         raise ValueError("registry revision is required")
+    shaping_identity = shaping_identity or shaping_fingerprint()
+    if not isinstance(shaping_identity, str) or not shaping_identity:
+        raise ValueError("shaping identity is required")
     if chapter_range is not None:
         if selected_chapters is not None:
             raise ValueError("provide only one selected chapter range")
@@ -440,12 +457,15 @@ def plan_interactive_chunks(
             raise ValueError(f"voice is invalid: {voice_id}")
         if not isinstance(settings, dict) or "speed" not in settings:
             raise ValueError(f"missing cast settings: {cast_id}")
-        speed = settings["speed"]
-        if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not math.isfinite(float(speed)) or float(speed) <= 0:
-            raise ValueError(f"invalid cast settings: {cast_id}")
+        try:
+            canonical_settings = canonical_voice_settings(settings)
+        except VoiceSettingsError as exc:
+            raise ValueError(f"invalid cast settings: {cast_id}") from exc
+        if canonical_settings["pitch_semitones"] and not shaping_capability().rubberband:
+            raise ValueError("pitch shaping is unavailable: FFmpeg rubberband support is required")
         if voice_id not in facts_by_voice:
             facts_by_voice[voice_id] = _interactive_generation_facts(generation_facts, voice_id)
-        cast[cast_id] = entry
+        cast[cast_id] = {**entry, "voice_settings": canonical_settings}
 
     artifact_chapters = voice_plan.get("chapters")
     if not isinstance(artifact_chapters, list) or not artifact_chapters:
@@ -499,6 +519,7 @@ def plan_interactive_chunks(
                 raise ValueError("thought spans require a manual override")
             entry = cast[speaker_id]
             voice_id = entry["voice_id"]
+            canonical_settings = entry["voice_settings"]
             facts = facts_by_voice[voice_id]
             if chapter_index in selected_set:
                 span_text = cleaned_text[start:end]
@@ -525,16 +546,18 @@ def plan_interactive_chunks(
                             "segment_type": segment_type,
                             "speaker_id": speaker_id,
                             "voice_id": voice_id,
-                            "voice_settings": dict(entry["voice_settings"]),
+                            "voice_settings": canonical_settings,
                             "generation_facts": facts,
                             "chunk_cap": cap,
                             "boundary_policy": "sentence_paragraph_safe",
+                            "shaping_fingerprint": shaping_identity,
                         }
                         payload = {
                             **audio_payload,
                             "voice_plan_canonical_hash": canonical_hash,
                             "voice_plan_revision": revision,
                             "registry_revision": registry_revision,
+                            "shaping_fingerprint": shaping_identity,
                         }
                         result.append(InteractiveTextChunk(
                             chapter_index, len(result), local, actual_start, actual_end, piece,
