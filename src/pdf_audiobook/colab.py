@@ -131,6 +131,91 @@ def _ensure_chapter_plan(workspace: Workspace, conversion_id: str, mode: str, co
     return plan
 
 
+def _print_progress(line: str) -> None:
+    print(line, flush=True)
+
+
+class ColabProgressDisplay:
+    """Render validated generation manifests as bounded, line-oriented output."""
+
+    def __init__(
+        self,
+        chapter_plan: dict[str, Any],
+        *,
+        output: Callable[[str], Any] | None = None,
+        bar_width: int = 24,
+    ) -> None:
+        chapters = chapter_plan.get("chapters") if isinstance(chapter_plan, dict) else None
+        self._chapter_total = len(chapters) if isinstance(chapters, list) else 0
+        self._output = output if output is not None else _print_progress
+        self._bar_width = max(8, min(int(bar_width), 48))
+        self._last_key: tuple[Any, ...] | None = None
+
+    @staticmethod
+    def _ascii(value: Any, limit: int = 32) -> str:
+        text = "".join(char if 32 <= ord(char) < 127 else "?" for char in str(value))
+        return text[:limit]
+
+    def _snapshot_key(self, manifest: dict[str, Any]) -> tuple[Any, ...]:
+        progress = manifest["progress"]
+        completed = manifest["completed_chunks"]
+        latest = completed[-1] if completed else None
+        return (
+            manifest["status"],
+            manifest["stage"],
+            progress["completed"],
+            progress["current"],
+            progress["total"],
+            (latest["global_index"], latest["chapter_index"]) if latest else None,
+        )
+
+    def _format(self, manifest: dict[str, Any]) -> str:
+        progress = manifest["progress"]
+        completed = progress["completed"]
+        total = progress["total"]
+        ratio = completed / total if total else 1.0
+        filled = round(self._bar_width * ratio)
+        bar = "#" * filled + "-" * (self._bar_width - filled)
+        details = f"{completed}/{total} chunks"
+        records = manifest["completed_chunks"]
+        if records and self._chapter_total:
+            chapter = records[-1]["chapter_index"]
+            details += f" | chapter {chapter}/{self._chapter_total}"
+        stage = self._ascii(manifest["stage"])
+        return f"[{bar}] {ratio * 100:5.1f}% ({details}) | stage: {stage}"
+
+    def render(self, manifest: dict[str, Any]) -> None:
+        """Render one already-validated manifest without affecting conversion."""
+
+        try:
+            key = self._snapshot_key(manifest)
+            if key == self._last_key:
+                return
+            line = self._format(manifest)
+            self._output(line)
+            self._last_key = key
+        except Exception:
+            # Display is best-effort.  The workspace update has already
+            # succeeded, and an output/formatting failure must not change it.
+            return
+
+
+class _ProgressWorkspaceProxy:
+    """Delegate a Workspace while observing its validated generation updates."""
+
+    def __init__(self, workspace: Workspace, display: ColabProgressDisplay) -> None:
+        self._workspace = workspace
+        self._display = display
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._workspace, name)
+
+    def update_generation(self, *args: Any, **updates: Any) -> dict[str, Any]:
+        manifest = self._workspace.update_generation(*args, **updates)
+        self._display.render(manifest)
+        return manifest
+
+
 @contextmanager
 def _output_directory(path: Path) -> Iterator[None]:
     """Temporarily direct the existing finalizer to an explicit directory."""
@@ -214,8 +299,11 @@ def run_conversion(
     workspace.configure_generation(conversion_id, tts=tts, total_chunks=total_chunks)
 
     factory = engine_factory or make_cuda_kokoro_factory()
-    worker = worker_class(workspace, conversion_id, engine_factory=factory)
+    display = ColabProgressDisplay(plan)
+    progress_workspace = _ProgressWorkspaceProxy(workspace, display)
+    worker = worker_class(progress_workspace, conversion_id, engine_factory=factory)
     with _output_directory(output):
+        display.render(workspace.read_job(conversion_id))
         result: WorkerResult = worker.run(full_pipeline=True)
     if result.status != "completed":
         raise ColabError(f"conversion did not complete (status: {result.status})")
@@ -261,4 +349,4 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["ColabConflictError", "ColabError", "main", "make_cuda_kokoro_factory", "run_conversion"]
+__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "run_conversion"]
