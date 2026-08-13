@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from io import BytesIO
 import hashlib
 import json
 import shutil
@@ -23,6 +24,7 @@ from pdf_audiobook.m4b import (
     verify_m4b,
     finalize_conversion,
 )
+from pdf_audiobook.m4b import _open_aggregate_wave
 from pdf_audiobook.audio import write_pcm_wav
 from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks
 from pdf_audiobook.chapters import select_chapter_range
@@ -100,6 +102,26 @@ def test_chapter_mode_has_no_intra_chapter_pause() -> None:
         assert len(records) == 1 and assembly.frames == records[0][2].frames
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_aggregate_wave_uses_rf64_ds64_sizes_only_above_riff_limit() -> None:
+    ordinary = BytesIO()
+    with _open_aggregate_wave(ordinary, rate=24000, frames=1, data_bytes=2) as output:
+        output.writeframes(b"\0\0")
+    assert ordinary.getvalue()[:4] == b"RIFF"
+
+    data_bytes = 0x1_0000_0000
+    rf64 = BytesIO()
+    with _open_aggregate_wave(rf64, rate=24000, frames=data_bytes // 2, data_bytes=data_bytes) as output:
+        output.writeframes(b"\0\0")
+    header = rf64.getvalue()
+    assert header[:4] == b"RF64" and header[8:12] == b"WAVE"
+    assert int.from_bytes(header[4:8], "little") == 0xFFFFFFFF
+    assert header[12:16] == b"ds64" and int.from_bytes(header[16:20], "little") == 28
+    assert int.from_bytes(header[20:28], "little") == 72 + data_bytes
+    assert int.from_bytes(header[28:36], "little") == data_bytes
+    assert int.from_bytes(header[36:44], "little") == data_bytes // 2
+    assert header[72:76] == b"data" and int.from_bytes(header[76:80], "little") == 0xFFFFFFFF
 
 
 def test_metadata_escape_and_pause_markers() -> None:

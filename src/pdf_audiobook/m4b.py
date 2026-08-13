@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import wave
@@ -26,6 +27,7 @@ ORDINARY_PAUSE_MS = 150
 PARAGRAPH_PAUSE_MS = 400
 CHAPTER_PAUSE_MS = 750
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
+_RIFF_MAX_SIZE = 0xFFFFFFFF
 
 
 class M4BError(RuntimeError):
@@ -218,6 +220,46 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
     return ordered, {**plan, "chapters": chapters}, job
 
 
+class _RF64WaveWriter:
+    """Write the fixed mono PCM RF64 envelope used by chapter assembly."""
+
+    def __init__(self, raw: Any, *, rate: int, frames: int, data_bytes: int) -> None:
+        self._raw = raw
+        raw.write(b"RF64")
+        raw.write(struct.pack("<I", _RIFF_MAX_SIZE))
+        raw.write(b"WAVE")
+        raw.write(b"ds64")
+        raw.write(struct.pack("<IQQQI", 28, 72 + data_bytes, data_bytes, frames, 0))
+        raw.write(b"fmt ")
+        raw.write(struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16))
+        raw.write(b"data")
+        raw.write(struct.pack("<I", _RIFF_MAX_SIZE))
+
+    def __enter__(self) -> _RF64WaveWriter:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def writeframes(self, data: bytes) -> None:
+        self._raw.write(data)
+
+
+def _open_aggregate_wave(raw: Any, *, rate: int, frames: int, data_bytes: int) -> Any:
+    if data_bytes > _RIFF_MAX_SIZE:
+        return _RF64WaveWriter(raw, rate=rate, frames=frames, data_bytes=data_bytes)
+    output = wave.open(raw, "wb")
+    output.setnchannels(1); output.setsampwidth(2); output.setframerate(rate)
+    return output
+
+
+def _pause_frames(rate: int, chunk: Any, next_chunk: Any | None) -> int:
+    if next_chunk is None:
+        return 0
+    pause_ms = CHAPTER_PAUSE_MS if next_chunk.chapter_index != chunk.chapter_index else (PARAGRAPH_PAUSE_MS if _paragraph_boundary(chunk.text) else ORDINARY_PAUSE_MS)
+    return round(rate * pause_ms / 1000)
+
+
 def assemble_chapters(workspace: Workspace, conversion_id: str) -> AssemblyResult:
     """Re-plan and concatenate validated PCM chunks with frame-exact pauses."""
 
@@ -234,13 +276,17 @@ def assemble_chapters(workspace: Workspace, conversion_id: str) -> AssemblyResul
     chapter_title = ""
     chapter_count = len(plan["chapters"])
     chapter_by_index = {int(item["index"]): str(item["title"]) for item in plan["chapters"]}
+    aggregate_frames = sum(info.frames for _, _, info in ordered)
+    for position, (chunk, _path, _info) in enumerate(ordered):
+        next_item = ordered[position + 1] if position + 1 < len(ordered) else None
+        aggregate_frames += _pause_frames(rate, chunk, next_item[0] if next_item is not None else None)
+    aggregate_data_bytes = aggregate_frames * 2
 
     fd, temporary_name = tempfile.mkstemp(prefix=".assembled.", suffix=".wav", dir=destination_dir)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "wb") as raw:
-            with wave.open(raw, "wb") as output:
-                output.setnchannels(1); output.setsampwidth(2); output.setframerate(rate)
+            with _open_aggregate_wave(raw, rate=rate, frames=aggregate_frames, data_bytes=aggregate_data_bytes) as output:
                 for position, (chunk, path, info) in enumerate(ordered):
                     if chapter_index != chunk.chapter_index:
                         if chapter_index is not None and chapter_start is not None and (not chapters or chapters[-1].index != chapter_index):
@@ -253,10 +299,9 @@ def assemble_chapters(workspace: Workspace, conversion_id: str) -> AssemblyResul
                     frames_total += info.frames
                     next_item = ordered[position + 1] if position + 1 < len(ordered) else None
                     if next_item is not None:
-                        pause_ms = CHAPTER_PAUSE_MS if next_item[0].chapter_index != chunk.chapter_index else (PARAGRAPH_PAUSE_MS if _paragraph_boundary(chunk.text) else ORDINARY_PAUSE_MS)
                         if next_item[0].chapter_index != chunk.chapter_index and chapter_start is not None:
                             chapters.append(ChapterTiming(chunk.chapter_index, chapter_title, chapter_start, frames_total, rate))
-                        pause_frames = round(rate * pause_ms / 1000)
+                        pause_frames = _pause_frames(rate, chunk, next_item[0])
                         output.writeframes(b"\0\0" * pause_frames)
                         frames_total += pause_frames
                 if chapter_index is not None and chapter_start is not None:
