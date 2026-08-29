@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import uuid
@@ -11,7 +12,7 @@ import pytest
 import pdf_audiobook.worker as worker_module
 from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks, plan_interactive_chunks
 from pdf_audiobook.chapters import select_chapter_range
-from pdf_audiobook.worker import ConversionWorker
+from pdf_audiobook.worker import ConversionWorker, WorkerBusyError
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.workspace import ManifestError, Workspace, atomic_write_json
 from pdf_audiobook.engine_catalog import CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT
@@ -440,3 +441,122 @@ def test_worker_synthesizes_only_selected_reindexed_chapters() -> None:
         assert engine.texts == [text[splits[1]:splits[2]], text[splits[2]:splits[3]]]
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("status,stage", [("completed", "synthesis_complete"), ("assembling", "assembling")])
+def test_v4_phase5_fast_path_falls_through_when_chunk_identity_changed(status: str, stage: str) -> None:
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        assert ConversionWorker(workspace, conversion_id).run(engine=FakeVoice()).status == "completed"
+        job = workspace.read_job(conversion_id)
+        stale = [{**record, "input_hash": "f" * 64} for record in job["completed_chunks"]]
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": status, "stage": stage, "worker": None, "output": None, "completed_chunks": stale})
+        engine = _CountingEngine(); result = ConversionWorker(workspace, conversion_id).run(engine=engine, full_pipeline=False)
+        assert result.status == "completed" and engine.calls >= 1
+        current = workspace.read_job(conversion_id)
+        assert all(record["input_hash"] == chunk.input_hash for record, chunk in zip(current["completed_chunks"], ConversionWorker(workspace, conversion_id)._planned_chunks(current)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v4_synthesis_complete_fast_path_kept_when_chunk_identity_matches() -> None:
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        assert ConversionWorker(workspace, conversion_id).run(engine=FakeVoice()).status == "completed"
+        job = workspace.read_job(conversion_id)
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": "completed", "stage": "synthesis_complete", "worker": None, "output": None})
+        loads: list[str] = []
+        def factory(voice, settings, *, engine, **kwargs): loads.append(voice); return FakeVoice()
+        result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and result.attempts == 0 and loads == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("status,stage", [("completed", "synthesis_complete"), ("assembling", "assembling")])
+def test_v5_phase5_fast_path_falls_through_when_chunk_identity_changed(monkeypatch, status: str, stage: str) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        assert ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+        sanitized: list[bool] = []
+        original_sanitize = ConversionWorker._sanitize_interactive
+        def sanitize(self, current_job, current_chunks):
+            sanitized.append(True); return original_sanitize(self, current_job, current_chunks)
+        monkeypatch.setattr(ConversionWorker, "_sanitize_interactive", sanitize)
+        stale = [{**record, "audio_input_hash": "f" * 64} for record in job["completed_chunks"]]
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": status, "stage": stage, "worker": None, "output": None, "completed_chunks": stale})
+        made.clear(); result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and result.attempts == 3 and len(made) == 3 and sanitized == [True]
+        current = workspace.read_job(conversion_id)
+        assert all(record["audio_input_hash"] == chunk.audio_input_hash for record, chunk in zip(current["completed_chunks"], ConversionWorker(workspace, conversion_id)._planned_chunks(current)))
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_synthesis_complete_fast_path_kept_when_chunk_identity_matches(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        assert ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+        sanitized: list[bool] = []
+        original_sanitize = ConversionWorker._sanitize_interactive
+        def sanitize(self, current_job, current_chunks):
+            sanitized.append(True); return original_sanitize(self, current_job, current_chunks)
+        monkeypatch.setattr(ConversionWorker, "_sanitize_interactive", sanitize)
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": "completed", "stage": "synthesis_complete", "worker": None, "output": None})
+        made.clear(); result = ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert result.status == "completed" and result.attempts == 0 and made == [] and sanitized == []
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_assembling_fast_path_rejects_stale_input_hash_with_matching_audio_hash(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        worker = ConversionWorker(workspace, conversion_id, engine_factory=factory)
+        assert worker.run(full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+        chunks = worker._planned_chunks(job)
+        stale = [{**record, "input_hash": "f" * 64} for record in job["completed_chunks"]]
+        assert all(record["audio_input_hash"] == chunk.audio_input_hash for record, chunk in zip(stale, chunks))
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": "assembling", "stage": "assembling", "worker": None, "output": None, "completed_chunks": stale})
+        for record in stale:
+            (workspace.conversion_path(conversion_id) / record["relative_path"]).unlink()
+        made.clear(); result = worker.run(full_pipeline=False)
+        assert result.status == "completed" and result.attempts == 3 and len(made) == 3
+    finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v5_live_worker_refuses_before_rewriting_the_manifest(monkeypatch) -> None:
+    root, workspace, conversion_id, text, voice_plan, facts, tts = _prepared_v5()
+    try:
+        monkeypatch.setattr(worker_module, "get_generation_facts", lambda voice: facts[voice]); monkeypatch.setattr(worker_module, "registry_revision", lambda: "a" * 64)
+        _configure_v5(workspace, conversion_id, text, voice_plan, facts, tts)
+        made: list[_RecordedVoice] = []
+        def factory(voice, settings, *, engine):
+            loaded = _RecordedVoice(voice, settings); made.append(loaded); return loaded
+        assert ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+        stale = [{**record, "audio_input_hash": "f" * 64} for record in job["completed_chunks"]]
+        atomic_write_json(workspace.job_path(conversion_id), {**job, "status": "cancelled", "stage": "cancelled", "worker": {"pid": os.getpid() + 1, "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}, "completed_chunks": stale})
+        monkeypatch.setattr(worker_module, "pid_is_alive", lambda pid: True)
+        before = workspace.job_path(conversion_id).read_bytes(); made.clear()
+        with pytest.raises(WorkerBusyError):
+            ConversionWorker(workspace, conversion_id, engine_factory=factory).run(full_pipeline=False)
+        assert workspace.job_path(conversion_id).read_bytes() == before and made == []
+        assert workspace.read_job(conversion_id)["completed_chunks"] == stale
+    finally: shutil.rmtree(root, ignore_errors=True)

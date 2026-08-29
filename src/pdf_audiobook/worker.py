@@ -72,17 +72,19 @@ class ConversionWorker:
     def _timestamp() -> str:
         return __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    def _claim(self, job: dict[str, Any]) -> dict[str, Any]:
+    def _refuse_if_busy(self, job: dict[str, Any]) -> None:
         worker = job.get("worker")
         if worker and worker.get("pid") != os.getpid() and pid_is_alive(worker.get("pid", -1)):
             raise WorkerBusyError("a conversion worker is already active")
+
+    def _claim(self, job: dict[str, Any]) -> dict[str, Any]:
+        self._refuse_if_busy(job)
         now = self._timestamp()
         return self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", worker={"pid": os.getpid(), "started_at": now, "updated_at": now}, error=None, last_safe_error=None)
 
     def _claim_phase5(self, job: dict[str, Any]) -> dict[str, Any]:
+        self._refuse_if_busy(job)
         worker = job.get("worker")
-        if worker and worker.get("pid") != os.getpid() and pid_is_alive(worker.get("pid", -1)):
-            raise WorkerBusyError("a conversion worker is already active")
         now = self._timestamp()
         started = worker.get("started_at", now) if worker else now
         return self.workspace.update_generation(self.conversion_id, status="assembling", stage="assembling", worker={"pid": os.getpid(), "started_at": started, "updated_at": now}, error=None, last_safe_error=None)
@@ -195,11 +197,37 @@ class ConversionWorker:
         if verified == job["completed_chunks"] and job["progress"]["completed"] == len(verified):
             return job
         current = verified[-1]["global_index"] + 1 if verified else 0
+        # status/stage move with the truncation: a resume out of a completed or
+        # phase-5 state must not leave "completed" over a shortened chunk list.
         return self.workspace.update_generation(
             self.conversion_id,
+            status="synthesizing",
+            stage="synthesis",
             completed_chunks=verified,
             progress={"completed": len(verified), "current": current, "total": len(chunks)},
         )
+
+    def _phase5_plan_matches(self, job: dict[str, Any], chunks: list[Any], *, interactive: bool) -> bool:
+        """Report whether the recorded chunks still equal the freshly planned identity."""
+
+        records = job["completed_chunks"]
+        if len(records) != len(chunks):
+            return False
+        for record, chunk in zip(records, chunks):
+            expected_path = self._chunk_path(chunk).relative_to(self.workspace.conversion_path(self.conversion_id)).as_posix()
+            if record.get("global_index") != chunk.global_index:
+                return False
+            if record.get("chapter_index") != chunk.chapter_index:
+                return False
+            if record.get("local_index") != chunk.local_index:
+                return False
+            if record.get("input_hash") != chunk.input_hash:
+                return False
+            if record.get("relative_path") != expected_path:
+                return False
+            if interactive and any(record.get(field) != getattr(chunk, field) for field in ("audio_input_hash", "span_id", "speaker_id", "voice_id", "segment_type", "source_start", "source_end")):
+                return False
+        return True
 
     def _run_v4(self, job: dict[str, Any], *, engine: Any | None = None, full_pipeline: bool = True) -> WorkerResult:
         """Run the legacy schema-v4 flow without interactive voice behavior."""
@@ -209,7 +237,10 @@ class ConversionWorker:
         chunks = self._planned_chunks(job)
         if len(chunks) != job["total_chunks"]:
             raise ManifestError("planned chunk count does not match manifest")
-        if job.get("status") in {"assembling", "encoding", "verifying", "publishing"}:
+        # A phase-5 resume is only safe while the recorded chunks still match the
+        # planner; otherwise fall through and regenerate against the new identity.
+        resumable = self._phase5_plan_matches(job, chunks, interactive=False)
+        if resumable and job.get("status") in {"assembling", "encoding", "verifying", "publishing"}:
             if not full_pipeline:
                 return WorkerResult(job["status"], len(job["completed_chunks"]), len(chunks), 0)
             self._claim_phase5(job)
@@ -218,7 +249,7 @@ class ConversionWorker:
             except Phase5Cancelled:
                 return WorkerResult("cancelled", len(job["completed_chunks"]), len(chunks), 0)
             return WorkerResult("completed", len(job["completed_chunks"]), len(chunks), 0)
-        if job.get("status") == "completed" and job.get("stage") == "synthesis_complete" and job.get("output") is None:
+        if resumable and job.get("status") == "completed" and job.get("stage") == "synthesis_complete" and job.get("output") is None:
             if full_pipeline:
                 self._claim_phase5(job)
                 try:
@@ -317,7 +348,10 @@ class ConversionWorker:
         chunks = self._planned_chunks(job)
         if len(chunks) != job["total_chunks"]:
             raise ManifestError("planned chunk count does not match manifest")
-        if job.get("status") in {"assembling", "encoding", "verifying", "publishing"}:
+        # A phase-5 resume is only safe while the recorded chunks still match the
+        # planner; otherwise fall through and regenerate against the new identity.
+        resumable = self._phase5_plan_matches(job, chunks, interactive=True)
+        if resumable and job.get("status") in {"assembling", "encoding", "verifying", "publishing"}:
             if not full_pipeline:
                 return WorkerResult(job["status"], len(job["completed_chunks"]), len(chunks), 0)
             self._claim_phase5(job)
@@ -326,7 +360,7 @@ class ConversionWorker:
             except Phase5Cancelled:
                 return WorkerResult("cancelled", len(job["completed_chunks"]), len(chunks), 0)
             return WorkerResult("completed", len(job["completed_chunks"]), len(chunks), 0)
-        if job.get("status") == "completed" and job.get("stage") == "synthesis_complete" and job.get("output") is None:
+        if resumable and job.get("status") == "completed" and job.get("stage") == "synthesis_complete" and job.get("output") is None:
             if full_pipeline:
                 self._claim_phase5(job)
                 try:
@@ -343,6 +377,7 @@ class ConversionWorker:
         if captured_shaping is not None and captured_shaping != shaping_fingerprint():
             raise ManifestError("voice shaping capability does not match captured generation")
         cast_by_id = {entry["cast_id"]: entry for entry in voice_plan["cast"]}
+        self._refuse_if_busy(job)
         job = self._sanitize_interactive(job, chunks)
         job = self._claim(job)
         attempts_total = 0
