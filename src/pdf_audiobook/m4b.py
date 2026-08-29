@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable
 
 from .audio import validate_wav
 from .chapters import select_chapter_range
-from .tts import EngineMetadata, plan_chunks, plan_interactive_chunks
+from .tts import EngineMetadata, plan_chunks, plan_interactive_chunks, _SENTENCE_FINAL
 from .voice_registry import get_generation_facts, registry_revision
 from .workspace import INTERACTIVE_GENERATION_SCHEMA_VERSION, Workspace, atomic_write_text
 
@@ -246,7 +246,7 @@ class _RF64WaveWriter:
 
 
 def _open_aggregate_wave(raw: Any, *, rate: int, frames: int, data_bytes: int) -> Any:
-    if data_bytes > _RIFF_MAX_SIZE:
+    if data_bytes + 36 > _RIFF_MAX_SIZE:   # RIFF size field is 36 + data_bytes
         return _RF64WaveWriter(raw, rate=rate, frames=frames, data_bytes=data_bytes)
     output = wave.open(raw, "wb")
     output.setnchannels(1); output.setsampwidth(2); output.setframerate(rate)
@@ -256,7 +256,12 @@ def _open_aggregate_wave(raw: Any, *, rate: int, frames: int, data_bytes: int) -
 def _pause_frames(rate: int, chunk: Any, next_chunk: Any | None) -> int:
     if next_chunk is None:
         return 0
-    pause_ms = CHAPTER_PAUSE_MS if next_chunk.chapter_index != chunk.chapter_index else (PARAGRAPH_PAUSE_MS if _paragraph_boundary(chunk.text) else ORDINARY_PAUSE_MS)
+    if next_chunk.chapter_index != chunk.chapter_index:
+        pause_ms = CHAPTER_PAUSE_MS
+    elif _paragraph_boundary(chunk.text):
+        pause_ms = PARAGRAPH_PAUSE_MS if _SENTENCE_FINAL.search(chunk.text.rstrip()) else 0
+    else:
+        pause_ms = ORDINARY_PAUSE_MS
     return round(rate * pause_ms / 1000)
 
 
@@ -295,7 +300,10 @@ def assemble_chapters(workspace: Workspace, conversion_id: str) -> AssemblyResul
                         chapter_title = chapter_by_index.get(chapter_index, f"Chapter {chapter_index}")
                         chapter_start = frames_total
                     with wave.open(str(path), "rb") as source:
-                        output.writeframes(source.readframes(info.frames))
+                        pcm = source.readframes(info.frames)
+                    if len(pcm) != info.frames * 2:
+                        raise M4BError("completed chunk WAV is shorter than its recorded frame count")
+                    output.writeframes(pcm)
                     frames_total += info.frames
                     next_item = ordered[position + 1] if position + 1 < len(ordered) else None
                     if next_item is not None:
@@ -307,6 +315,8 @@ def assemble_chapters(workspace: Workspace, conversion_id: str) -> AssemblyResul
                 if chapter_index is not None and chapter_start is not None:
                     chapters.append(ChapterTiming(chapter_index, chapter_title, chapter_start, frames_total, rate))
             raw.flush(); os.fsync(raw.fileno())
+        if frames_total != aggregate_frames:
+            raise M4BError("assembled frame count does not match the declared header")
         os.replace(temporary, destination)
         return AssemblyResult(destination, rate, frames_total, tuple(chapters))
     finally:
@@ -379,7 +389,7 @@ def _run(command_runner: Callable[..., Any] | None, argv: list[str]) -> Any:
 def encode_m4b(assembly: AssemblyResult, metadata_path: Path, destination: Path, *, command_runner: Callable[..., Any] | None = None) -> Path:
     _prepare_working_file(destination)
     ffmpeg = discover_tool("ffmpeg", "PDF_AUDIOBOOK_FFMPEG")
-    argv = [ffmpeg, "-y", "-i", str(assembly.path), "-f", "ffmetadata", "-i", str(metadata_path), "-map", "0:a:0", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "aac", "-af", "loudnorm=I=-18:TP=-3:LRA=11", "-movflags", "+faststart", str(destination)]
+    argv = [ffmpeg, "-y", "-i", str(assembly.path), "-f", "ffmetadata", "-i", str(metadata_path), "-map", "0:a:0", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "aac", "-af", "loudnorm=I=-18:TP=-3:LRA=11", "-ar", str(assembly.sample_rate), "-movflags", "+faststart", str(destination)]
     result = _run(command_runner, argv)
     if type(getattr(result, "returncode", None)) is not int or result.returncode != 0:
         raise M4BError("ffmpeg encoding failed")
@@ -403,8 +413,22 @@ def verify_m4b(path: Path, chapters: Iterable[ChapterTiming], *, command_runner:
     if not isinstance(payload, dict):
         raise M4BError("ffprobe JSON must be an object")
     streams = payload.get("streams")
-    if not isinstance(streams, list) or not any(isinstance(item, dict) and item.get("codec_name") == "aac" for item in streams):
+    audio = next((item for item in streams if isinstance(item, dict) and item.get("codec_name") == "aac"), None) if isinstance(streams, list) else None
+    if audio is None:
         raise M4BError("output does not contain AAC audio")
+    expected = tuple(chapters)
+    try:
+        rates = tuple(item.sample_rate for item in expected)
+    except AttributeError:
+        raise M4BError("expected sample rate is missing") from None
+    if not rates or any(type(rate) is not int or rate <= 0 for rate in rates) or len(set(rates)) != 1:
+        raise M4BError("expected sample rate is missing or ambiguous")
+    try:
+        actual_rate = int(audio.get("sample_rate"))
+    except (TypeError, ValueError):
+        raise M4BError("output sample rate is missing or invalid") from None
+    if actual_rate != rates[0]:
+        raise M4BError("output sample rate does not match the assembled audio")
     fmt = payload.get("format") if isinstance(payload.get("format"), dict) else {}
     try:
         duration = float(fmt.get("duration"))
@@ -417,7 +441,6 @@ def verify_m4b(path: Path, chapters: Iterable[ChapterTiming], *, command_runner:
                 continue
     if not math.isfinite(duration) or duration <= 0:
         raise M4BError("output duration is invalid")
-    expected = tuple(chapters)
     expected_bounds = _chapter_bounds_ms(expected)
     actual = payload.get("chapters")
     if not isinstance(actual, list) or len(actual) != len(expected):

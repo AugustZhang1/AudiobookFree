@@ -24,7 +24,7 @@ from pdf_audiobook.m4b import (
     verify_m4b,
     finalize_conversion,
 )
-from pdf_audiobook.m4b import _open_aggregate_wave
+from pdf_audiobook.m4b import _open_aggregate_wave, _pause_frames
 from pdf_audiobook.audio import write_pcm_wav
 from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks
 from pdf_audiobook.chapters import select_chapter_range
@@ -138,7 +138,7 @@ def test_metadata_and_verification_use_contiguous_pause_boundary(monkeypatch) ->
     assert "START=39900" in metadata and "END=50000" in metadata
 
     root = Path("tests") / f".pytest-phase5-contiguous-{uuid.uuid4().hex}"; root.mkdir(); output = root / "out.m4b"; output.write_bytes(b"m4b")
-    payload = {"format": {"duration": "50.0"}, "streams": [{"codec_name": "aac"}], "chapters": [{"start_time": "0", "end_time": "39.9", "tags": {"title": "One"}}, {"start_time": "39.9", "end_time": "50.0", "tags": {"title": "Two"}}]}
+    payload = {"format": {"duration": "50.0"}, "streams": [{"codec_name": "aac", "sample_rate": "1000"}], "chapters": [{"start_time": "0", "end_time": "39.9", "tags": {"title": "One"}}, {"start_time": "39.9", "end_time": "50.0", "tags": {"title": "Two"}}]}
     monkeypatch.setattr("pdf_audiobook.m4b.discover_tool", lambda name, *_: name)
     def runner(argv: list[str], **_kwargs):
         if "ffprobe" in argv[0]: return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
@@ -175,6 +175,7 @@ def test_encode_argv_and_tool_failure_are_injected() -> None:
     try:
         output = encode_m4b(AssemblyResult(root / "assembly.wav", 24000, 24000, assembly.chapters), metadata, root / "out.m4b", command_runner=runner)
         assert output.is_file() and "-f" in calls[0] and "ffmetadata" in calls[0] and "+faststart" in calls[0] and "loudnorm=I=-18:TP=-3:LRA=11" in calls[0]
+        assert calls[0][calls[0].index("-ar") + 1] == "24000"
     finally:
         m4b.discover_tool = old; shutil.rmtree(root, ignore_errors=True)
 
@@ -182,7 +183,7 @@ def test_encode_argv_and_tool_failure_are_injected() -> None:
 def test_verify_success_and_malformed_probe_decode_or_chapter_failures() -> None:
     root = Path("tests") / f".pytest-phase5-verify-{uuid.uuid4().hex}"; root.mkdir(); output = root / "out.m4b"; output.write_bytes(b"m4b")
     chapter = ChapterTiming(1, "Book", 0, 24000, 24000)
-    payload = {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac"}], "chapters": [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]}
+    payload = {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac", "sample_rate": "24000"}], "chapters": [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]}
     def runner(argv: list[str], **_kwargs):
         if "ffprobe" in argv[0]: return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
         return SimpleNamespace(returncode=0, stdout="")
@@ -191,7 +192,7 @@ def test_verify_success_and_malformed_probe_decode_or_chapter_failures() -> None
     try:
         assert verify_m4b(output, [chapter], command_runner=runner).codec == "aac"
         for bad in ("{", json.dumps({**payload, "streams": [{"codec_name": "mp3"}]}), json.dumps({**payload, "chapters": []}), json.dumps({**payload, "format": {"duration": "nan"}})):
-            payload["streams"] = [{"codec_name": "aac"}]; payload["chapters"] = [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]; payload["format"] = {"duration": "1.0"}
+            payload["streams"] = [{"codec_name": "aac", "sample_rate": "24000"}]; payload["chapters"] = [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]; payload["format"] = {"duration": "1.0"}
             def bad_runner(argv: list[str], **_kwargs):
                 if "ffprobe" in argv[0]: return SimpleNamespace(returncode=0, stdout=bad)
                 return SimpleNamespace(returncode=1, stdout="")
@@ -293,7 +294,7 @@ def test_probe_nonobject_decode_failure_and_timestamp_errors(monkeypatch) -> Non
     root = Path("tests") / f".pytest-phase5-probe-{uuid.uuid4().hex}"; root.mkdir()
     try:
         output = root / "out.m4b"; output.write_bytes(b"m4b"); chapter = ChapterTiming(1, "Book", 0, 24000, 24000)
-        payload = {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac"}], "chapters": [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]}
+        payload = {"format": {"duration": "1.0"}, "streams": [{"codec_name": "aac", "sample_rate": "24000"}], "chapters": [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]}
         monkeypatch.setattr("pdf_audiobook.m4b.discover_tool", lambda name, *_: name)
         def runner(argv: list[str], **_kwargs):
             if "ffprobe" in argv[0]: return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
@@ -437,5 +438,128 @@ def test_v5_registry_and_wav_tampering_are_rejected(monkeypatch) -> None:
         path.write_bytes(b"not-wav")
         with pytest.raises((M4BError, ValueError)):
             assemble_chapters(workspace, "conversion")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pause_frames_covers_every_boundary_row() -> None:
+    following = SimpleNamespace(chapter_index=1, text="Next.")
+    assert _pause_frames(24000, SimpleNamespace(chapter_index=1, text="He said."), None) == 0
+    assert _pause_frames(24000, SimpleNamespace(chapter_index=1, text="He said."), SimpleNamespace(chapter_index=2, text="Next.")) == round(24000 * 750 / 1000)
+    assert _pause_frames(24000, SimpleNamespace(chapter_index=1, text="He said.\n\n"), following) == round(24000 * 400 / 1000)
+    assert _pause_frames(24000, SimpleNamespace(chapter_index=1, text="He said,\n\n"), following) == 0
+    assert _pause_frames(24000, SimpleNamespace(chapter_index=1, text="He said. "), following) == round(24000 * 150 / 1000)
+
+
+def test_aggregate_wave_riff_cutoff_accounts_for_the_riff_header() -> None:
+    below_bytes = 0xFFFFFFFF - 37; below = BytesIO()
+    with _open_aggregate_wave(below, rate=24000, frames=below_bytes // 2, data_bytes=below_bytes) as output:
+        output.writeframes(b"\0\0")
+    assert below.getvalue()[:4] == b"RIFF"
+    above_bytes = 0xFFFFFFFF - 35; above = BytesIO()
+    with _open_aggregate_wave(above, rate=24000, frames=above_bytes // 2, data_bytes=above_bytes) as output:
+        output.writeframes(b"\0\0")
+    assert above.getvalue()[:4] == b"RF64"
+
+
+def test_verify_checks_sample_rate_against_the_assembled_audio(monkeypatch) -> None:
+    root = Path("tests") / f".pytest-phase5-rate-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        output = root / "out.m4b"; output.write_bytes(b"m4b"); chapter = ChapterTiming(1, "Book", 0, 24000, 24000)
+        monkeypatch.setattr("pdf_audiobook.m4b.discover_tool", lambda name, *_: name)
+        def probe(stream: dict):
+            payload = {"format": {"duration": "1.0"}, "streams": [stream], "chapters": [{"start_time": "0", "end_time": "1", "tags": {"title": "Book"}}]}
+            return lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload)) if "ffprobe" in argv[0] else SimpleNamespace(returncode=0, stdout="")
+        good = probe({"codec_name": "aac", "sample_rate": "24000"})
+        assert verify_m4b(output, [chapter], command_runner=good).codec == "aac"
+        for stream in ({"codec_name": "aac", "sample_rate": "44100"}, {"codec_name": "aac"}, {"codec_name": "aac", "sample_rate": "abc"}):
+            with pytest.raises(M4BError): verify_m4b(output, [chapter], command_runner=probe(stream))
+        for expected in ([object()], [SimpleNamespace(sample_rate=0)], [SimpleNamespace(sample_rate="24000")], []):
+            with pytest.raises(M4BError): verify_m4b(output, expected, command_runner=good)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_short_chunk_read_is_rejected_before_publication(monkeypatch) -> None:
+    workspace, job, _chunks, root = _v5_fixture(monkeypatch)
+    try:
+        path = root / job["completed_chunks"][0]["relative_path"]
+        path.write_bytes(path.read_bytes()[:-2])
+        job["completed_chunks"][0]["wav_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with pytest.raises(M4BError, match="shorter than its recorded frame count"):
+            assemble_chapters(workspace, "conversion")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_non_sentence_final_paragraph_join_adds_no_pause(monkeypatch) -> None:
+    import pdf_audiobook.m4b as m4b
+
+    text = "One. He continued\n\nSo it goes."
+    split = text.index("He"); para = text.index("So")
+    chapter_plan = {
+        "schema_version": 1,
+        "mode": "original",
+        "requested_count": None,
+        "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "warnings": [],
+        "chapters": [
+            {"index": 1, "title": "One", "start_offset": 0, "end_offset": split, "start_page": 1, "end_page": 1, "source_type": "original", "word_count": 1},
+            {"index": 2, "title": "Two", "start_offset": split, "end_offset": len(text), "start_page": 1, "end_page": 1, "source_type": "original", "word_count": 5},
+        ],
+    }
+    voice_plan = with_canonical_artifact_hash({
+        "schema_version": 1,
+        "artifact": "voice-plan",
+        "revision": 2,
+        "approval": {"state": "approved", "approved_revision": 2},
+        "cast": [{"cast_id": "narrator", "voice_id": "af_heart", "voice_settings": {"speed": 1.0}}],
+        "chapters": [
+            {"chapter_index": 1, "source_start": 0, "source_end": split, "spans": [{"span_id": "s1", "source_start": 0, "source_end": split, "type": "narration", "speaker_id": "narrator"}]},
+            {"chapter_index": 2, "source_start": split, "source_end": len(text), "spans": [
+                {"span_id": "s2", "source_start": split, "source_end": para, "type": "narration", "speaker_id": "narrator"},
+                {"span_id": "s3", "source_start": para, "source_end": len(text), "type": "dialogue", "speaker_id": "narrator"},
+            ]},
+        ],
+    })
+    facts = {"af_heart": {"id": "af_heart", "engine": "kokoro", "package": "kokoro", "package_version": "0.9.4", "model": "model", "model_revision": "r1", "model_checksum": "m1", "voice_version": "v1", "voice_checksum": "w1", "sample_rate": 24000, "enabled": True}}
+    registry = "a" * 64
+    monkeypatch.setattr(m4b, "get_generation_facts", lambda voice_id: facts[voice_id])
+    monkeypatch.setattr(m4b, "registry_revision", lambda: registry)
+    chunks = plan_interactive_chunks(text, voice_plan, facts, registry, chapter_range=(2, 2), cap=900)
+    root = Path("tests") / f".pytest-phase5-nonfinal-{uuid.uuid4().hex}"
+    root.mkdir()
+    records = []
+    for chunk in chunks:
+        path = root / f"chunks/chapter-{chunk.chapter_index:03d}-chunk-{chunk.local_index:04d}.wav"
+        info = write_pcm_wav(path, b"\0\0" * 240, 24000)
+        records.append({**chunk.manifest_record(path.relative_to(root).as_posix(), info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    job = {
+        "schema_version": 5,
+        "tts": {"sample_rate": 24000, "chunk_cap": 900, "settings": {"chapter_start": 2, "chapter_end": 2}},
+        "total_chunks": len(chunks),
+        "completed_chunks": records,
+        "voice_plan_sha256": voice_plan["canonical_artifact_sha256"],
+        "voice_plan_revision": voice_plan["revision"],
+        "speaker_analysis_sha256": "b" * 64,
+        "cast_voice_ids": ["af_heart"],
+        "voice_registry_revision": registry,
+    }
+
+    class FakeWorkspace:
+        def read_job(self, _conversion_id): return job
+        def load_cleaned_artifacts(self, _conversion_id): return text, []
+        def load_chapter_plan(self, _conversion_id): return chapter_plan
+        def load_voice_plan(self, _conversion_id): return voice_plan
+        def load_speaker_analysis(self, _conversion_id): return {"canonical_artifact_sha256": "b" * 64, "revision": 3}
+        def conversion_path(self, _conversion_id): return root
+
+    try:
+        ordered = m4b._recorded_chunks(FakeWorkspace(), "conversion")[0]
+        assert len(ordered) == 2 and [chunk.chapter_index for chunk, _, _ in ordered] == [2, 2]
+        assert ordered[0][0].text.endswith("continued\n\n")
+        assert _pause_frames(24000, ordered[0][0], ordered[1][0]) == 0
+        assembly = assemble_chapters(FakeWorkspace(), "conversion")
+        assert assembly.frames == sum(info.frames for _, _, info in ordered)
     finally:
         shutil.rmtree(root, ignore_errors=True)
