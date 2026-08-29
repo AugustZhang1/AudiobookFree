@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterator
 
 from .chapters import create_chapter_plan
 from .pdf import analyze_pdf
+from .preview_worker import generate_preview
+from .security import pid_is_alive
 from .tts import EngineMetadata, KokoroVoice, SynthesisSettings, plan_chunks
 from .voice_registry import APPROVED_VOICE_IDS
 from .worker import ConversionWorker, WorkerResult
@@ -96,11 +98,28 @@ def _request_mode(mode: str, count: int | None) -> tuple[str, int | None]:
     return mode, None
 
 
-def _expected_tts(cleaned_text: str, plan: dict[str, Any], voice: str, speed: float) -> tuple[dict[str, Any], int]:
+def _normalized_speed(speed: Any) -> float:
+    """Coerce a caller-supplied speed exactly once, so validation binds the value that is used."""
+
+    if isinstance(speed, bool):
+        raise ColabError("speed must be between 0.5 and 2.0")
+    try:
+        return float(speed)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ColabError("speed must be between 0.5 and 2.0") from exc
+
+
+def _validate_voice_speed(voice: str, speed: float) -> None:
+    """Reject an unapproved voice or an out-of-range speed before any mutation."""
+
     if voice not in APPROVED_VOICE_IDS:
         raise ColabError(f"voice is not approved: {voice}")
     if not math.isfinite(speed) or not 0.5 <= speed <= 2.0:
         raise ColabError("speed must be between 0.5 and 2.0")
+
+
+def _expected_tts(cleaned_text: str, plan: dict[str, Any], voice: str, speed: float) -> tuple[dict[str, Any], int]:
+    _validate_voice_speed(voice, speed)
     settings = SynthesisSettings(speed=speed)
     metadata = EngineMetadata(
         "kokoro", "0.9.4", "hexgrad/Kokoro-82M", "captured-at-download", "unrecorded",
@@ -115,7 +134,7 @@ def _ensure_chapter_plan(workspace: Workspace, conversion_id: str, mode: str, co
     if job.get("chapter_plan_sha256") is not None:
         plan = workspace.load_chapter_plan(conversion_id)
         if plan.get("mode") != mode or plan.get("requested_count") != count:
-            raise ColabConflictError("active conversion has a different chapter configuration; resume it with the original settings")
+            raise ColabConflictError("active conversion has a different chapter configuration; resume it with the original settings, or pass start_new (--start-new) to discard it")
         return plan
     analysis = workspace.load_analysis(conversion_id)
     cleaned_text, cleaned_map = workspace.load_cleaned_artifacts(conversion_id)
@@ -133,6 +152,36 @@ def _ensure_chapter_plan(workspace: Workspace, conversion_id: str, mode: str, co
 
 def _print_progress(line: str) -> None:
     print(line, flush=True)
+
+
+def _discard_active_conversion(workspace: Workspace, inspection: Any) -> None:
+    """Delete the active conversion, refusing while a recorded worker is alive."""
+
+    if inspection.state == "resumable":
+        conversion_id = inspection.conversion_id
+        job = workspace.read_job(conversion_id) if conversion_id else {}
+        worker = job.get("worker")
+        pid = worker.get("pid") if isinstance(worker, dict) else None
+        if type(pid) is int and pid_is_alive(pid):
+            raise ColabError("a conversion worker is still running for the active conversion; stop it before starting a new one")
+        completed = job.get("completed_chunks")
+        done = len(completed) if isinstance(completed, list) else 0
+        _print_progress(
+            f"Starting new: discarding active conversion {conversion_id} with {done} completed chunk(s). "
+            "This deletes the whole active conversion tree - source copy, analysis, chapter plan and chunk WAVs. "
+            "An already-published M4B is not affected."
+        )
+    else:
+        _print_progress(
+            "Starting new: discarding an invalid active workspace. The live-worker check could not be performed "
+            "because the manifest did not validate. If active.json itself is malformed, only the active pointer is "
+            "removed, which frees the workspace but may leave the old conversion tree orphaned on disk. "
+            "An already-published M4B is not affected."
+        )
+    try:
+        workspace.delete_active_state()
+    except WorkspaceError as exc:
+        raise ColabError(f"the previous conversion could not be discarded: {exc}") from exc
 
 
 class ColabProgressDisplay:
@@ -240,6 +289,7 @@ def run_conversion(
     speed: float = 1.0,
     chapter_mode: str = "original",
     chapter_count: int | None = None,
+    start_new: bool = False,
     cuda_check: Callable[[], Any] = _cuda_module,
     analyzer: Callable[..., dict[str, Any]] = analyze_pdf,
     worker_class: Callable[..., Any] = ConversionWorker,
@@ -247,16 +297,27 @@ def run_conversion(
 ) -> Path:
     """Analyze, synthesize, and publish one PDF, resuming only a match."""
 
+    if type(start_new) is not bool:
+        raise ColabError("start_new must be a boolean")
     source = Path(pdf).expanduser().resolve()
     if not source.is_file():
         raise ColabError("PDF path does not exist or is not a regular file")
     mode, count = _request_mode(chapter_mode, chapter_count)
+    # Every request-level check runs before the workspace is touched, so a bad
+    # voice or speed can never destroy checkpoints on the start_new path.  The
+    # speed is coerced exactly once here, so validation binds the same value the
+    # rest of the run uses even for an object with a stateful __float__.
+    requested_speed = _normalized_speed(speed)
+    _validate_voice_speed(voice, requested_speed)
     cuda_check()
     workspace = Workspace(Path(workspace_root).expanduser())
     output = Path(output_dir).expanduser().absolute()
     inspection = workspace.inspect_startup()
+    if start_new and inspection.state != "no_active":
+        _discard_active_conversion(workspace, inspection)
+        inspection = workspace.inspect_startup()
     if inspection.state == "invalid":
-        raise ColabError(f"active workspace is invalid: {inspection.reason or 'manifest validation failed'}")
+        raise ColabError(f"active workspace is invalid: {inspection.reason or 'manifest validation failed'}; pass start_new (--start-new) to discard it and start over")
 
     resumed = inspection.state == "resumable"
     if resumed:
@@ -265,7 +326,7 @@ def run_conversion(
         conversion_id = inspection.conversion_id
         job = workspace.read_job(conversion_id)
         if job["source_pdf_sha256"] != _sha256(source):
-            raise ColabConflictError("active conversion uses a different PDF; no files were changed")
+            raise ColabConflictError("active conversion uses a different PDF; no files were changed. Pass start_new (--start-new) to discard it")
     else:
         try:
             manifest = workspace.create_conversion(source, original_display_filename=source.name)
@@ -287,10 +348,10 @@ def run_conversion(
 
     plan = _ensure_chapter_plan(workspace, conversion_id, mode, count)
     cleaned_text, _ = workspace.load_cleaned_artifacts(conversion_id)
-    tts, total_chunks = _expected_tts(cleaned_text, plan, voice, float(speed))
+    tts, total_chunks = _expected_tts(cleaned_text, plan, voice, requested_speed)
     job = workspace.read_job(conversion_id)
     if job.get("schema_version") == 4 and (job.get("tts") != tts or job.get("total_chunks") != total_chunks):
-        raise ColabConflictError("active conversion has different voice, speed, or chunk settings; no files were changed")
+        raise ColabConflictError("active conversion has different voice, speed, or chunk settings; no files were changed. Pass start_new (--start-new) to discard it")
     # A fully completed generation is immutable. Validation above still binds
     # this request to its source, plan, voice, speed, and chunk count, but the
     # existing verified publication must be returned without reconfiguration.
@@ -314,20 +375,66 @@ def run_conversion(
     return Path(final_output["path"])
 
 
+def preview_voice(
+    voice: str,
+    target: str | os.PathLike[str],
+    *,
+    speed: float = 1.0,
+    cuda_check: Callable[[], Any] = _cuda_module,
+    engine_factory: Callable[..., Any] | None = None,
+    preview: Callable[..., Path] = generate_preview,
+) -> Path:
+    """Render one short preview WAV for a voice without touching a workspace."""
+
+    requested_speed = _normalized_speed(speed)
+    _validate_voice_speed(voice, requested_speed)
+    cuda_check()
+    destination = Path(target).expanduser().absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    factory = engine_factory or make_cuda_kokoro_factory()
+    try:
+        return preview(voice, destination, settings={"speed": requested_speed}, voice_loader=factory)
+    except ColabError:
+        raise
+    except Exception as exc:
+        raise ColabError(f"voice preview failed for {voice}") from exc
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one Single Voice Kokoro audiobook conversion on a CUDA runtime")
-    parser.add_argument("pdf", type=Path)
+    parser.add_argument("pdf", type=Path, nargs="?")
     parser.add_argument("--workspace-root", type=Path, default=Path("/content/pdf-audiobook-workspace"))
     parser.add_argument("--output-dir", type=Path, default=Path("/content/pdf-audiobook-output"))
     parser.add_argument("--voice", choices=APPROVED_VOICE_IDS, default="af_heart")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--chapter-mode", choices=("original", "whole", "custom"), default="original")
     parser.add_argument("--chapter-count", type=int)
+    parser.add_argument(
+        "--start-new",
+        action="store_true",
+        help=(
+            "Discard the entire active conversion - source copy, analysis, chapter plan and chunk WAVs - "
+            "before starting, so a new voice, speed or chapter configuration can be used. "
+            "An already-published M4B is not affected."
+        ),
+    )
+    parser.add_argument("--preview-out", type=Path, help="Render a short voice preview WAV to this path and exit; no PDF is needed")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.preview_out is not None:
+        try:
+            sample = preview_voice(args.voice, args.preview_out, speed=args.speed)
+        except (ColabError, OSError, ValueError) as exc:
+            print(f"Colab voice preview failed: {exc}")
+            return 2
+        print(f"Preview WAV: {sample}")
+        return 0
+    if args.pdf is None:
+        print("Colab conversion failed: a PDF path is required unless --preview-out is used")
+        return 2
     try:
         result = run_conversion(
             args.pdf,
@@ -337,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
             speed=args.speed,
             chapter_mode=args.chapter_mode,
             chapter_count=args.chapter_count,
+            start_new=args.start_new,
         )
     except (ColabError, ManifestError, WorkspaceError, OSError, ValueError) as exc:
         print(f"Colab conversion failed: {exc}")
@@ -349,4 +457,4 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "run_conversion"]
+__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "preview_voice", "run_conversion"]
