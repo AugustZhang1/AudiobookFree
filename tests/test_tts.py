@@ -325,6 +325,19 @@ def test_chunk_hash_changes_for_every_output_setting() -> None:
     assert chunk_input_hash("changed", metadata) != original
 
 
+def test_chunk_hash_binds_kokoro_implementation_only(monkeypatch) -> None:
+    metadata_by_engine = {}
+    for engine in ("kokoro", "chatterbox", "fake"):
+        metadata = _metadata().as_dict()
+        metadata["engine"] = engine
+        metadata_by_engine[engine] = metadata
+    original = {engine: chunk_input_hash("same", metadata) for engine, metadata in metadata_by_engine.items()}
+    monkeypatch.setattr(tts, "KOKORO_SYNTHESIS_IMPLEMENTATION", "kokoro-synthesis-v3")
+    assert chunk_input_hash("same", metadata_by_engine["kokoro"]) != original["kokoro"]
+    assert chunk_input_hash("same", metadata_by_engine["chatterbox"]) == original["chatterbox"]
+    assert chunk_input_hash("same", metadata_by_engine["fake"]) == original["fake"]
+
+
 def test_short_sentences_group_to_soft_cap_but_long_sentence_stays_intact() -> None:
     text = "One. Two. Three. Four. " + ("Long " * 80) + ". Tail."
     chunks = plan_chunks(text, [{"index": 1, "start_offset": 0, "end_offset": len(text)}], _metadata(), cap=24)
@@ -439,6 +452,132 @@ def test_kokoro_speakable_text_without_pipeline_output_still_raises() -> None:
         _fake_kokoro_voice(Pipeline(), events).synthesize("hello")
     assert calls == ["hello"]
     assert events == ["inference-enter", "inference-exit"]
+
+
+def test_flowed_paragraphs_flows_wrapped_lines() -> None:
+    assert tts.flowed_paragraphs("A wrapped\nline.") == ["A wrapped line."]
+
+
+def test_flowed_paragraphs_preserves_blank_line_breaks() -> None:
+    assert tts.flowed_paragraphs("First.\n\nSecond.") == ["First.", "Second."]
+
+
+def test_flowed_paragraphs_drops_whitespace_only_blocks() -> None:
+    assert tts.flowed_paragraphs(" \n\t\n\n First. \n\n \t ") == ["First."]
+
+
+def test_flowed_paragraphs_preserves_leading_chapter_heading() -> None:
+    assert tts.flowed_paragraphs("Chapter 1\nThe opening\ncontinues.") == ["Chapter 1", "The opening continues."]
+
+
+def test_flowed_paragraphs_peels_consecutive_leading_headings() -> None:
+    assert tts.flowed_paragraphs("Part I\nChapter 1\nThe opening.") == ["Part I", "Chapter 1", "The opening."]
+
+
+def test_flowed_paragraphs_keeps_heading_only_block_single() -> None:
+    assert tts.flowed_paragraphs("Chapter 1") == ["Chapter 1"]
+    assert tts.flowed_paragraphs("Part I\nChapter 1") == ["Part I", "Chapter 1"]
+
+
+def test_flowed_paragraphs_flows_nonmatching_heading_into_body() -> None:
+    assert tts.flowed_paragraphs("PROLOGUE\nThe opening continues.") == ["PROLOGUE The opening continues."]
+
+
+def test_kokoro_synthesizes_one_flowed_paragraph_per_pipeline_call() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    events: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **kwargs: object):
+            calls.append((text, kwargs))
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), events).synthesize("First wrapped\nline.\n\nSecond")
+    assert calls == [
+        ("First wrapped line.", {"voice": "af_heart", "speed": 1.0, "split_pattern": None}),
+        ("Second", {"voice": "af_heart", "speed": 1.0, "split_pattern": None}),
+    ]
+    assert pcm == b"\x00\x00" * 402
+    assert events == ["inference-enter", "inference-exit"]
+
+
+@pytest.mark.parametrize("ending", ['."', "!)", '\u2026"'])
+def test_kokoro_adds_400ms_pause_after_sentence_final_paragraph(ending: str) -> None:
+    calls: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), []).synthesize(f"First{ending}\n\nSecond")
+    assert pcm == b"\x00\x00" + (b"\x00\x00" * 400) + b"\x00\x00"
+    assert calls == [f"First{ending}", "Second"]
+
+
+def test_kokoro_does_not_pause_after_non_sentence_final_paragraph() -> None:
+    calls: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), []).synthesize("First\n\nSecond")
+    assert pcm == b"\x00\x00" * 2
+    assert calls == ["First", "Second"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_length"),
+    [("Chapter 1\nBody", 4), ("Chapter 1.\nBody", 804)],
+)
+def test_kokoro_heading_sentence_final_controls_pause(text: str, expected_length: int) -> None:
+    calls: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), []).synthesize(text)
+    assert len(pcm) == expected_length
+    assert calls == ["Chapter 1" if text.startswith("Chapter 1\n") else "Chapter 1.", "Body"]
+
+
+def test_kokoro_does_not_add_trailing_paragraph_pause() -> None:
+    class Pipeline:
+        def __call__(self, *_args: object, **_kwargs: object):
+            return iter([[0.0]])
+
+    assert _fake_kokoro_voice(Pipeline(), []).synthesize("First.\n\n") == b"\x00\x00"
+
+
+def test_kokoro_filters_non_alphanumeric_scene_break_blocks() -> None:
+    calls: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]])
+
+    pcm = _fake_kokoro_voice(Pipeline(), []).synthesize("First.\n\n***\n\nSecond.")
+    assert calls == ["First.", "Second."]
+    assert len(pcm) == 804
+
+
+def test_kokoro_surviving_no_audio_paragraph_raises_exact_message() -> None:
+    calls: list[str] = []
+
+    class Pipeline:
+        def __call__(self, text: str, **_kwargs: object):
+            calls.append(text)
+            return iter([[0.0]]) if text == "First." else iter(())
+
+    with pytest.raises(RuntimeError) as error:
+        _fake_kokoro_voice(Pipeline(), []).synthesize("First.\n\nSecond.")
+    assert str(error.value) == "Kokoro returned no audio"
+    assert calls == ["First.", "Second."]
 
 
 @pytest.mark.parametrize(("cpu_count", "expected_threads"), ((16, 8), (4, 4)))
@@ -595,6 +734,22 @@ def test_interactive_audio_hash_reuse_excludes_plan_and_registry_revisions() -> 
     assert revised.input_hash != baseline.input_hash
     assert registry_changed.input_hash != baseline.input_hash
     assert revised.audio_input_hash == baseline.audio_input_hash == registry_changed.audio_input_hash
+
+
+def test_interactive_hash_binds_kokoro_implementation_only(monkeypatch) -> None:
+    text = "One."
+    span = {"span_id": "s", "source_start": 0, "source_end": len(text), "type": "narration", "speaker_id": "narrator"}
+    kokoro = plan_interactive_chunks(text, _interactive_plan(text, [span]), _interactive_facts(), "a" * 64, cap=100)[0]
+    non_kokoro_facts = _interactive_facts()
+    non_kokoro_facts["af_heart"] = {**non_kokoro_facts["af_heart"], "engine": "fake"}
+    non_kokoro = plan_interactive_chunks(text, _interactive_plan(text, [span]), non_kokoro_facts, "a" * 64, cap=100)[0]
+    monkeypatch.setattr(tts, "KOKORO_SYNTHESIS_IMPLEMENTATION", "kokoro-synthesis-v3")
+    changed_kokoro = plan_interactive_chunks(text, _interactive_plan(text, [span]), _interactive_facts(), "a" * 64, cap=100)[0]
+    changed_non_kokoro = plan_interactive_chunks(text, _interactive_plan(text, [span]), non_kokoro_facts, "a" * 64, cap=100)[0]
+    assert changed_kokoro.audio_input_hash != kokoro.audio_input_hash
+    assert changed_kokoro.input_hash != kokoro.input_hash
+    assert changed_non_kokoro.audio_input_hash == non_kokoro.audio_input_hash
+    assert changed_non_kokoro.input_hash == non_kokoro.input_hash
 
 
 def test_interactive_audio_hash_changes_for_voice_settings_model_text_and_offsets() -> None:

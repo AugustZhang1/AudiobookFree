@@ -45,12 +45,43 @@ DEFAULT_TORCH_THREADS = 8
 TORCH_THREADS_ENV = "PDF_AUDIOBOOK_TORCH_THREADS"
 CHUNK_MODES = ("chapter", "legacy")
 _KOKORO_SILENCE_DURATION_SECONDS = 0.05
+KOKORO_SYNTHESIS_IMPLEMENTATION = "kokoro-synthesis-v2"
+_KOKORO_PARAGRAPH_PAUSE_SECONDS = 0.4  # matches m4b.PARAGRAPH_PAUSE_MS
+_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n+")
+_WRAPPED_LINE = re.compile(r"[ \t]*\n[ \t]*")
+_SENTENCE_FINAL = re.compile(r"""[.!?…]["'’”»›)\]}]*\Z""")
+# Mirrors chapters.py:18 deliberately: importing it would couple narration
+# hashes to the chapter planner's heading rule.
+_HEADING_LINE = re.compile(r"^(?:chapter|part|section)\b(?:\s+.*)?$", re.IGNORECASE)
 
 
-def _silence_pcm(sample_rate: int) -> bytes:
-    """Return 50 ms of deterministic mono signed-16-bit silence."""
+def flowed_paragraphs(text: str) -> list[str]:
+    """Split on blank lines; flow a surviving single newline into a space.
 
-    frames = max(1, round(sample_rate * _KOKORO_SILENCE_DURATION_SECONDS))
+    A single newline in cleaned PDF text is a hard wrap, not a spoken boundary,
+    so it becomes a space -- except that a leading `Chapter`/`Part`/`Section`
+    line stays a paragraph of its own so it keeps its own prosody. Other
+    line-oriented material -- poetry, lists, dialogue, and headings that do not
+    match that pattern -- is flowed into the following sentence.
+    """
+
+    flowed: list[str] = []
+    for block in _PARAGRAPH_SPLIT.split(text):
+        lines = block.split("\n")
+        while len(lines) > 1 and _HEADING_LINE.match(lines[0].strip()):
+            flowed.append(lines[0].strip())
+            lines = lines[1:]
+        block = "\n".join(lines)
+        joined = _WRAPPED_LINE.sub(" ", block).strip()
+        if joined:
+            flowed.append(joined)
+    return flowed
+
+
+def _silence_pcm(sample_rate: int, seconds: float = _KOKORO_SILENCE_DURATION_SECONDS) -> bytes:
+    """Return deterministic mono signed-16-bit silence for the requested duration."""
+
+    frames = max(1, round(sample_rate * seconds))
     return b"\x00\x00" * frames
 
 
@@ -145,16 +176,22 @@ class KokoroVoice:
     def synthesize(self, text: str) -> bytes:
         if not any(character.isalnum() for character in text):
             return _silence_pcm(self.metadata.sample_rate)
+        paragraphs = [paragraph for paragraph in flowed_paragraphs(text) if any(character.isalnum() for character in paragraph)]
         pieces: list[bytes] = []
         with self._inference_context():
-            for result in self.pipeline(text, voice=self.metadata.voice, speed=self.metadata.settings["speed"], split_pattern=r"\n+"):
-                audio = getattr(result, "audio", result[2] if isinstance(result, tuple) and len(result) >= 3 else result)
-                pcm = pcm_from_audio(audio)
-                if not pcm:
-                    raise RuntimeError("Kokoro returned empty audio")
-                pieces.append(pcm)
-        if not pieces:
-            raise RuntimeError("Kokoro returned no audio")
+            for index, paragraph in enumerate(paragraphs):
+                paragraph_pcm: list[bytes] = []
+                for result in self.pipeline(paragraph, voice=self.metadata.voice, speed=self.metadata.settings["speed"], split_pattern=None):
+                    audio = getattr(result, "audio", result[2] if isinstance(result, tuple) and len(result) >= 3 else result)
+                    pcm = pcm_from_audio(audio)
+                    if not pcm:
+                        raise RuntimeError("Kokoro returned empty audio")
+                    paragraph_pcm.append(pcm)
+                if not paragraph_pcm:
+                    raise RuntimeError("Kokoro returned no audio")
+                if index >= 1 and _SENTENCE_FINAL.search(paragraphs[index - 1]):
+                    pieces.append(_silence_pcm(self.metadata.sample_rate, _KOKORO_PARAGRAPH_PAUSE_SECONDS))
+                pieces.extend(paragraph_pcm)
         return b"".join(pieces)
 
     def close_voice(self) -> None:
@@ -451,6 +488,8 @@ def chunk_input_hash(text: str, metadata: EngineMetadata | dict[str, Any]) -> st
 
     facts = metadata.as_dict() if isinstance(metadata, EngineMetadata) else metadata
     payload = {"text": text, "metadata": facts}
+    if facts.get("engine") == "kokoro":
+        payload["synthesis_implementation"] = KOKORO_SYNTHESIS_IMPLEMENTATION
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -700,6 +739,8 @@ def plan_interactive_chunks(
                             "boundary_policy": "sentence_paragraph_safe",
                             "shaping_fingerprint": shaping_identity,
                         }
+                        if facts.get("engine") == "kokoro":
+                            audio_payload["synthesis_implementation"] = KOKORO_SYNTHESIS_IMPLEMENTATION
                         payload = {
                             **audio_payload,
                             "voice_plan_canonical_hash": canonical_hash,
@@ -784,4 +825,4 @@ def plan_chunks(cleaned_text: str, chapters: list[dict[str, Any]], metadata: Eng
     return _plan_legacy_chunks(cleaned_text, chapters, metadata, cap)
 
 
-__all__ = ["APPROVED_VOICES", "CHUNK_MODES", "DEFAULT_CHUNK_CAP", "DEFAULT_TORCH_THREADS", "EngineMetadata", "FakeVoice", "InteractiveTextChunk", "KOKORO_MODEL", "KOKORO_PACKAGE_VERSION", "KOKORO_SAMPLE_RATE", "LoadedVoice", "SynthesisSettings", "TextChunk", "TORCH_THREADS_ENV", "chunk_input_hash", "close_voice", "load_voice", "plan_chunks", "plan_interactive_chunks", "synthesize"]
+__all__ = ["APPROVED_VOICES", "CHUNK_MODES", "DEFAULT_CHUNK_CAP", "DEFAULT_TORCH_THREADS", "EngineMetadata", "FakeVoice", "InteractiveTextChunk", "KOKORO_MODEL", "KOKORO_PACKAGE_VERSION", "KOKORO_SAMPLE_RATE", "LoadedVoice", "SynthesisSettings", "TextChunk", "TORCH_THREADS_ENV", "chunk_input_hash", "close_voice", "flowed_paragraphs", "load_voice", "plan_chunks", "plan_interactive_chunks", "synthesize"]
