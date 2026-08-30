@@ -173,6 +173,34 @@ def test_large_custom_plan_builds_word_index_once(monkeypatch: pytest.MonkeyPatc
     assert_complete(plan, text)
 
 
+@pytest.mark.parametrize(("mode", "count"), [("original", None), ("custom", 6)])
+def test_chapter_planning_builds_sentence_and_heading_indexes_once(monkeypatch: pytest.MonkeyPatch, mode: str, count: int | None) -> None:
+    sections = [f"CHAPTER {index}\nThis chapter has enough useful words for a stable boundary." for index in range(1, 13)]
+    text = "\n\n".join(sections)
+    candidates = [
+        {"title": f"CHAPTER {index}", "source_page": 1, "source_type": "heading", "cleaned_offset": text.index(f"CHAPTER {index}")}
+        for index in range(1, 13)
+    ]
+    original_sentence_boundaries = chapters_module._sentence_boundaries
+    original_heading_boundaries = chapters_module._heading_boundaries
+    calls = {"sentence": 0, "heading": 0}
+
+    def counted_sentence_boundaries(value: str) -> set[int]:
+        calls["sentence"] += 1
+        return original_sentence_boundaries(value)
+
+    def counted_heading_boundaries(value: str) -> dict[int, str]:
+        calls["heading"] += 1
+        return original_heading_boundaries(value)
+
+    monkeypatch.setattr(chapters_module, "_sentence_boundaries", counted_sentence_boundaries)
+    monkeypatch.setattr(chapters_module, "_heading_boundaries", counted_heading_boundaries)
+    plan = create_chapter_plan(text, mapping_for(text), candidates, mode=mode, count=count)
+
+    assert calls == {"sentence": 1, "heading": 1}
+    assert_complete(plan, text)
+
+
 def test_custom_sentence_detection_handles_abbreviations_and_decimals() -> None:
     text = "Dr. Smith reviewed version 2.5 carefully. The result was useful. Another sentence follows."
     plan = create_chapter_plan(text, mapping_for(text), [], mode="custom", count=2)

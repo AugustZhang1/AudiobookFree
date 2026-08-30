@@ -91,6 +91,37 @@ def calculate_rtf(generation_seconds: float, audio_seconds: float) -> float:
     return generation_seconds / audio_seconds
 
 
+def _numpy_pcm(value: Any) -> bytes | None:
+    """Convert a NumPy array without materializing a Python sample list."""
+
+    if not hasattr(value, "dtype"):
+        return None
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    try:
+        if not isinstance(value, np.ndarray):
+            return None
+        flattened = value.reshape(-1)
+        if flattened.size == 0 or flattened.dtype.kind not in "biuf":
+            return None
+        if flattened.dtype.kind == "f":
+            if not np.isfinite(flattened).all():
+                # The Python fallback raises on NaN/inf; casting them would emit
+                # silent sentinel samples instead.
+                raise ValueError("audio contains non-finite samples")
+            flattened = np.rint(flattened * 32767.0)
+        return np.clip(flattened, -32768, 32767).astype("<i2").tobytes()
+    except ValueError:
+        raise
+    except Exception:
+        # A tensor backend can expose a NumPy-like object without supporting
+        # every operation above.  The existing Python conversion remains the
+        # compatibility path for those values.
+        return None
+
+
 def pcm_from_audio(value: Any) -> bytes:
     if isinstance(value, bytes):
         return value
@@ -100,6 +131,9 @@ def pcm_from_audio(value: Any) -> bytes:
         value = value.cpu()
     if hasattr(value, "numpy"):
         value = value.numpy()
+    fast_path = _numpy_pcm(value)
+    if fast_path is not None:
+        return fast_path
     if hasattr(value, "reshape") and hasattr(value, "tolist"):
         value = value.reshape(-1).tolist()
     elif hasattr(value, "tolist"):

@@ -126,6 +126,27 @@ class EngineMetadata:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ChunkPlanInputs:
+    settings: dict[str, Any]
+    model: str
+    cap: int
+
+
+def derive_chunk_plan_inputs(tts: dict[str, Any], *, interactive: bool) -> ChunkPlanInputs:
+    """Normalize manifest values shared by worker and assembler planning."""
+
+    model = str(tts.get("model", tts.get("model_id", "")))
+    if interactive:
+        raw_settings = tts.get("settings")
+        settings = dict(raw_settings) if isinstance(raw_settings, dict) else {}
+        cap = int(tts.get("chunk_cap", settings.get("chunk_cap", 900)))
+    else:
+        settings = dict(tts.get("settings", {"speed": tts["speed"], "sample_rate": tts["sample_rate"], "chunk_cap": tts.get("chunk_cap", 900)}))
+        cap = int(settings.get("chunk_cap", 900))
+    return ChunkPlanInputs(settings=settings, model=model, cap=cap)
+
+
 class LoadedVoice(Protocol):
     metadata: EngineMetadata
 
@@ -825,4 +846,4 @@ def plan_chunks(cleaned_text: str, chapters: list[dict[str, Any]], metadata: Eng
     return _plan_legacy_chunks(cleaned_text, chapters, metadata, cap)
 
 
-__all__ = ["APPROVED_VOICES", "CHUNK_MODES", "DEFAULT_CHUNK_CAP", "DEFAULT_TORCH_THREADS", "EngineMetadata", "FakeVoice", "InteractiveTextChunk", "KOKORO_MODEL", "KOKORO_PACKAGE_VERSION", "KOKORO_SAMPLE_RATE", "LoadedVoice", "SynthesisSettings", "TextChunk", "TORCH_THREADS_ENV", "chunk_input_hash", "close_voice", "flowed_paragraphs", "load_voice", "plan_chunks", "plan_interactive_chunks", "synthesize"]
+__all__ = ["APPROVED_VOICES", "CHUNK_MODES", "ChunkPlanInputs", "DEFAULT_CHUNK_CAP", "DEFAULT_TORCH_THREADS", "EngineMetadata", "FakeVoice", "InteractiveTextChunk", "KOKORO_MODEL", "KOKORO_PACKAGE_VERSION", "KOKORO_SAMPLE_RATE", "LoadedVoice", "SynthesisSettings", "TextChunk", "TORCH_THREADS_ENV", "chunk_input_hash", "close_voice", "derive_chunk_plan_inputs", "flowed_paragraphs", "load_voice", "plan_chunks", "plan_interactive_chunks", "synthesize"]

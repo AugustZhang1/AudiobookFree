@@ -250,7 +250,7 @@ def validate_approved_spans(
                     raise _fail("UNRESOLVED_SPANS", "unknown spans require explicit narrator fallback acceptance")
             elif span.speaker_id != "narrator":
                 raise _fail("UNRESOLVED_SPANS", "accepted unknown spans must be explicitly assigned to narrator")
-        if span.speaker_id is None:
+        if span.speaker_id is None and not allow_unresolved:
             raise _fail("UNASSIGNED_SPEAKER", "approved spans require an assigned speaker")
         chapter_fragments[span.chapter_index].append(text[span.source_start : span.source_end])
         expected_position = span.source_end

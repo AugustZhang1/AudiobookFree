@@ -187,6 +187,18 @@ class VoiceAnalysisRunner:
         }
         return with_canonical_artifact_hash(artifact)
 
+    def _force_terminal_status(self, status: str, error: dict[str, str] | None) -> dict[str, Any] | None:
+        """Last-resort terminal status when the normal write failed.
+
+        Retries with zero progress and no analyzer-derived fields, so a run can
+        never be left durably reporting "running" with no worker behind it.
+        """
+
+        try:
+            return self._set_status(status, status, 0, 0, error=error, finished=True)
+        except Exception:
+            return None
+
     def _set_status(
         self,
         status: str,
@@ -428,7 +440,12 @@ class VoiceAnalysisRunner:
             return AnalysisRunResult(self.analysis_id, self.revision, "completed", completed_status, speaker_artifact)
         except VoiceAnalysisCancelled:
             try:
-                cancelled = self._set_status("cancelled", "cancelled", self._control.completed if self._control else 0, self._control.total if self._control else 0, cancel_requested=True, finished=True)
+                try:
+                    cancelled = self._set_status("cancelled", "cancelled", self._control.completed if self._control else 0, self._control.total if self._control else 0, cancel_requested=True, finished=True)
+                except Exception:
+                    # The cancel marker is cleared below regardless, so without a
+                    # terminal status the run would keep reporting "running".
+                    cancelled = self._force_terminal_status("cancelled", None)
             finally:
                 self.workspace.clear_voice_analysis_cancel_request(self.conversion_id)
             return AnalysisRunResult(self.analysis_id, self.revision, "cancelled", cancelled)
@@ -438,7 +455,7 @@ class VoiceAnalysisRunner:
                 try:
                     self._set_status("failed", "failed", self._control.completed if self._control else 0, self._control.total if self._control else 0, error={"code": code, "message": message}, finished=True)
                 except Exception:
-                    pass
+                    self._force_terminal_status("failed", {"code": code, "message": message})
             finally:
                 self.workspace.clear_voice_analysis_cancel_request(self.conversion_id)
             raise

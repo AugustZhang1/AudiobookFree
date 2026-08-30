@@ -4,15 +4,16 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import threading
 import uuid
 import wave
 
 import pytest
 
 import pdf_audiobook.worker as worker_module
-from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, plan_chunks, plan_interactive_chunks
+from pdf_audiobook.tts import EngineMetadata, FakeVoice, SynthesisSettings, TextChunk, plan_chunks, plan_interactive_chunks
 from pdf_audiobook.chapters import select_chapter_range
-from pdf_audiobook.worker import ConversionWorker, WorkerBusyError
+from pdf_audiobook.worker import WORKER_LOCK_FILENAME, _WORKER_LOCK_STALE_SECONDS, conversion_worker_lock_is_reclaimable, ConversionWorker, WorkerBusyError
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.workspace import ManifestError, Workspace, atomic_write_json
 from pdf_audiobook.engine_catalog import CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT
@@ -389,6 +390,74 @@ def test_cancel_then_resume_preserves_first_chunk_bytes_and_mtime() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_v4_existing_lookup_indexes_manifest_records_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    root, workspace, conversion_id, metadata = _prepared()
+    try:
+        _small_chunks(workspace, conversion_id, metadata)
+        assert ConversionWorker(workspace, conversion_id).run(engine=FakeVoice(), full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+
+        class CountingRecords(list):
+            iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        records = CountingRecords(job["completed_chunks"])
+        resumable_job = {**job, "status": "cancelled", "stage": "cancelled", "worker": None, "completed_chunks": records}
+        worker = ConversionWorker(workspace, conversion_id)
+        monkeypatch.setattr(worker, "_phase5_plan_matches", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(worker, "_claim", lambda current: current)
+
+        result = worker._run_v4(resumable_job, engine=FakeVoice(), full_pipeline=False)
+
+        assert result.status == "completed"
+        assert len(records) >= 2
+        assert result.completed == len(records)
+        assert records.iterations == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v4_resume_drops_manifest_records_not_verified_against_planned_chunks() -> None:
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        assert ConversionWorker(workspace, conversion_id).run(engine=FakeVoice(), full_pipeline=False).status == "completed"
+        job = workspace.read_job(conversion_id)
+        chunks = [
+            TextChunk(1, 0, 0, 0, 1, "first", "first-input"),
+            TextChunk(1, 1, 0, 1, 2, "second", "second-input"),
+            TextChunk(1, 3, 0, 2, 3, "unplanned", "unplanned-input"),
+        ]
+        template = job["completed_chunks"][0]
+        records = [
+            {**template, "global_index": index, "local_index": index, "input_hash": f"input-{index}", "relative_path": f"chunks/old-{index}.wav"}
+            for index in range(3)
+        ]
+        resumable_job = {**job, "total_chunks": 3, "status": "cancelled", "stage": "cancelled", "worker": None, "completed_chunks": records}
+        worker = ConversionWorker(workspace, conversion_id)
+        worker._planned_chunks = lambda _job: chunks
+        worker._phase5_plan_matches = lambda *_args, **_kwargs: False
+        worker._claim = lambda current: current
+
+        def existing(_job: dict, chunk: TextChunk, *_args: object) -> dict:
+            return {**chunk.manifest_record(f"chunks/chunk-{chunk.global_index}.wav", 1.0), "wav_sha256": "0" * 64}
+
+        worker._existing = existing
+
+        def update_generation(_conversion_id: str, **changes: object) -> dict:
+            return {**resumable_job, **changes}
+
+        workspace.update_generation = update_generation
+        result = worker._run_v4(resumable_job, engine=FakeVoice(), full_pipeline=False)
+
+        assert result.status == "completed"
+        assert result.completed == len(chunks)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_chapter_mode_cancel_then_resume_checkpoints_by_chapter() -> None:
     root = Path("tests") / f".pytest-phase4-worker-chapters-{uuid.uuid4().hex}"; root.mkdir()
     try:
@@ -560,3 +629,146 @@ def test_v5_live_worker_refuses_before_rewriting_the_manifest(monkeypatch) -> No
         assert workspace.job_path(conversion_id).read_bytes() == before and made == []
         assert workspace.read_job(conversion_id)["completed_chunks"] == stale
     finally: shutil.rmtree(root, ignore_errors=True)
+
+
+def test_two_conversion_workers_cannot_double_claim_one_conversion() -> None:
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        first_claimed = threading.Event()
+        second_factory_entered = threading.Event()
+        release_first = threading.Event()
+        first_results: list[object] = []
+        second_results: list[object] = []
+        second_failures: list[BaseException] = []
+
+        class BlockingEngine:
+            def __init__(self, *, marker: threading.Event | None = None) -> None:
+                self.inner = FakeVoice()
+                self.calls = 0
+                self.marker = marker
+
+            def synthesize(self, text: str) -> bytes:
+                self.calls += 1
+                if self.marker is not None:
+                    self.marker.set()
+                assert release_first.wait(timeout=10)
+                return self.inner.synthesize(text)
+
+            def close_voice(self) -> None:
+                self.inner.close_voice()
+
+        first_engine = BlockingEngine(marker=first_claimed)
+        second_engine = BlockingEngine(marker=second_factory_entered)
+
+        def run_first() -> None:
+            try:
+                first_results.append(ConversionWorker(workspace, conversion_id).run(engine=first_engine, full_pipeline=False))
+            except BaseException as exc:  # pragma: no cover - assertion below reports it
+                first_results.append(exc)
+
+        def run_second() -> None:
+            try:
+                second_results.append(ConversionWorker(workspace, conversion_id).run(engine=second_engine, full_pipeline=False))
+            except BaseException as exc:
+                second_failures.append(exc)
+
+        first_thread = threading.Thread(target=run_first, name="conversion-worker-one")
+        second_thread = threading.Thread(target=run_second, name="conversion-worker-two")
+        first_thread.start()
+        assert first_claimed.wait(timeout=5)
+        second_thread.start()
+        assert second_factory_entered.wait(timeout=1) or bool(second_failures) or bool(second_results)
+        release_first.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+
+        assert not first_thread.is_alive() and not second_thread.is_alive()
+        assert len(first_results) == 1 and getattr(first_results[0], "status", None) == "completed"
+        assert len(second_failures) == 1 and isinstance(second_failures[0], WorkerBusyError)
+        assert second_results == []
+        assert second_engine.calls == 0
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_conversion_worker_lock_is_reclaimable_distinguishes_owner_states(tmp_path: Path) -> None:
+    """The shared rule behind both generation-start branches.
+
+    pid_is_alive() reports True for an inaccessible Windows PID, so a recorded PID
+    cannot decide ownership. Only a lock that is PRESENT and stale proves the owner
+    is gone; a missing lock must leave the recorded PID authoritative.
+    """
+
+    import json as _json
+    import time as _time
+
+    workspace = Workspace(tmp_path)
+    conversion_id = str(uuid.uuid4())
+    directory = workspace.conversion_path(conversion_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / WORKER_LOCK_FILENAME
+
+    # No lock at all -> not reclaimable, so a recorded live PID still wins.
+    assert conversion_worker_lock_is_reclaimable(workspace, conversion_id) is False
+
+    # Fresh lock -> not reclaimable regardless of owner state.
+    lock_path.write_text(_json.dumps({"pid": os.getpid(), "started_at": "2026-01-01T00:00:00Z", "token": "fresh"}), encoding="utf-8")
+    assert conversion_worker_lock_is_reclaimable(workspace, conversion_id) is False
+
+    # A CONFIRMED-LIVE owner is never reclaimable, however old the heartbeat:
+    # stealing its lock would let two workers write the same chunks.
+    stale = _time.time() - (_WORKER_LOCK_STALE_SECONDS + 60.0)
+    os.utime(lock_path, (stale, stale))
+    assert conversion_worker_lock_is_reclaimable(workspace, conversion_id) is False
+
+    # An owner we are not permitted to query (Windows ACCESS_DENIED) is
+    # reclaimable once the bounded lease expires, or it wedges the conversion.
+    import pdf_audiobook.worker as _worker_module
+    original = _worker_module.pid_liveness
+    _worker_module.pid_liveness = lambda pid: _worker_module.PID_ALIVE if False else "unknown"
+    try:
+        assert conversion_worker_lock_is_reclaimable(workspace, conversion_id) is True
+    finally:
+        _worker_module.pid_liveness = original
+
+
+def test_deterministic_synthesis_error_is_not_retried() -> None:
+    """A deterministic failure burns identical model invocations for nothing."""
+
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        class Deterministic:
+            def __init__(self): self.calls = 0
+            def synthesize(self, _text): self.calls += 1; raise ValueError("bad text")
+            def close_voice(self): pass
+        engine = Deterministic()
+        worker = ConversionWorker(workspace, conversion_id)
+        worker.retry_backoff_seconds = 0.0
+        try: worker.run(engine=engine)
+        except RuntimeError: pass
+        else: raise AssertionError("expected bounded failure")
+        assert engine.calls == 1, f"deterministic error retried {engine.calls} times"
+        assert workspace.read_job(conversion_id)["status"] == "failed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_v4_preserves_the_precise_chunk_failure_message() -> None:
+    """v4 used to overwrite the per-chunk message with a generic one, as v5 does not."""
+
+    root, workspace, conversion_id, _ = _prepared()
+    try:
+        class Failing:
+            def synthesize(self, _text): raise RuntimeError("expected")
+            def close_voice(self): pass
+        worker = ConversionWorker(workspace, conversion_id)
+        worker.retry_backoff_seconds = 0.0
+        try: worker.run(engine=Failing())
+        except RuntimeError: pass
+        else: raise AssertionError("expected bounded failure")
+        job = workspace.read_job(conversion_id)
+        assert job["status"] == "failed"
+        assert "failed after 3 attempts" in job["error"], job["error"]
+        assert job["error"] != "worker failed: RuntimeError"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

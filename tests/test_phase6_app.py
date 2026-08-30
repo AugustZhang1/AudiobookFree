@@ -20,6 +20,7 @@ from pdf_audiobook.voice_plan import build_voice_plan, with_canonical_artifact_h
 from pdf_audiobook.voice_shaping import ShapingCapability
 from pdf_audiobook.worker import ConversionWorker
 from pdf_audiobook.workspace import Workspace, atomic_write_json
+from pdf_audiobook.security import atomic_write_instance, build_instance
 from test_pdf import make_pdf
 
 
@@ -41,6 +42,179 @@ def _app(root: Path, port: int, *, opener=None, worker_poll=1, worker_launcher=N
     headers = {"Origin": f"http://127.0.0.1:{port}"}
     assert client.post("/api/session/bootstrap", json={"token": "phase6-token"}, headers=headers).status_code == 200
     return app, client, headers, preview
+
+
+def test_cancel_vs_start_race_returns_active_worker_contention() -> None:
+    root = Path("tests") / f".pytest-phase6-cancel-start-race-{uuid.uuid4().hex}"
+    root.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class StartingProcess:
+        def poll(self):
+            return 0
+
+    def launch(*_args):
+        entered.set()
+        release.wait(5)
+        return StartingProcess()
+
+    start_client = None
+    cancel_client = None
+    start_result: list[object] = []
+    start_error: list[BaseException] = []
+    start_thread = None
+    try:
+        app, start_client, headers, _ = _app(root, 19879, worker_launcher=launch)
+        cancel_client = TestClient(app, base_url="http://127.0.0.1:19879")
+        assert cancel_client.post("/api/session/bootstrap", json={"token": "phase6-token"}, headers=headers).status_code == 200
+        pdf = make_pdf(root / "book.pdf", ["One sentence. Two sentence."])
+        upload_headers = {**headers, "X-PDF-Filename": "book.pdf", "Content-Type": "application/pdf"}
+        assert start_client.post("/api/analyze", content=pdf.read_bytes(), headers=upload_headers).status_code == 200
+        assert start_client.post("/api/chapter-plan", json={"mode": "whole"}, headers=headers).status_code == 200
+
+        def start_generation() -> None:
+            try:
+                start_result.append(start_client.post("/api/generation/start", json={"voice": "af_heart", "speed": 1.0}, headers=headers))
+            except BaseException as exc:
+                start_error.append(exc)
+
+        start_thread = threading.Thread(target=start_generation)
+        start_thread.start()
+        assert entered.wait(5), "generation start did not reach the worker launcher"
+
+        cancelled = cancel_client.post("/api/generation/cancel", json={}, headers=headers)
+        assert cancelled.status_code == 409
+        assert cancelled.json() == {"error": {"code": "ACTIVE_WORKER", "message": "another generation operation is in progress"}}
+    finally:
+        release.set()
+        if start_thread is not None:
+            start_thread.join(5)
+        if start_client is not None:
+            start_client.close()
+        if cancel_client is not None:
+            cancel_client.close()
+        shutil.rmtree(root, ignore_errors=True)
+    assert not start_thread.is_alive()
+    assert not start_error
+    assert start_result and start_result[0].status_code == 200
+    app.state.phase1.worker_process = None
+
+
+def test_shutdown_vs_start_race_returns_active_worker_contention() -> None:
+    root = Path("tests") / f".pytest-phase6-shutdown-start-race-{uuid.uuid4().hex}"
+    root.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class StartingProcess:
+        def poll(self):
+            return 0
+
+    def launch(*_args):
+        entered.set()
+        release.wait(5)
+        return StartingProcess()
+
+    start_client = None
+    shutdown_client = None
+    start_result: list[object] = []
+    start_error: list[BaseException] = []
+    start_thread = None
+    try:
+        app, start_client, headers, _ = _app(root, 19876, worker_launcher=launch)
+        shutdown_client = TestClient(app, base_url="http://127.0.0.1:19876")
+        assert shutdown_client.post("/api/session/bootstrap", json={"token": "phase6-token"}, headers=headers).status_code == 200
+        pdf = make_pdf(root / "book.pdf", ["One sentence. Two sentence."])
+        upload_headers = {**headers, "X-PDF-Filename": "book.pdf", "Content-Type": "application/pdf"}
+        assert start_client.post("/api/analyze", content=pdf.read_bytes(), headers=upload_headers).status_code == 200
+        assert start_client.post("/api/chapter-plan", json={"mode": "whole"}, headers=headers).status_code == 200
+
+        def start_generation() -> None:
+            try:
+                start_result.append(start_client.post("/api/generation/start", json={"voice": "af_heart", "speed": 1.0}, headers=headers))
+            except BaseException as exc:
+                start_error.append(exc)
+
+        start_thread = threading.Thread(target=start_generation)
+        start_thread.start()
+        assert entered.wait(5), "generation start did not reach the worker launcher"
+
+        shutting_down = shutdown_client.post("/api/shutdown", headers=headers)
+        assert shutting_down.status_code == 409
+        assert shutting_down.json() == {"error": {"code": "ACTIVE_WORKER", "message": "another generation operation is in progress"}}
+        assert not app.state.phase1.shutdown_event.is_set()
+    finally:
+        release.set()
+        if start_thread is not None:
+            start_thread.join(5)
+        if start_client is not None:
+            start_client.close()
+        if shutdown_client is not None:
+            shutdown_client.close()
+        shutil.rmtree(root, ignore_errors=True)
+    assert not start_thread.is_alive()
+    assert not start_error
+    assert start_result and start_result[0].status_code == 200
+    app.state.phase1.worker_process = None
+
+
+def test_shutdown_requests_cancel_and_reaps_live_worker_before_cleanup() -> None:
+    root = Path("tests") / f".pytest-phase6-shutdown-worker-{uuid.uuid4().hex}"
+    root.mkdir()
+    instance_file = root / "instance.json"
+    events: list[object] = []
+
+    class ShutdownProcess:
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            events.append("terminate")
+            assert instance_file.is_file()
+            assert conversion_id is not None
+            assert Workspace(root / "data").cancel_marker_path(conversion_id).is_file()
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            assert timeout > 0
+            assert instance_file.is_file()
+            self.returncode = 0
+
+    process = ShutdownProcess()
+    client = None
+    try:
+        port = 19877
+        app, client, headers, _ = _app(root, port, worker_launcher=lambda *_: process)
+        state = app.state.phase1
+        state.session_token = "phase6-shutdown-session-token-012345678901234567890123"
+        client.cookies.clear()
+        assert client.post("/api/session/bootstrap", json={"token": state.session_token}, headers=headers).status_code == 200
+        pdf = make_pdf(root / "book.pdf", ["One sentence. Two sentence."])
+        upload_headers = {**headers, "X-PDF-Filename": "book.pdf", "Content-Type": "application/pdf"}
+        assert client.post("/api/analyze", content=pdf.read_bytes(), headers=upload_headers).status_code == 200
+        assert client.post("/api/chapter-plan", json={"mode": "whole"}, headers=headers).status_code == 200
+        started = client.post("/api/generation/start", json={"voice": "af_heart", "speed": 1.0}, headers=headers)
+        assert started.status_code == 200
+        conversion_id = Workspace(root / "data").inspect_startup().conversion_id
+        assert conversion_id is not None
+        atomic_write_instance(build_instance(pid=os.getpid(), port=port, launch_id=state.launch_id, token=state.session_token), instance_file)
+
+        response = client.post("/api/shutdown", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"shutting_down": True}
+        assert events == ["terminate", ("wait", app_module.WORKER_SHUTDOWN_TIMEOUT_SECONDS)]
+        assert process.poll() == 0
+        assert state.worker_process is None
+        assert state.shutdown_event.is_set()
+        assert not instance_file.exists()
+    finally:
+        if client is not None:
+            client.close()
+        shutil.rmtree(root, ignore_errors=True)
 
 
 class _BlockingVoiceAnalyzer:
@@ -112,8 +286,10 @@ def _prepare_approved_voice_plan(root: Path, client, headers, app=None) -> tuple
         for span in chapter["spans"]:
             if span["span_id"] == "alice":
                 span["speaker_id"] = "character-alice"
+                span["type"] = "dialogue"
             elif span["span_id"] == "bob":
                 span["speaker_id"] = "character-bob"
+                span["type"] = "dialogue"
     workspace.persist_voice_plan(manifest["conversion_id"], with_canonical_artifact_hash(draft_plan))
     approved = client.post("/api/voice-plan/approve", json={"expected_revision": identity["revision"], "accept_narrator_fallback": True}, headers=headers)
     assert approved.status_code == 200, approved.text

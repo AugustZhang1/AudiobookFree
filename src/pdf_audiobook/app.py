@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
 from .audio import validate_wav
+from .worker import conversion_worker_lock_is_reclaimable
 from .analysis_runner import AnalyzerDescriptor, VoiceAnalysisRunner
 from .analyzers.booknlp import BookNLPAnalyzer
 from .chatterbox_reference import MAX_REFERENCE_BYTES
@@ -46,6 +47,7 @@ PREVIEW_GENERATION_TIMEOUT_SECONDS = 120
 # warming the shared cache without removing the subprocess safety timeout.
 CHATTERBOX_PREVIEW_GENERATION_TIMEOUT_SECONDS = 600
 CHATTERBOX_BUILTIN_PREVIEW_VERSION = "chatterbox-builtin-preview-v1"
+WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -513,6 +515,65 @@ def _default_path_opener(path: Path) -> None:
     if not callable(opener):
         raise OSError("path opener is unavailable")
     opener(str(path))
+
+
+def _worker_process_live(process: Any) -> bool:
+    if process is None:
+        return False
+    poll = getattr(process, "poll", None)
+    return not callable(poll) or poll() is None
+
+
+async def _stop_worker_for_shutdown(state: AppState) -> bool:
+    process = state.worker_process
+    if process is None:
+        return True
+    if not _worker_process_live(process):
+        state.worker_process = None
+        return True
+
+    workspace = Workspace(state.workspace_root)
+    try:
+        inspection = await asyncio.to_thread(workspace.inspect_startup)
+        if inspection.conversion_id:
+            await asyncio.to_thread(workspace.request_cancel, inspection.conversion_id)
+    except (WorkspaceError, ManifestError, OSError):
+        # Worker termination must still be attempted if the persisted state is
+        # unavailable or already invalid.
+        pass
+
+    terminate = getattr(process, "terminate", None)
+    if callable(terminate):
+        try:
+            await asyncio.to_thread(terminate)
+        except OSError:
+            pass
+
+    wait = getattr(process, "wait", None)
+
+    async def _wait_for_worker() -> None:
+        if not callable(wait):
+            return
+        try:
+            await asyncio.to_thread(wait, timeout=WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired, TimeoutError):
+            pass
+
+    await _wait_for_worker()
+    if _worker_process_live(process):
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            try:
+                await asyncio.to_thread(kill)
+            except OSError:
+                pass
+            await _wait_for_worker()
+
+    if _worker_process_live(process):
+        return False
+    if state.worker_process is process:
+        state.worker_process = None
+    return True
 
 
 def _generation_summary(cleaned_text: str, chapter_plan: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any] | None:
@@ -1243,6 +1304,18 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             recorded_live = bool(recorded and pid_is_alive(int(recorded.get("pid", 0))))
         except (TypeError, ValueError):
             recorded_live = False
+        if recorded_live:
+            # A crashed owner with an inaccessible PID reports alive forever on
+            # Windows.  A worker lock that is present but stale proves it is gone,
+            # so it must not wedge interactive generation permanently.  A missing
+            # lock leaves the recorded PID authoritative.
+            conversion_id = manifest.get("conversion_id")
+            if conversion_id:
+                try:
+                    if conversion_worker_lock_is_reclaimable(Workspace(state.workspace_root), str(conversion_id)):
+                        recorded_live = False
+                except (WorkspaceError, OSError):
+                    pass
         local_process = state.worker_process
         local_live = local_process is not None and (not hasattr(local_process, "poll") or local_process.poll() is None)
         return recorded_live or local_live
@@ -1996,7 +2069,7 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             if manifest.get("status") == "completed" and manifest.get("output") is not None:
                 return JSONResponse({"error": {"code": "ACTIVE_JOB", "message": "generation is complete"}}, status_code=409)
             recorded = manifest.get("worker") or {}
-            recorded_live = bool(recorded and pid_is_alive(int(recorded.get("pid", 0))))
+            recorded_live = bool(recorded and pid_is_alive(int(recorded.get("pid", 0))) and not await asyncio.to_thread(conversion_worker_lock_is_reclaimable, workspace, inspection.conversion_id))
             if recorded_live:
                 return JSONResponse({"error": {"code": "ACTIVE_WORKER", "message": "a generation worker is already active"}}, status_code=409)
             local_process = state.worker_process
@@ -2047,6 +2120,9 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
         if body is None or (body != {} and (set(body) != {"conversion_id"} or type(body.get("conversion_id")) is not str or not body["conversion_id"])):
             return JSONResponse({"error": {"code": "INVALID_INPUT", "message": "cancel accepts an empty body or the active conversion_id"}}, status_code=422)
         workspace = Workspace(state.workspace_root)
+        generation_acquired = await asyncio.to_thread(state.generation_lock.acquire, False)
+        if not generation_acquired:
+            return JSONResponse({"error": {"code": "ACTIVE_WORKER", "message": "another generation operation is in progress"}}, status_code=409)
         try:
             inspection = await asyncio.to_thread(workspace.inspect_startup)
             if inspection.state != "resumable" or not inspection.conversion_id or not inspection.manifest:
@@ -2081,6 +2157,8 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
             return {"conversion_id": inspection.conversion_id, "status": "cancelling", "cancel_requested": True}
         except (WorkspaceError, ManifestError, OSError) as exc:
             return JSONResponse({"error": {"code": "INVALID_GENERATION", "message": str(exc)}}, status_code=409)
+        finally:
+            state.generation_lock.release()
 
     @app.delete("/api/workspace/active")
     async def delete_active_workspace(request: Request):
@@ -2114,10 +2192,18 @@ def create_app(*, port: int, launch_id: str | None = None, session_token: str | 
     async def shutdown(request: Request):
         if not _authenticated(request, state) or not _exact_origin(request, state.port):
             raise HTTPException(403, "authenticated exact local Origin required")
-        state.shutdown_event.set()
-        if state.uvicorn_server is not None:
-            state.uvicorn_server.should_exit = True
-        remove_instance_if_matches(state.instance_file, launch_id=state.launch_id, pid=__import__("os").getpid(), token=state.session_token)
-        return {"shutting_down": True}
+        generation_acquired = await asyncio.to_thread(state.generation_lock.acquire, False)
+        if not generation_acquired:
+            return JSONResponse({"error": {"code": "ACTIVE_WORKER", "message": "another generation operation is in progress"}}, status_code=409)
+        try:
+            if not await _stop_worker_for_shutdown(state):
+                return JSONResponse({"error": {"code": "WORKER_SHUTDOWN_FAILED", "message": "generation worker did not stop"}}, status_code=503)
+            remove_instance_if_matches(state.instance_file, launch_id=state.launch_id, pid=os.getpid(), token=state.session_token)
+            state.shutdown_event.set()
+            if state.uvicorn_server is not None:
+                state.uvicorn_server.should_exit = True
+            return {"shutting_down": True}
+        finally:
+            state.generation_lock.release()
 
     return app

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "artifact": "interactive-accuracy-predictions",
+  "books": [
+    {
+      "book_id": "book-alpha",
+      "text": "\"Hello, Bob.\" Alice said. \"Hi, Alice.\" Bob answered. \"Move!\" called Captain Vale. Captain Vale frowned. \"Soon.\" \"I agree,\" said Alice. \"You go,\" replied Bob. The young scout whispered, \"Ready?\" \"We wait,\" said Minor.",
+      "cast": [
+        {"speaker_id": "narrator", "role": "narrator"},
+        {"speaker_id": "alice", "role": "character"},
+        {"speaker_id": "bob", "role": "character"},
+        {"speaker_id": "captain_vale", "role": "character"},
+        {"speaker_id": "young_scout", "role": "character"},
+        {"speaker_id": "minor", "role": "character"}
+      ],
+      "predictions": [
+        {"prediction_id": "alpha-p1", "source_start": 0, "source_end": 13, "predicted_speaker_id": "alice", "original_speaker_id": "alice", "effective_speaker_id": "alice", "decision_state": "auto_approved"},
+        {"prediction_id": "alpha-p2", "source_start": 26, "source_end": 38, "predicted_speaker_id": "alice", "original_speaker_id": "alice", "effective_speaker_id": "alice", "decision_state": "auto_approved"},
+        {"prediction_id": "alpha-p3", "source_start": 53, "source_end": 60, "predicted_speaker_id": "captain_vale", "original_speaker_id": "captain_vale", "effective_speaker_id": "narrator", "decision_state": "exception"},
+        {"prediction_id": "alpha-p4", "source_start": 104, "source_end": 111, "predicted_speaker_id": "captain_vale", "original_speaker_id": "captain_vale", "effective_speaker_id": "alice", "decision_state": "reviewed"},
+        {"prediction_id": "alpha-p5", "source_start": 112, "source_end": 122, "predicted_speaker_id": "narrator", "original_speaker_id": "narrator", "effective_speaker_id": "alice", "decision_state": "manual_correction"},
+        {"prediction_id": "alpha-p6", "source_start": 135, "source_end": 144, "predicted_speaker_id": "bob", "original_speaker_id": "bob", "effective_speaker_id": "bob", "decision_state": "reviewed"},
+        {"prediction_id": "alpha-p7", "source_start": 194, "source_end": 204, "predicted_speaker_id": "minor", "original_speaker_id": "minor", "effective_speaker_id": "minor", "decision_state": "reviewed"},
+        {"prediction_id": "alpha-spurious", "source_start": 70, "source_end": 76, "predicted_speaker_id": "alice", "original_speaker_id": "alice", "effective_speaker_id": "alice", "decision_state": "auto_approved"}
+      ]
+    },
+    {
+      "book_id": "book-beta",
+      "text": "\"Start.\" The doctor nodded. \"End.\"",
+      "cast": [
+        {"speaker_id": "narrator", "role": "narrator"},
+        {"speaker_id": "doctor", "role": "character"},
+        {"speaker_id": "beta_scout", "role": "character"}
+      ],
+      "predictions": [
+        {"prediction_id": "beta-p1", "source_start": 0, "source_end": 8, "predicted_speaker_id": "doctor", "original_speaker_id": "doctor", "effective_speaker_id": "doctor", "decision_state": "auto_approved"},
+        {"prediction_id": "beta-p2", "source_start": 28, "source_end": 34, "predicted_speaker_id": "beta_scout", "original_speaker_id": "beta_scout", "effective_speaker_id": "beta_scout", "decision_state": "unresolved"}
+      ]
+    }
+  ]
+}

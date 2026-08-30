@@ -23,6 +23,7 @@ import time
 import uuid
 from typing import Any, Literal
 
+from .security import pid_is_alive
 from .speaker_analysis import MAX_ARTIFACT_BYTES, SpeakerAnalysisError, validate_speaker_analysis
 from .chatterbox_reference import (
     REFERENCE_DESCRIPTOR_FILENAME,
@@ -49,6 +50,10 @@ _KNOWN_JOB_SCHEMA_VERSION = 1
 COPY_CHUNK_SIZE = 1024 * 1024
 _REPLACE_RETRY_ATTEMPTS = 3
 _REPLACE_RETRY_DELAY_SECONDS = 0.05
+_GENERATION_UPDATE_RETRIES = 8
+_GENERATION_UPDATE_DELAY_SECONDS = 0.02
+_GENERATION_UPDATE_STALE_SECONDS = 300.0
+_GENERATION_UPDATE_LOCK_FILENAME = "job.json.generation.lock"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 _ACTIVE_FIELDS = {"schema_version", "conversion_id", "updated_at"}
@@ -115,6 +120,10 @@ class ManifestError(WorkspaceError):
     """A manifest is missing, malformed, or has an unsupported schema."""
 
 
+class GenerationConflictError(WorkspaceError):
+    """A generation manifest could not be updated after bounded retries."""
+
+
 class UnsafePathError(WorkspaceError):
     """A path would escape the workspace or traverse a link."""
 
@@ -130,7 +139,7 @@ class StartupInspection:
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _valid_timestamp(value: Any) -> bool:
@@ -608,6 +617,83 @@ def _canonical_json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def _generation_lock_is_stale(path: Path) -> bool:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False
+    age = max(0.0, time.time() - info.st_mtime)
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        pid = marker.get("pid") if isinstance(marker, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pid = None
+    if isinstance(pid, int) and pid > 0 and not pid_is_alive(pid):
+        return True
+    # pid_is_alive intentionally treats Windows ACCESS_DENIED as alive.  An
+    # old marker is still reclaimable so an inaccessible crashed owner cannot
+    # permanently block manifest recovery.
+    return age >= _GENERATION_UPDATE_STALE_SECONDS
+
+
+def _acquire_generation_update_lock(path: Path) -> tuple[Path, int, str]:
+    token = uuid.uuid4().hex
+    marker = {"pid": os.getpid(), "started_at": _timestamp(), "token": token}
+    encoded = _canonical_json_text(marker).encode("utf-8")
+    for attempt in range(max(1, _GENERATION_UPDATE_RETRIES)):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if _generation_lock_is_stale(path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+                continue
+            if attempt + 1 >= max(1, _GENERATION_UPDATE_RETRIES):
+                raise GenerationConflictError("generation update lock was busy after bounded retries")
+            time.sleep(_GENERATION_UPDATE_DELAY_SECONDS)
+        except PermissionError:
+            if attempt + 1 >= max(1, _GENERATION_UPDATE_RETRIES):
+                raise GenerationConflictError("generation update lock was unavailable after bounded retries")
+            time.sleep(_GENERATION_UPDATE_DELAY_SECONDS)
+        else:
+            try:
+                written = 0
+                while written < len(encoded):
+                    written += os.write(fd, encoded[written:])
+                os.fsync(fd)
+            except Exception:
+                os.close(fd)
+                path.unlink(missing_ok=True)
+                raise
+            return path, fd, token
+    raise GenerationConflictError("generation update lock was busy after bounded retries")
+
+
+def _release_generation_update_lock(lock: tuple[Path, int, str]) -> None:
+    path, fd, token = lock
+    try:
+        os.close(fd)
+    finally:
+        try:
+            info = path.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(marker, dict) or marker.get("token") != token or marker.get("pid") != os.getpid():
+                return
+            path.unlink()
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return
+
+
 def atomic_write_text(path: Path, value: str) -> Path:
     """Atomically write UTF-8 text to ``path``."""
 
@@ -905,6 +991,13 @@ class Workspace:
         return self.conversion_path(conversion_id) / "cancel.request"
 
     def request_cancel(self, conversion_id: str | uuid.UUID) -> Path:
+        lock = _acquire_generation_update_lock(self.conversion_path(conversion_id) / _GENERATION_UPDATE_LOCK_FILENAME)
+        try:
+            return self._request_cancel_locked(conversion_id)
+        finally:
+            _release_generation_update_lock(lock)
+
+    def _request_cancel_locked(self, conversion_id: str | uuid.UUID) -> Path:
         marker = self.cancel_marker_path(conversion_id)
         try:
             info = marker.lstat()
@@ -1139,19 +1232,88 @@ class Workspace:
         self.clear_cancel_request(conversion_id)
         return validated
 
-    def update_generation(self, conversion_id: str | uuid.UUID, **updates: Any) -> dict[str, Any]:
-        current = self.read_job(conversion_id)
-        if current["schema_version"] not in {GENERATION_SCHEMA_VERSION, INTERACTIVE_GENERATION_SCHEMA_VERSION}:
+    def update_generation(self, conversion_id: str | uuid.UUID, *, allow_cancelled_resume: bool = False, **updates: Any) -> dict[str, Any]:
+        job_path = self.job_path(conversion_id)
+        initial = self.read_job(conversion_id)
+        if initial["schema_version"] not in {GENERATION_SCHEMA_VERSION, INTERACTIVE_GENERATION_SCHEMA_VERSION}:
             raise ManifestError("job is not a generation manifest")
-        current.update(updates)
-        current["updated_at"] = _timestamp()
-        validated = (
-            validate_interactive_generation_manifest(current)
-            if current["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION
-            else validate_generation_manifest(current)
-        )
-        atomic_write_json(self.job_path(conversion_id), validated)
-        return validated
+        expected_updated_at = initial["updated_at"]
+        retries = max(1, _GENERATION_UPDATE_RETRIES)
+        for attempt in range(retries):
+            lock = _acquire_generation_update_lock(job_path.parent / _GENERATION_UPDATE_LOCK_FILENAME)
+            try:
+                current = self.read_job(conversion_id)
+                # The optimistic snapshot was taken before the process-safe
+                # lock.  Re-read under that lock and retry if another writer
+                # won the compare-and-swap race.
+                if current["updated_at"] != expected_updated_at:
+                    expected_updated_at = current["updated_at"]
+                    continue
+
+                requested_status = updates.get("status")
+                resume_claim = (
+                    allow_cancelled_resume is True
+                    and initial["status"] == "cancelled"
+                    and requested_status == "synthesizing"
+                    and updates.get("stage") == "synthesis"
+                    and isinstance(updates.get("worker"), dict)
+                    and "completed_chunks" not in updates
+                    and "progress" not in updates
+                    and not self.cancellation_requested(conversion_id)
+                )
+                if current["status"] == "cancelled" and requested_status != "cancelled" and not resume_claim:
+                    # Cancellation is terminal.  In particular, an already
+                    # prepared chunk-progress or completion write must not
+                    # resurrect a cancelled generation.  Error detail is still
+                    # preserved so a genuine failure is not hidden behind the
+                    # cancellation the user sees.
+                    preserved = {
+                        field: updates[field]
+                        for field in ("error", "last_safe_error")
+                        if updates.get(field) is not None and current.get(field) != updates.get(field)
+                    }
+                    if not preserved:
+                        return current
+                    merged = {**current, **preserved, "updated_at": _timestamp()}
+                    validated_merged = (
+                        validate_interactive_generation_manifest(merged)
+                        if merged["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION
+                        else validate_generation_manifest(merged)
+                    )
+                    atomic_write_json(job_path, validated_merged)
+                    return validated_merged
+
+                progress_write = requested_status != "cancelled" and any(
+                    field in updates for field in ("completed_chunks", "progress")
+                )
+                if progress_write and requested_status == "completed" and current["status"] != "cancelled" and self.cancellation_requested(conversion_id):
+                    cancelled = {
+                        **current,
+                        "status": "cancelled",
+                        "stage": "cancelled",
+                        "worker": None,
+                        "last_safe_error": "cancelled",
+                        "updated_at": _timestamp(),
+                    }
+                    validated_cancelled = (
+                        validate_interactive_generation_manifest(cancelled)
+                        if cancelled["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION
+                        else validate_generation_manifest(cancelled)
+                    )
+                    atomic_write_json(job_path, validated_cancelled)
+                    return validated_cancelled
+
+                candidate = {**current, **updates, "updated_at": _timestamp()}
+                validated = (
+                    validate_interactive_generation_manifest(candidate)
+                    if candidate["schema_version"] == INTERACTIVE_GENERATION_SCHEMA_VERSION
+                    else validate_generation_manifest(candidate)
+                )
+                atomic_write_json(job_path, validated)
+                return validated
+            finally:
+                _release_generation_update_lock(lock)
+        raise GenerationConflictError("generation update conflicted after bounded retries")
 
     def load_analysis(self, conversion_id: str | uuid.UUID) -> dict[str, Any]:
         """Load a trustworthy analysis artifact for the current source PDF."""
@@ -1599,6 +1761,7 @@ __all__ = [
     "LEGACY_GENERATION_SCHEMA_VERSION",
     "GENERATION_SCHEMA_VERSION",
     "INTERACTIVE_GENERATION_SCHEMA_VERSION",
+    "GenerationConflictError",
     "ManifestError",
     "StartupInspection",
     "UnsafePathError",

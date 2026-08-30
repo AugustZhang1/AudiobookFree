@@ -7,6 +7,7 @@ contract; it never imports the ML package itself.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Callable, Mapping
 import json
 import os
@@ -29,6 +30,11 @@ MAX_TOKENS = 2_000_000
 MAX_QUOTES = 250_000
 MAX_CHARACTERS = 100_000
 MAX_WARNING_LENGTH = 8 * 1024
+MAX_ANALYSIS_WARNINGS = 256
+# A handful of bad quotes in a long book is tolerable; losing most of them means
+# the runner output is corrupt and must not become a silent narration-only book.
+_MIN_QUOTES_FOR_REJECTION_RATIO = 20
+_MAX_QUOTE_REJECTION_RATIO = 0.5
 RUNNER_SCHEMA_VERSION = 1
 BOOKNLP_VERSION = "1.0.8"
 OUTPUT_TOO_LARGE_MESSAGE = "analyzer output exceeded the size limit"
@@ -107,18 +113,33 @@ def _parse_json(stdout: Any) -> dict[str, Any]:
     return value
 
 
-def _byte_boundaries(text: str) -> tuple[dict[int, int], bytes]:
-    encoded = text.encode("utf-8")
-    boundaries = {0: 0}
+def _byte_boundaries(text: str, requested_offsets: Any, *, encoded: bytes | None = None) -> tuple[tuple[int, ...], tuple[int, ...], bytes]:
+    """Map only requested UTF-8 offsets during one forward walk of the text."""
+
+    encoded = text.encode("utf-8") if encoded is None else encoded
+    offsets = tuple(sorted(set(requested_offsets)))
+    if not offsets:
+        return (), (), encoded
+    character_positions = [-1] * len(offsets)
+    offset_index = 0
     byte_position = 0
-    for index, char in enumerate(text, 1):
+    while offset_index < len(offsets) and offsets[offset_index] == byte_position:
+        character_positions[offset_index] = 0
+        offset_index += 1
+    for character_index, char in enumerate(text, 1):
         byte_position += len(char.encode("utf-8"))
-        boundaries[byte_position] = index
-    return boundaries, encoded
+        while offset_index < len(offsets) and offsets[offset_index] == byte_position:
+            character_positions[offset_index] = character_index
+            offset_index += 1
+        if offset_index == len(offsets):
+            break
+    return offsets, tuple(character_positions), encoded
 
 
 def _token_table(raw_tokens: Any, text: str) -> tuple[dict[int, tuple[int, int]], dict[int, str]]:
-    boundaries, encoded = _byte_boundaries(text)
+    encoded = text.encode("utf-8")
+    token_rows: list[tuple[int, str, int, int]] = []
+    requested_offsets: list[int] = []
     positions: dict[int, tuple[int, int]] = {}
     words: dict[int, str] = {}
     for expected_id, token in enumerate(raw_tokens):
@@ -130,11 +151,19 @@ def _token_table(raw_tokens: Any, text: str) -> tuple[dict[int, tuple[int, int]]
         end = token["byte_end"]
         if not _is_int(token_id) or token_id != expected_id or not isinstance(word, str) or not word or len(word) > 4096 or any(ord(char) < 32 for char in word):
             raise _fail("ANALYZER_OUTPUT_INVALID", "runner token is invalid")
-        if not _is_int(start) or not _is_int(end) or start < 0 or end <= start or end > len(encoded) or start not in boundaries or end not in boundaries:
+        if not _is_int(start) or not _is_int(end) or start < 0 or end <= start or end > len(encoded):
             raise _fail("ANALYZER_OUTPUT_INVALID", "runner token offset is invalid")
         if encoded[start:end] != word.encode("utf-8"):
             raise _fail("ANALYZER_OUTPUT_INVALID", "runner token offset does not match cleaned text")
-        positions[token_id] = (boundaries[start], boundaries[end])
+        token_rows.append((token_id, word, start, end))
+        requested_offsets.extend((start, end))
+    boundaries, character_positions, _ = _byte_boundaries(text, requested_offsets, encoded=encoded)
+    for token_id, word, start, end in token_rows:
+        start_position = bisect_left(boundaries, start)
+        end_position = bisect_left(boundaries, end)
+        if start_position >= len(boundaries) or end_position >= len(boundaries) or boundaries[start_position] != start or boundaries[end_position] != end or character_positions[start_position] < 0 or character_positions[end_position] < 0:
+            raise _fail("ANALYZER_OUTPUT_INVALID", "runner token offset is invalid")
+        positions[token_id] = (character_positions[start_position], character_positions[end_position])
         words[token_id] = word
     return positions, words
 
@@ -249,30 +278,55 @@ class BookNLPAnalyzer:
         self._check_cancelled(control)
         characters = _characters(payload["characters"], len(positions))
         spans: list[speakers.SpeakerSpan] = []
-        previous_end = -1
+        warnings = list(payload["warnings"])
+        quote_warnings = 0
+
+        def skip_quote(reason: str) -> None:
+            nonlocal quote_warnings
+            if quote_warnings < MAX_ANALYSIS_WARNINGS and len(warnings) < MAX_ANALYSIS_WARNINGS:
+                warnings.append("BookNLP quote skipped: " + reason + ".")
+                quote_warnings += 1
+
         seen_quote_ids: set[str] = set()
+        candidates: list[tuple[int, int, str, int, int]] = []
         for quote in payload["quotes"]:
             if not isinstance(quote, dict) or set(quote) != {"quote_id", "start_token", "end_token", "coref_id"}:
                 raise _fail("ANALYZER_OUTPUT_INVALID", "runner quote schema mismatch")
             quote_id, start_token, end_token, coref_id = (quote[key] for key in ("quote_id", "start_token", "end_token", "coref_id"))
             quote_id = _clean_string(quote_id, "quote ID", 256)
-            if quote_id in seen_quote_ids or not _is_int(start_token) or not _is_int(end_token) or not _is_int(coref_id) or coref_id < -1 or start_token > end_token or start_token not in positions or end_token not in positions:
+            if quote_id in seen_quote_ids:
+                skip_quote("duplicate quote")
+                continue
+            if not _is_int(start_token) or not _is_int(end_token) or not _is_int(coref_id) or coref_id < -1 or start_token not in positions or end_token not in positions:
                 raise _fail("ANALYZER_OUTPUT_INVALID", "runner quote is invalid")
             seen_quote_ids.add(quote_id)
             start = positions[start_token][0]
             end = positions[end_token][1]
-            if start < previous_end or end <= start:
-                raise _fail("ANALYZER_OUTPUT_INVALID", "runner quotes overlap or are invalid")
+            if start_token > end_token or end <= start:
+                skip_quote("invalid range")
+                continue
             chapter = next((index for index, (chapter_start, chapter_end) in ranges.items() if chapter_start <= start and end <= chapter_end), None)
             if chapter is None:
-                raise _fail("ANALYZER_OUTPUT_INVALID", "runner quote crosses a chapter boundary")
+                skip_quote("crosses a chapter boundary")
+                continue
+            candidates.append((start, end, quote_id, chapter, coref_id))
+        previous_end = -1
+        for start, end, quote_id, chapter, coref_id in sorted(candidates, key=lambda item: (item[0], item[1], item[2])):
+            if start < previous_end:
+                skip_quote("overlaps another quote")
+                continue
             previous_end = end
-            character = characters.get(coref_id) if _is_int(coref_id) and coref_id >= 0 else None
+            character = characters.get(coref_id) if coref_id >= 0 else None
             speaker_id = character[0] if character else None
             span_type = "dialogue" if speaker_id else "unknown"
             score, band, reason = (0.85, "high", "booknlp quote attribution") if speaker_id else (0.2, "low", "speaker unresolved")
             spans.append(speakers.SpeakerSpan(f"booknlp:{quote_id}", chapter, start, end, span_type, speaker_id, speakers.Confidence(score, band, (reason,)), ("booknlp", quote_id)))
-        analysis = speakers.MachineAnalysis(tuple(spans), source_hash, ("booknlp",), tuple(item[1] for item in characters.values()), tuple(payload["warnings"]))
+        offered = len(payload["quotes"])
+        if offered and not spans:
+            raise _fail("ANALYZER_OUTPUT_INVALID", "every runner quote was rejected")
+        if offered >= _MIN_QUOTES_FOR_REJECTION_RATIO and len(spans) < offered * _MAX_QUOTE_REJECTION_RATIO:
+            raise _fail("ANALYZER_OUTPUT_INVALID", "most runner quotes were rejected")
+        analysis = speakers.MachineAnalysis(tuple(spans), source_hash, ("booknlp",), tuple(item[1] for item in characters.values()), tuple(warnings))
         self._check_cancelled(control)
         speakers.validate_machine_spans(analysis, cleaned_text, chapter_plan)
         return analysis

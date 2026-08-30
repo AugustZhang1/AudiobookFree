@@ -233,9 +233,32 @@ APPROVED_VOICE_IDS = tuple(record[0] for record in _VOICE_RECORDS)
 
 _VOICE_BY_ID = MappingProxyType({record[0]: record for record in _VOICE_RECORDS})
 
+# Public catalog metadata is derived from the stable Kokoro ID family rather
+# than generation records. The voice-plan casting contract may consume exactly
+# these values: gender is ``female`` or ``male`` and accent is ``American`` or
+# ``British``. These descriptive fields are intentionally excluded from
+# ``_GENERATION_FIELDS`` and therefore do not affect generation facts or the
+# registry revision/hash.
+_PUBLIC_METADATA_BY_FAMILY = MappingProxyType({
+    "af": ("female", "American"),
+    "am": ("male", "American"),
+    "bf": ("female", "British"),
+    "bm": ("male", "British"),
+})
+
 
 def _record_projection(record: tuple[Any, ...]) -> dict[str, Any]:
     return dict(zip(_FIELDS, record))
+
+
+def _public_record_projection(record: tuple[Any, ...]) -> dict[str, Any]:
+    projected = _record_projection(record)
+    try:
+        gender, accent = _PUBLIC_METADATA_BY_FAMILY[projected["id"][:2]]
+    except (KeyError, TypeError) as exc:
+        raise VoiceRegistryError("voice metadata is unavailable") from exc
+    projected.update(gender=gender, accent=accent)
+    return projected
 
 
 def _canonical_generation_entries() -> bytes:
@@ -256,9 +279,16 @@ def registry_revision() -> str:
 
 
 def list_public_entries() -> tuple[dict[str, Any], ...]:
-    """Return an ordered, path-free snapshot of all public voice entries."""
+    """Return ordered public entries with stable catalog metadata.
 
-    return tuple(_record_projection(record) for record in _VOICE_RECORDS)
+    Every entry contains ``gender`` (``female`` or ``male``) and ``accent``
+    (``American`` or ``British``), derived from the voice ID's ``af``, ``am``,
+    ``bf``, or ``bm`` family. Consumers such as voice-plan casting may use
+    these descriptive fields for matching; they are not generation inputs and
+    are absent from :func:`get_generation_facts`.
+    """
+
+    return tuple(_public_record_projection(record) for record in _VOICE_RECORDS)
 
 
 def _validated_id(voice_id: object) -> str:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import threading
 import time
 import urllib.request
@@ -29,6 +30,7 @@ from .security import (
     read_instance,
     remove_instance_if_matches,
 )
+from .workspace import Workspace
 
 
 class InstanceLock:
@@ -103,6 +105,99 @@ def _open_url(url: str) -> bool:
         return False
 
 
+WORKER_SHUTDOWN_TIMEOUT = 3.0
+
+
+def _reap_worker(
+    worker: object | None,
+    *,
+    request_cancel: Callable[[], None] | None = None,
+    timeout: float = WORKER_SHUTDOWN_TIMEOUT,
+) -> None:
+    """Stop and reap a worker without allowing shutdown cleanup to be skipped."""
+
+    if worker is None:
+        return
+    poll = getattr(worker, "poll", None)
+    try:
+        if callable(poll) and poll() is not None:
+            return
+    except Exception:
+        # A process that disappears while it is being inspected is already on
+        # the idempotent cleanup path; terminate/wait below are safe no-ops for
+        # a real Popen object and are guarded for test doubles.
+        pass
+
+    if request_cancel is not None:
+        try:
+            request_cancel()
+        except Exception:
+            pass
+
+    terminate = getattr(worker, "terminate", None)
+    if callable(terminate):
+        try:
+            terminate()
+        except Exception:
+            pass
+
+    wait = getattr(worker, "wait", None)
+    if not callable(wait):
+        raise RuntimeError("worker process is live but cannot be reaped: wait() is unavailable")
+    wait_error = None
+    try:
+        wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        wait_error = True
+    except Exception as exc:
+        wait_error = exc
+
+    if callable(poll):
+        try:
+            if poll() is not None:
+                return
+        except Exception:
+            pass
+    elif wait_error is None:
+        return
+
+    kill = getattr(worker, "kill", None)
+    if not callable(kill):
+        raise RuntimeError("worker process remained live after terminate/wait: kill() is unavailable")
+    try:
+        kill()
+    except Exception:
+        pass
+    escalation_wait_error = None
+    try:
+        wait(timeout=timeout)
+    except Exception as exc:
+        escalation_wait_error = exc
+    if callable(poll):
+        try:
+            if poll() is None:
+                raise RuntimeError("worker process remained live after kill/wait")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError("worker process could not be verified after kill/wait") from exc
+    elif escalation_wait_error is not None:
+        raise RuntimeError("worker process could not be verified after kill/wait") from escalation_wait_error
+
+
+def _request_worker_cancel(phase1: object) -> None:
+    """Write the cooperative cancellation marker when active state is known."""
+
+    workspace_root = getattr(phase1, "workspace_root", None)
+    if workspace_root is None:
+        return
+    workspace = Workspace(workspace_root)
+    inspection = workspace.inspect_startup()
+    conversion_id = getattr(inspection, "conversion_id", None)
+    if conversion_id:
+        workspace.request_cancel(conversion_id)
+
+
 def run_launcher(*, root: Path | None = None, open_browser: Callable[[str], bool] = _open_url, wait_timeout: float = 10.0, run_server: bool = True) -> int:
     root = root or data_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -124,6 +219,7 @@ def run_launcher(*, root: Path | None = None, open_browser: Callable[[str], bool
     instance_written = False
     server = None
     thread = None
+    app = None
     try:
         stale = read_instance(instance_file)
         if stale:
@@ -163,9 +259,23 @@ def run_launcher(*, root: Path | None = None, open_browser: Callable[[str], bool
         if server is not None and thread is not None and thread.is_alive():
             server.should_exit = True
             thread.join(timeout=3)
-        if instance_written:
-            remove_instance_if_matches(instance_file, launch_id=launch_id, pid=os.getpid(), token=token)
-        lock.close()
+        try:
+            phase1 = getattr(getattr(app, "state", None), "phase1", None)
+            if phase1 is not None:
+                shutdown_event = getattr(phase1, "shutdown_event", None)
+                if shutdown_event is not None:
+                    try:
+                        shutdown_event.set()
+                    except Exception:
+                        pass
+                _reap_worker(
+                    getattr(phase1, "worker_process", None),
+                    request_cancel=lambda: _request_worker_cancel(phase1),
+                )
+            if instance_written:
+                remove_instance_if_matches(instance_file, launch_id=launch_id, pid=os.getpid(), token=token)
+        finally:
+            lock.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

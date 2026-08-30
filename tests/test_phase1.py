@@ -251,6 +251,95 @@ def test_new_launch_binds_loopback_waits_readiness_and_joins(tmp_path: Path, mon
     assert not (root / "instance.lock").exists()
 
 
+def test_launcher_reaps_live_worker_before_instance_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "live-worker"
+    instance_file = root / "instance.json"
+    events: list[str] = []
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.alive = True
+            self.terminated = False
+            self.killed = False
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            events.append("worker.poll")
+            return None if self.alive else self.returncode
+
+        def terminate(self) -> None:
+            events.append("worker.terminate")
+            assert self.alive
+            self.terminated = True
+
+        def kill(self) -> None:
+            events.append("worker.kill")
+            assert self.terminated and self.alive
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append("worker.wait")
+            assert self.terminated
+            assert timeout is not None and timeout > 0
+            assert instance_file.exists()
+            if self.killed:
+                self.alive = False
+                self.returncode = 0
+            return self.returncode
+
+    worker = FakeWorker()
+    phase1 = type("Phase1State", (), {"shutdown_event": threading.Event(), "worker_process": worker, "workspace_root": root})()
+    app = type("FakeApp", (), {"state": type("FakeState", (), {"phase1": phase1})()})()
+
+    class FakeConfig:
+        def __init__(self, _app: object, **_kwargs: object) -> None:
+            pass
+
+    class FakeServer:
+        should_exit = False
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self) -> None:
+            return
+
+    class FakeWorkspace:
+        def __init__(self, _root: Path) -> None:
+            events.append("workspace.init")
+
+        def inspect_startup(self) -> object:
+            events.append("workspace.inspect")
+            return type("Inspection", (), {"conversion_id": "conversion-id"})()
+
+        def request_cancel(self, conversion_id: str) -> None:
+            events.append(f"workspace.cancel:{conversion_id}")
+
+    original_remove = launcher.remove_instance_if_matches
+
+    def fake_remove_instance(path: Path, *, launch_id: str, pid: int, token: str) -> bool:
+        events.append("instance.cleanup")
+        assert not worker.alive
+        return original_remove(path, launch_id=launch_id, pid=pid, token=token)
+
+    monkeypatch.setattr(launcher, "create_app", lambda **_kwargs: app)
+    monkeypatch.setattr(launcher, "choose_port", lambda *_args: 18889)
+    monkeypatch.setattr(launcher.uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(launcher.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(launcher, "_health", lambda _instance: True)
+    monkeypatch.setattr(launcher, "Workspace", FakeWorkspace)
+    monkeypatch.setattr(launcher, "remove_instance_if_matches", fake_remove_instance)
+
+    assert run_launcher(root=root, open_browser=lambda _url: True, run_server=False) == 0
+    assert events.index("workspace.cancel:conversion-id") < events.index("worker.terminate")
+    assert events.index("worker.terminate") < events.index("worker.wait") < events.index("worker.kill") < events.index("instance.cleanup")
+    assert events.count("worker.wait") == 2
+    assert phase1.shutdown_event.is_set()
+    assert worker.terminated and worker.killed and not worker.alive and worker.returncode == 0
+    assert not instance_file.exists()
+    assert not (root / "instance.lock").exists()
+
+
 def test_runtime_assets_have_no_remote_references() -> None:
     for path in Path("src/pdf_audiobook/static").glob("*"):
         if path.suffix not in {".html", ".css", ".js"}:

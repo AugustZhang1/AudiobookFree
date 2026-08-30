@@ -6,6 +6,7 @@ drafts, API transport, and generation concerns.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -14,7 +15,7 @@ import math
 import re
 from typing import Any, Sequence
 
-from . import speakers
+from . import speakers, voice_registry
 from .voice_settings import VoiceSettingsError, canonical_voice_settings
 
 
@@ -33,6 +34,14 @@ _PRONOUN_LABELS = frozenset(
         "they", "them", "their", "theirs", "themselves",
     }
 )
+_PRONOUN_GENDERS = {
+    "he": "male", "him": "male", "his": "male", "himself": "male",
+    "she": "female", "her": "female", "hers": "female", "herself": "female",
+}
+_GENDER_ALIASES = {
+    "f": "female", "female": "female", "woman": "female", "girl": "female",
+    "m": "male", "male": "male", "man": "male", "boy": "male",
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CANONICAL_HASH_FIELD = "canonical_artifact_sha256"
 _VOICE_PLAN_FIELDS = {
@@ -589,6 +598,36 @@ def _has_proper_name_evidence(item: dict[str, Any], aliases: Sequence[Any], fall
     return _looks_like_proper_name(item.get("canonical_label", item.get("display_label", item.get("name", fallback_label))))
 
 
+def _normalized_gender(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _GENDER_ALIASES.get(value.strip().casefold())
+
+
+def _reliable_analyzer_gender(item: dict[str, Any], aliases: Sequence[Any]) -> str | None:
+    explicit = _normalized_gender(item.get("gender"))
+    if explicit is not None:
+        return explicit
+    pronoun_genders = {
+        _PRONOUN_GENDERS[_alias_text(alias).casefold()]
+        for alias in aliases
+        if isinstance(alias, dict) and alias.get("kind") == "pronoun" and _alias_text(alias).casefold() in _PRONOUN_GENDERS
+    }
+    return next(iter(pronoun_genders)) if len(pronoun_genders) == 1 else None
+
+
+def _registry_voice_genders() -> dict[str, str]:
+    genders: dict[str, str] = {}
+    for entry in voice_registry.list_public_entries():
+        if not isinstance(entry, dict):
+            continue
+        voice_id = entry.get("id")
+        gender = _normalized_gender(entry.get("gender"))
+        if isinstance(voice_id, str) and gender is not None:
+            genders[voice_id] = gender
+    return genders
+
+
 def build_voice_plan(
     speaker_analysis: dict[str, Any],
     cleaned_text: str,
@@ -647,8 +686,6 @@ def build_voice_plan(
         if observed_count < MIN_CHARACTER_QUOTE_COUNT:
             continue
         cast_id = _safe_id(original_id, "character")
-        if cast_id in used_ids:
-            continue
         proper_alias = next(
             (_alias_text(alias) for alias in aliases if isinstance(alias, dict) and alias.get("kind") == "proper" and _alias_text(alias)),
             "",
@@ -656,10 +693,34 @@ def build_voice_plan(
         fallback_label = item.get("canonical_label", item.get("display_label", item.get("name", original_id or cast_id)))
         if not _has_proper_name_evidence(item, aliases, fallback_label):
             continue
+        analyzer_gender = _reliable_analyzer_gender(item, aliases)
+        if cast_id in used_ids:
+            existing = next((spec for spec in character_specs if spec["cast_id"] == cast_id), None)
+            if existing is not None:
+                merged_keys = list(existing.get("identity_keys", ()))
+                duplicate_label = proper_alias or _speaker_key(fallback_label)
+                for identity_key in (*identity_keys, _speaker_key(original_id), duplicate_label):
+                    if identity_key and identity_key not in merged_keys:
+                        merged_keys.append(identity_key)
+                existing["identity_keys"] = tuple(merged_keys)
+                merged_aliases = list(existing.get("aliases", []))
+                existing_texts = {_alias_text(alias) for alias in merged_aliases}
+                for alias in aliases:
+                    alias_value = _alias_text(alias)
+                    if alias_value and alias_value not in existing_texts:
+                        merged_aliases.append(alias)
+                        existing_texts.add(alias_value)
+                existing["aliases"] = merged_aliases
+                existing_gender = existing.get("gender")
+                if existing_gender is None:
+                    existing["gender"] = analyzer_gender
+                elif analyzer_gender is not None and analyzer_gender != existing_gender:
+                    existing["gender"] = None
+            continue
         used_ids.add(cast_id)
         label = proper_alias or _speaker_key(fallback_label) or cast_id
         relationship = item.get("relationship", "separate_from_narrator")
-        character_specs.append({"cast_id": cast_id, "source_id": _speaker_key(original_id), "label": label, "relationship": relationship, "aliases": aliases, "identity_keys": identity_keys})
+        character_specs.append({"cast_id": cast_id, "source_id": _speaker_key(original_id), "label": label, "relationship": relationship, "aliases": aliases, "identity_keys": identity_keys, "gender": analyzer_gender})
     # Include speakers that were detected in spans but omitted from characters.
     for item in raw_spans:
         if not isinstance(item, dict):
@@ -674,7 +735,7 @@ def build_voice_plan(
         cast_id = _safe_id(speaker, "character")
         if cast_id not in used_ids:
             used_ids.add(cast_id)
-            character_specs.append({"cast_id": cast_id, "source_id": speaker, "label": speaker, "relationship": "separate_from_narrator", "aliases": [], "identity_keys": (speaker,)})
+            character_specs.append({"cast_id": cast_id, "source_id": speaker, "label": speaker, "relationship": "separate_from_narrator", "aliases": [], "identity_keys": (speaker,), "gender": None})
 
     if not ordered_voices:
         raise _fail("INVALID_VOICE_IDS", "voice_ids must provide at least one voice")
@@ -682,11 +743,21 @@ def build_voice_plan(
     cast: list[dict[str, Any]] = [{"cast_id": "narrator", "display_label": "Narrator", "role": "narrator", "relationship": "third_person", "voice_id": ordered_voices[0], "voice_settings": dict(default_settings)}]
     aliases: list[dict[str, Any]] = []
     original_to_cast: dict[str, str] = {"narrator": "narrator"}
-    for position, spec in enumerate(character_specs, start=1):
+    character_voices = ordered_voices[1:]
+    character_voice_position = 0
+    registry_genders = _registry_voice_genders()
+    for spec in character_specs:
         cast_id, label = spec["cast_id"], spec["label"]
         relationship, alias_values = spec["relationship"], spec["aliases"]
-        cast_voice = ordered_voices[position % len(ordered_voices)]
         if relationship == "same_as_narrator":
+            cast_voice = ordered_voices[0]
+        elif character_voices:
+            fallback_voice = character_voices[character_voice_position % len(character_voices)]
+            character_voice_position += 1
+            spec_gender = spec.get("gender")
+            preferred_voice = next((voice for voice in character_voices if spec_gender is not None and registry_genders.get(voice) == spec_gender), None)
+            cast_voice = preferred_voice or fallback_voice
+        else:
             cast_voice = ordered_voices[0]
         cast.append({"cast_id": cast_id, "display_label": label, "role": "character", "relationship": relationship, "voice_id": cast_voice, "voice_settings": dict(default_settings)})
         original_to_cast[cast_id] = cast_id
@@ -716,10 +787,7 @@ def build_voice_plan(
     chapters: list[dict[str, Any]] = []
     analysis_values = [_analysis_span(item, index, analyzer_id) for index, item in enumerate(raw_spans)]
     seen_span_ids: set[str] = set()
-    chapter_ranges = [(item.get("start_offset"), item.get("end_offset")) for item in chapter_plan["chapters"] if isinstance(item, dict)]
-    for item in analysis_values:
-        if not any(type(start) is int and type(end) is int and start <= item["source_start"] and item["source_end"] <= end for start, end in chapter_ranges):
-            raise _fail("INVALID_ANALYSIS_SPAN", "analysis span is outside the chapter plan")
+    chapter_data: list[tuple[int, int, int, int, int]] = []
     for index, current in enumerate(chapter_plan["chapters"], start=1):
         if not isinstance(current, dict):
             raise _fail("INVALID_CHAPTER_PLAN", "chapter entries must be objects")
@@ -728,13 +796,20 @@ def build_voice_plan(
         chapter_index = current.get("index")
         if type(chapter_index) is not int or chapter_index != index or type(start) is not int or type(end) is not int or start < 0 or end <= start or end > len(cleaned_text) or type(start_page) is not int or type(end_page) is not int:
             raise _fail("INVALID_CHAPTER_PLAN", "chapter offsets are invalid")
-        candidates = [item for item in analysis_values if start <= item["source_start"] and item["source_end"] <= end]
-        for item in analysis_values:
-            if item["source_start"] < 0 or item["source_end"] > len(cleaned_text) or item["source_end"] <= item["source_start"]:
-                raise _fail("INVALID_ANALYSIS_SPAN", "analysis span range is outside cleaned text")
-            if item not in candidates and item["source_start"] < end and item["source_end"] > start:
-                raise _fail("INVALID_ANALYSIS_SPAN", "analysis span crosses a chapter boundary or is outside the chapter plan")
-        candidates.sort(key=lambda item: (item["source_start"], item["source_end"], item["span_id"]))
+        chapter_data.append((chapter_index, start, end, start_page, end_page))
+    analysis_values.sort(key=lambda item: (item["source_start"], item["source_end"], item["span_id"]))
+    chapter_starts = [item[1] for item in chapter_data]
+    candidates_by_chapter: list[list[dict[str, Any]]] = [[] for _ in chapter_data]
+    for item in analysis_values:
+        if item["source_start"] < 0 or item["source_end"] > len(cleaned_text) or item["source_end"] <= item["source_start"]:
+            raise _fail("INVALID_ANALYSIS_SPAN", "analysis span range is outside cleaned text")
+        chapter_position = bisect_right(chapter_starts, item["source_start"]) - 1
+        if chapter_position < 0 or item["source_start"] < chapter_data[chapter_position][1] or item["source_end"] > chapter_data[chapter_position][2]:
+            raise _fail("INVALID_ANALYSIS_SPAN", "analysis span crosses a chapter boundary or is outside the chapter plan")
+        candidates_by_chapter[chapter_position].append(item)
+    for index, current in enumerate(chapter_plan["chapters"], start=1):
+        chapter_index, start, end, start_page, end_page = chapter_data[index - 1]
+        candidates = candidates_by_chapter[index - 1]
         built: list[dict[str, Any]] = []
         cursor = start
         for item in candidates:
@@ -746,7 +821,19 @@ def build_voice_plan(
                 raise _fail("DUPLICATE_SPAN_ID", "analysis span IDs must be unique")
             seen_span_ids.add(item["span_id"])
             item = dict(item)
-            item["speaker_id"] = original_to_cast.get(str(item["speaker_id"]), "narrator")
+            source_speaker = _speaker_key(item["speaker_id"])
+            if source_speaker not in original_to_cast:
+                item["speaker_id"] = "narrator"
+                if source_speaker and source_speaker.casefold() not in {"narrator", "unknown"}:
+                    item["type"] = "unknown"
+                    confidence = item.get("confidence", {})
+                    if isinstance(confidence, dict):
+                        reasons = list(confidence.get("reasons", []))
+                        if "speaker_not_cast" not in reasons:
+                            reasons.append("speaker_not_cast")
+                        item["confidence"] = {**confidence, "reasons": reasons}
+            else:
+                item["speaker_id"] = original_to_cast[source_speaker]
             item["type"] = item["type"] if item["type"] in speakers.SPAN_TYPES else "unknown"
             built.append(item)
             cursor = item["source_end"]
@@ -968,7 +1055,14 @@ def override_span(
         raise _fail("INVALID_SPAN_TYPE", "override type is unsupported")
     span = matches[0]
     previous = span.get("speaker_id") if kind == "speaker" else span.get("type")
-    span[kind if kind == "type" else "speaker_id"] = to
+    if kind == "speaker":
+        span["speaker_id"] = to
+        if to != "narrator" and span.get("type") == "unknown":
+            span["type"] = "dialogue"
+    else:
+        span["type"] = to
+        if to in {"narration", "unknown"}:
+            span["speaker_id"] = "narrator"
     span["override"] = {"kind": kind, "from": str(previous), "to": to, "actor": actor, "reason": reason}
     return _finish_edit(result)
 
@@ -1019,12 +1113,22 @@ def review_summary(artifact: dict[str, Any]) -> dict[str, Any]:
     cast = artifact.get("cast", []) if isinstance(artifact, dict) else []
     chapters = artifact.get("chapters", []) if isinstance(artifact, dict) else []
     spans = [span for chapter in chapters if isinstance(chapter, dict) for span in chapter.get("spans", []) if isinstance(span, dict)]
+    narrator = next((entry for entry in cast if isinstance(entry, dict) and entry.get("cast_id") == "narrator"), None)
+    narrator_voice = narrator.get("voice_id") if narrator is not None else None
+    voice_collision_count = sum(
+        isinstance(entry, dict)
+        and entry.get("role") == "character"
+        and entry.get("relationship") != "same_as_narrator"
+        and narrator_voice is not None
+        and entry.get("voice_id") == narrator_voice
+        for entry in cast
+    )
     bands = {band: 0 for band in speakers.CONFIDENCE_BANDS}
     for span in spans:
         band = span.get("confidence", {}).get("band")
         if band in bands:
             bands[band] += 1
-    return {"cast_count": len(cast), "span_count": len(spans), "confidence": bands, "unresolved_count": sum(span.get("type") == "unknown" for span in spans), "override_count": sum(span.get("override") is not None for span in spans), "revision": artifact.get("revision"), "approval_state": artifact.get("approval", {}).get("state")}
+    return {"cast_count": len(cast), "span_count": len(spans), "confidence": bands, "unresolved_count": sum(span.get("type") == "unknown" for span in spans), "override_count": sum(span.get("override") is not None for span in spans), "speaker_not_cast_count": sum("speaker_not_cast" in span.get("confidence", {}).get("reasons", []) for span in spans), "voice_collision_count": voice_collision_count, "has_voice_collisions": voice_collision_count > 0, "revision": artifact.get("revision"), "approval_state": artifact.get("approval", {}).get("state")}
 
 
 __all__ = [

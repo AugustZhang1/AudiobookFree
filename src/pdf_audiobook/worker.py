@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from collections import OrderedDict
 from pathlib import Path
+import stat
+import threading
 import time
 from typing import Any, Callable
+import uuid
 
 from .audio import validate_wav, write_pcm_wav
 from .chapters import select_chapter_range
-from .security import pid_is_alive
-from .tts import CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_CHUNK_CAP, CHATTERBOX_NANO_MODEL, CHATTERBOX_REFERENCE_VOICE, CHATTERBOX_SAMPLE_RATE, CHATTERBOX_SOURCE_COMMIT, EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, load_voice, plan_chunks, plan_interactive_chunks
+from .security import PID_ALIVE, PID_DEAD, pid_is_alive, pid_liveness
+from .tts import CHATTERBOX_BUILTIN_VOICE, CHATTERBOX_CHUNK_CAP, CHATTERBOX_NANO_MODEL, CHATTERBOX_REFERENCE_VOICE, CHATTERBOX_SAMPLE_RATE, CHATTERBOX_SOURCE_COMMIT, EngineMetadata, InteractiveTextChunk, SynthesisSettings, TextChunk, close_voice, derive_chunk_plan_inputs, load_voice, plan_chunks, plan_interactive_chunks
 from .voice_shaping import shape_pcm, shaping_fingerprint
 from .voice_settings import canonical_voice_settings
 from .voice_registry import get_generation_facts, registry_revision
@@ -22,6 +26,55 @@ from .m4b import Phase5Cancelled, finalize_conversion
 
 MAX_ATTEMPTS = 3
 VOICE_CACHE_CAP = 2
+WORKER_LOCK_FILENAME = ".conversion-worker.lock"
+_WORKER_LOCK_RETRIES = 8
+_WORKER_LOCK_RETRY_DELAY_SECONDS = 0.05
+RETRY_BACKOFF_SECONDS = 0.25
+_WORKER_LOCK_STALE_SECONDS = 300.0
+_WORKER_LOCK_HEARTBEAT_SECONDS = 10.0
+
+
+@dataclass
+class _WorkerLease:
+    path: Path
+    fd: int
+    token: str
+    stop: threading.Event
+    heartbeat_thread: threading.Thread | None = None
+
+    def start_heartbeat(self) -> None:
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, name="conversion-worker-lock-heartbeat", daemon=True)
+        self.heartbeat_thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self.stop.wait(_WORKER_LOCK_HEARTBEAT_SECONDS):
+            try:
+                os.utime(self.path, None)
+            except OSError:
+                return
+
+    def release(self) -> None:
+        self.stop.set()
+        if self.heartbeat_thread is not None:
+            self.heartbeat_thread.join(timeout=max(1.0, _WORKER_LOCK_HEARTBEAT_SECONDS))
+        owned = False
+        try:
+            info = self.path.stat(follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode):
+                marker = json.loads(self.path.read_text(encoding="utf-8"))
+                owned = isinstance(marker, dict) and marker.get("pid") == os.getpid() and marker.get("token") == self.token
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        if owned:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
 
 
 def _validate_captured_voice_facts(tts: dict[str, Any], facts: dict[str, Any], voice_id: str) -> None:
@@ -67,20 +120,125 @@ class ConversionWorker:
         self.conversion_id = conversion_id
         self.engine_factory = engine_factory
         self.max_attempts = max_attempts
+        self.retry_backoff_seconds = RETRY_BACKOFF_SECONDS
 
     @staticmethod
     def _timestamp() -> str:
         return __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+    def _worker_lock_is_stale(self, path: Path) -> bool:
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return False
+        age = max(0.0, time.time() - info.st_mtime)
+        try:
+            marker = json.loads(path.read_text(encoding="utf-8"))
+            pid = marker.get("pid") if isinstance(marker, dict) else None
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pid = None
+        if isinstance(pid, int) and pid > 0:
+            liveness = pid_liveness(pid)
+            if liveness == PID_DEAD:
+                return True
+            if liveness == PID_ALIVE:
+                # Never steal a lock from a confirmed-live worker: a heartbeat
+                # delayed by long synthesis or a suspended process would
+                # otherwise let a second worker overwrite the same chunks.
+                return False
+        # The owner cannot be queried (Windows ACCESS_DENIED). Only the bounded
+        # lease can free it, or an inaccessible crashed owner wedges this
+        # conversion forever.
+        return age >= _WORKER_LOCK_STALE_SECONDS
+
+    def _acquire_worker_lock(self) -> _WorkerLease:
+        path = self.workspace.conversion_path(self.conversion_id) / WORKER_LOCK_FILENAME
+        token = uuid.uuid4().hex
+        marker = {"pid": os.getpid(), "started_at": self._timestamp(), "token": token}
+        encoded = (json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        retries = max(1, _WORKER_LOCK_RETRIES)
+        reclaimed_stale = False
+        self._reclaimed_stale_lock = False
+        for attempt in range(retries):
+            try:
+                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                if self._worker_lock_is_stale(path):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                    else:
+                        # Note that THIS attempt removed a stale lock.  The flag is
+                        # only promoted to the instance once the following O_EXCL
+                        # acquisition actually wins, so a worker that loses the race
+                        # cannot carry a bypass it did not earn.
+                        reclaimed_stale = True
+                    continue
+                if attempt + 1 >= retries:
+                    raise WorkerBusyError("a conversion worker is already active")
+                time.sleep(_WORKER_LOCK_RETRY_DELAY_SECONDS)
+            except PermissionError:
+                if attempt + 1 >= retries:
+                    raise WorkerBusyError("a conversion worker lock is unavailable")
+                time.sleep(_WORKER_LOCK_RETRY_DELAY_SECONDS)
+            else:
+                try:
+                    written = 0
+                    while written < len(encoded):
+                        written += os.write(fd, encoded[written:])
+                    os.fsync(fd)
+                except Exception:
+                    os.close(fd)
+                    path.unlink(missing_ok=True)
+                    raise
+                lease = _WorkerLease(path, fd, token, threading.Event())
+                lease.start_heartbeat()
+                self._reclaimed_stale_lock = reclaimed_stale
+                return lease
+        raise WorkerBusyError("a conversion worker is already active")
+
+    def _retryable(self, error: Exception) -> bool:
+        """Retrying a deterministic failure just burns identical model invocations."""
+
+        return not isinstance(error, (ValueError, TypeError, KeyError, ManifestError))
+
+    def _backoff(self, attempt: int) -> bool:
+        """Pause between attempts. Returns False when no attempts remain."""
+
+        if attempt + 1 >= self.max_attempts:
+            return False
+        if self.retry_backoff_seconds > 0:
+            time.sleep(self.retry_backoff_seconds * (attempt + 1))
+        return True
+
     def _refuse_if_busy(self, job: dict[str, Any]) -> None:
+        # The exclusive conversion lease is the authority on ownership.  Once this
+        # process holds it, a recorded PID belonging to a dead-but-inaccessible
+        # owner (pid_is_alive() reports True on Windows ACCESS_DENIED) must not be
+        # able to wedge the conversion.
+        if self._holds_conversion_lease():
+            return
         worker = job.get("worker")
         if worker and worker.get("pid") != os.getpid() and pid_is_alive(worker.get("pid", -1)):
             raise WorkerBusyError("a conversion worker is already active")
 
+    def _holds_conversion_lease(self) -> bool:
+        return getattr(self, "_lease", None) is not None and getattr(self, "_reclaimed_stale_lock", False)
+
     def _claim(self, job: dict[str, Any]) -> dict[str, Any]:
         self._refuse_if_busy(job)
         now = self._timestamp()
-        return self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", worker={"pid": os.getpid(), "started_at": now, "updated_at": now}, error=None, last_safe_error=None)
+        # Only a fresh claim after configure/resume may explicitly leave a
+        # cancelled manifest.  All progress, completion, and error writes use
+        # the ordinary terminal-cancellation behavior.
+        return self.workspace.update_generation(self.conversion_id, allow_cancelled_resume=job.get("status") == "cancelled", status="synthesizing", stage="synthesis", worker={"pid": os.getpid(), "started_at": now, "updated_at": now}, error=None, last_safe_error=None)
 
     def _claim_phase5(self, job: dict[str, Any]) -> dict[str, Any]:
         self._refuse_if_busy(job)
@@ -95,15 +253,16 @@ class ConversionWorker:
         text, _ = self.workspace.load_cleaned_artifacts(self.conversion_id)
         plan = self.workspace.load_chapter_plan(self.conversion_id)
         tts = job["tts"]
+        plan_inputs = derive_chunk_plan_inputs(tts, interactive=False)
         metadata = EngineMetadata(
-            str(tts["engine"]), str(tts.get("package_version", "")), str(tts.get("model", tts.get("model_id", ""))),
+            str(tts["engine"]), str(tts.get("package_version", "")), plan_inputs.model,
             str(tts.get("model_revision", "")), str(tts.get("model_checksum", "")), str(tts["voice"]),
             str(tts.get("voice_version", "")), str(tts.get("voice_checksum", "")), int(tts["sample_rate"]),
-            dict(tts.get("settings", {"speed": tts["speed"], "sample_rate": tts["sample_rate"], "chunk_cap": tts.get("chunk_cap", 900)})),
+            plan_inputs.settings,
         )
-        settings = metadata.settings
+        settings = plan_inputs.settings
         chapters = select_chapter_range(plan, settings.get("chapter_start"), settings.get("chapter_end"))
-        return plan_chunks(text, chapters, metadata, cap=int(settings.get("chunk_cap", 900)))
+        return plan_chunks(text, chapters, metadata, cap=plan_inputs.cap)
 
     def _planned_interactive_chunks(self, job: dict[str, Any]) -> list[InteractiveTextChunk]:
         text, _ = self.workspace.load_cleaned_artifacts(self.conversion_id)
@@ -120,7 +279,8 @@ class ConversionWorker:
         if current_registry_revision != job.get("voice_registry_revision"):
             raise ManifestError("voice registry revision does not match generation manifest")
         tts = job["tts"]
-        settings = tts.get("settings") if isinstance(tts.get("settings"), dict) else {}
+        plan_inputs = derive_chunk_plan_inputs(tts, interactive=True)
+        settings = plan_inputs.settings
         chapter_start, chapter_end = settings.get("chapter_start"), settings.get("chapter_end")
         chapter_range = None
         if chapter_start is not None or chapter_end is not None:
@@ -133,15 +293,20 @@ class ConversionWorker:
             get_generation_facts,
             current_registry_revision,
             chapter_range=chapter_range,
-            cap=int(tts.get("chunk_cap", settings.get("chunk_cap", 900))),
+            cap=plan_inputs.cap,
         )
 
     def _chunk_path(self, chunk: TextChunk) -> Path:
         return self.workspace.chunks_path(self.conversion_id) / f"chapter-{chunk.chapter_index:03d}-chunk-{chunk.local_index:04d}.wav"
 
-    def _existing(self, job: dict[str, Any], chunk: TextChunk) -> dict[str, Any] | None:
+    def _existing(self, job: dict[str, Any], chunk: TextChunk, completed_by_index: dict[int, dict[str, Any]] | None = None) -> dict[str, Any] | None:
         expected_path = self._chunk_path(chunk).relative_to(self.workspace.conversion_path(self.conversion_id)).as_posix()
-        for record in job["completed_chunks"]:
+        if completed_by_index is None:
+            records = job["completed_chunks"]
+        else:
+            record = completed_by_index.get(chunk.global_index)
+            records = (record,) if record is not None else ()
+        for record in records:
             if (
                 record["chapter_index"] != chunk.chapter_index
                 or record["local_index"] != chunk.local_index
@@ -286,13 +451,18 @@ class ConversionWorker:
                     loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"], reference_wav=reference_wav)
                 else:
                     loaded = self.engine_factory(job["tts"]["voice"], settings, engine=job["tts"]["engine"])
-            completed = {record["global_index"]: record for record in job["completed_chunks"]}
+            completed_by_index = {record["global_index"]: record for record in job["completed_chunks"]}
+            completed: dict[int, dict[str, Any]] = {}
             for chunk in chunks:
                 if self.workspace.cancellation_requested(self.conversion_id):
                     raise CancellationRequested
-                reused = self._existing(job, chunk)
+                reused = self._existing(job, chunk, completed_by_index)
                 if reused is not None:
                     completed[chunk.global_index] = reused
+            for chunk in chunks:
+                if self.workspace.cancellation_requested(self.conversion_id):
+                    raise CancellationRequested
+                if chunk.global_index in completed:
                     continue
                 path = self._chunk_path(chunk)
                 # A mismatched regular file is replaced only after inspection;
@@ -307,6 +477,8 @@ class ConversionWorker:
                         break
                     except Exception as exc:  # bounded, factual retry
                         error = exc
+                        if not self._retryable(exc) or not self._backoff(attempt):
+                            break
                 if pcm is None:
                     message = f"chunk {chunk.global_index} failed after {self.max_attempts} attempts"
                     self.workspace.update_generation(self.conversion_id, status="failed", stage="synthesis", error=message, last_safe_error=message, worker=None)
@@ -316,8 +488,14 @@ class ConversionWorker:
                 completed[chunk.global_index] = {**chunk.manifest_record(relative, info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                 ordered = [completed[index] for index in sorted(completed)]
                 job = self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", completed_chunks=ordered, progress={"completed": len(ordered), "current": chunk.global_index + 1, "total": len(chunks)}, worker={"pid": os.getpid(), "started_at": job["worker"]["started_at"], "updated_at": self._timestamp()})
+                if job["status"] == "cancelled":
+                    raise CancellationRequested
+                if self.workspace.cancellation_requested(self.conversion_id):
+                    raise CancellationRequested
             final_records = [completed[index] for index in sorted(completed)]
-            self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
+            final_job = self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
+            if final_job["status"] == "cancelled":
+                return WorkerResult("cancelled", len(final_job["completed_chunks"]), len(chunks), attempts_total)
             if full_pipeline:
                 self._claim_phase5(self.workspace.read_job(self.conversion_id))
                 try:
@@ -332,7 +510,7 @@ class ConversionWorker:
             message = "worker failed: " + type(exc).__name__
             try:
                 current = self.workspace.read_job(self.conversion_id)
-                if current.get("stage") not in {"assembling", "encoding", "verifying", "publishing", "phase5"}:
+                if current.get("status") != "failed" and current.get("stage") not in {"assembling", "encoding", "verifying", "publishing", "phase5"}:
                     self.workspace.update_generation(self.conversion_id, status="failed", stage="synthesis", error=message, last_safe_error=message, worker=None)
             except Exception:
                 pass
@@ -465,6 +643,8 @@ class ConversionWorker:
                         break
                     except Exception as exc:
                         error = exc
+                        if not self._retryable(exc) or not self._backoff(_attempt):
+                            break
                 if pcm is None:
                     message = f"chunk {chunk.global_index} failed after {self.max_attempts} attempts"
                     self.workspace.update_generation(self.conversion_id, status="failed", stage="synthesis", error=message, last_safe_error=message, worker=None)
@@ -474,8 +654,14 @@ class ConversionWorker:
                 completed[chunk.global_index] = {**chunk.manifest_record(relative, info.duration_seconds), "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                 ordered = [completed[index] for index in sorted(completed)]
                 job = self.workspace.update_generation(self.conversion_id, status="synthesizing", stage="synthesis", completed_chunks=ordered, progress={"completed": len(ordered), "current": chunk.global_index + 1, "total": len(chunks)}, worker={"pid": os.getpid(), "started_at": job["worker"]["started_at"], "updated_at": self._timestamp()})
+                if job["status"] == "cancelled":
+                    raise CancellationRequested
+                if self.workspace.cancellation_requested(self.conversion_id):
+                    raise CancellationRequested
             final_records = [completed[index] for index in sorted(completed)]
-            self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
+            final_job = self.workspace.update_generation(self.conversion_id, status="completed", stage="synthesis_complete", completed_chunks=final_records, progress={"completed": len(final_records), "current": len(chunks), "total": len(chunks)}, worker=None, output=None)
+            if final_job["status"] == "cancelled":
+                return WorkerResult("cancelled", len(final_job["completed_chunks"]), len(chunks), attempts_total)
             if full_pipeline:
                 self._claim_phase5(self.workspace.read_job(self.conversion_id))
                 try:
@@ -500,16 +686,41 @@ class ConversionWorker:
                 close_cached(loaded)
 
     def run(self, *, engine: Any | None = None, full_pipeline: bool | None = None) -> WorkerResult:
-        if full_pipeline is None:
-            full_pipeline = engine is None
-        job = self.workspace.read_job(self.conversion_id)
-        if job.get("schema_version") == 5:
-            if engine is not None:
-                raise ManifestError("schema-v5 requires an engine factory")
-            return self._run_v5(job, full_pipeline=full_pipeline)
-        if job.get("schema_version") != 4:
-            raise ManifestError("job must be configured for generation")
-        return self._run_v4(job, engine=engine, full_pipeline=full_pipeline)
+        lease = self._acquire_worker_lock()
+        self._lease = lease
+        try:
+            if full_pipeline is None:
+                full_pipeline = engine is None
+            job = self.workspace.read_job(self.conversion_id)
+            if job.get("schema_version") == 5:
+                if engine is not None:
+                    raise ManifestError("schema-v5 requires an engine factory")
+                return self._run_v5(job, full_pipeline=full_pipeline)
+            if job.get("schema_version") != 4:
+                raise ManifestError("job must be configured for generation")
+            return self._run_v4(job, engine=engine, full_pipeline=full_pipeline)
+        finally:
+            self._lease = None
+            self._reclaimed_stale_lock = False
+            lease.release()
+
+
+def conversion_worker_lock_is_reclaimable(workspace: Workspace, conversion_id: str) -> bool:
+    """Report whether a conversion's worker lock exists but is provably abandoned.
+
+    A crashed owner whose PID is inaccessible (Windows ACCESS_DENIED) reports as
+    alive forever, so a recorded PID alone can wedge a conversion permanently.
+    This returns True only when a lock file is actually present AND stale, so a
+    manifest with no lock at all still falls back to the recorded-PID check.
+    """
+
+    path = workspace.conversion_path(conversion_id) / WORKER_LOCK_FILENAME
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+    return ConversionWorker(workspace, conversion_id)._worker_lock_is_stale(path)
 
 
 def run_worker(workspace_root: str | Path, conversion_id: str) -> WorkerResult:

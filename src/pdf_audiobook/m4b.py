@@ -14,12 +14,13 @@ import stat
 import struct
 import subprocess
 import tempfile
+import warnings
 import wave
 from typing import Any, Callable, Iterable
 
 from .audio import validate_wav
 from .chapters import select_chapter_range
-from .tts import EngineMetadata, plan_chunks, plan_interactive_chunks, _SENTENCE_FINAL
+from .tts import EngineMetadata, derive_chunk_plan_inputs, plan_chunks, plan_interactive_chunks, _SENTENCE_FINAL
 from .voice_registry import get_generation_facts, registry_revision
 from .workspace import INTERACTIVE_GENERATION_SCHEMA_VERSION, Workspace, atomic_write_text
 
@@ -132,6 +133,15 @@ def _prepare_working_file(path: Path) -> None:
         path.unlink()
 
 
+def _cleanup_phase5_artifacts(workspace: Workspace, conversion_id: str) -> None:
+    phase5 = Path(workspace.conversion_path(conversion_id)) / ".phase5"
+    _safe_directory(phase5, create=False)
+    for name in ("assembled.wav", "encoded.m4b", "metadata.txt"):
+        artifact = phase5 / name
+        if artifact.exists() or artifact.is_symlink():
+            artifact.unlink(missing_ok=True)
+
+
 def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any], dict[str, Any], list[dict[str, Any]]]:
     job = workspace.read_job(conversion_id)
     text, _ = workspace.load_cleaned_artifacts(conversion_id)
@@ -155,11 +165,17 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
         plan_voice_ids = list(dict.fromkeys(plan_voice_ids))
         if plan_voice_ids != job.get("cast_voice_ids"):
             raise M4BError("voice cast does not match the bound generation")
-        settings = tts.get("settings", {}) if isinstance(tts.get("settings", {}), dict) else {}
+        plan_inputs = derive_chunk_plan_inputs(tts, interactive=True)
+        settings = plan_inputs.settings
         chapter_start = settings.get("chapter_start")
         chapter_end = settings.get("chapter_end")
         start = 1 if chapter_start is None else chapter_start
         end = len(plan["chapters"]) if chapter_end is None else chapter_end
+        chapter_range = None
+        if chapter_start is not None or chapter_end is not None:
+            if type(chapter_start) is not int or type(chapter_end) is not int:
+                raise M4BError("captured chapter range is invalid")
+            chapter_range = (chapter_start, chapter_end)
         chapters = select_chapter_range(plan, chapter_start, chapter_end)
         # Interactive chunks retain their original chapter indexes. Preserve
         # those indexes on the selected chapter metadata used for assembly.
@@ -171,20 +187,22 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
                 voice_plan,
                 get_generation_facts,
                 job["voice_registry_revision"],
-                chapter_range=(start, end),
-                cap=int(tts.get("chunk_cap", 900)),
+                chapter_range=chapter_range,
+                cap=plan_inputs.cap,
             )
         except Exception as exc:
             raise M4BError("interactive chunk plan is invalid") from exc
     else:
+        plan_inputs = derive_chunk_plan_inputs(tts, interactive=False)
         metadata = EngineMetadata(
-            str(tts["engine"]), str(tts.get("package_version", "")), str(tts.get("model", "")),
+            str(tts["engine"]), str(tts.get("package_version", "")), plan_inputs.model,
             str(tts.get("model_revision", "")), str(tts.get("model_checksum", "")), str(tts["voice"]),
             str(tts.get("voice_version", "")), str(tts.get("voice_checksum", "")), int(tts["sample_rate"]),
-            dict(tts.get("settings", {})),
+            plan_inputs.settings,
         )
-        chapters = select_chapter_range(plan, metadata.settings.get("chapter_start"), metadata.settings.get("chapter_end"))
-        chunks = plan_chunks(text, chapters, metadata, cap=int(tts.get("chunk_cap", 900)))
+        settings = plan_inputs.settings
+        chapters = select_chapter_range(plan, settings.get("chapter_start"), settings.get("chapter_end"))
+        chunks = plan_chunks(text, chapters, metadata, cap=plan_inputs.cap)
     records = job["completed_chunks"]
     if not chunks or len(chunks) != job["total_chunks"] or len(records) != len(chunks):
         raise M4BError("completed chunk set does not match the current plan")
@@ -214,7 +232,13 @@ def _recorded_chunks(workspace: Workspace, conversion_id: str) -> tuple[list[Any
         digest = _sha256(path)
         if "wav_sha256" in record and (record["wav_sha256"] == "0" * 64 or record["wav_sha256"] != digest):
             raise M4BError("completed chunk WAV hash mismatch")
-        if float(record["duration_seconds"]) != info.frames / info.sample_rate:
+        try:
+            recorded_duration = float(record["duration_seconds"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise M4BError("completed chunk duration is invalid") from exc
+        if not math.isfinite(recorded_duration) or recorded_duration <= 0:
+            raise M4BError("completed chunk duration is invalid")
+        if round(recorded_duration * info.sample_rate) != info.frames:
             raise M4BError("completed chunk duration does not match WAV frames")
         ordered.append((chunk, path, info))
     return ordered, {**plan, "chapters": chapters}, job
@@ -545,6 +569,13 @@ def finalize_conversion(workspace: Workspace, conversion_id: str, *, command_run
         stage("publishing")
         title = (workspace.load_analysis(conversion_id).get("title") or Path(workspace.read_job(conversion_id)["original_display_filename"]).stem)
         output = publish_verified_output(encoded, title=str(title), conversion_id=conversion_id, duration_seconds=verified.duration_seconds, chapter_count=verified.chapter_count, codec=verified.codec, destination=destination)
+        try:
+            _cleanup_phase5_artifacts(workspace, conversion_id)
+        except Exception:
+            try:
+                warnings.warn("phase 5 working artifact cleanup failed", RuntimeWarning, stacklevel=2)
+            except Exception:
+                pass
         workspace.update_generation(conversion_id, status="completed", stage="completed", output=output, error=None, last_safe_error=None, worker=None)
         return output
     except Phase5Cancelled:

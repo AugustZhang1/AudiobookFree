@@ -128,14 +128,21 @@ def _document_title(value: Any) -> str:
     return value.strip()
 
 
-def _candidate_offset(text: str, mapping: list[dict[str, int]], candidate: Any) -> int | None:
+def _candidate_offset(
+    text: str,
+    mapping: list[dict[str, int]],
+    candidate: Any,
+    *,
+    sentence_boundaries: set[int] | None = None,
+    heading_boundaries: dict[int, str] | None = None,
+) -> int | None:
     if not isinstance(candidate, dict) or not isinstance(candidate.get("title"), str):
         return None
     title = candidate["title"].strip()
     if not title:
         return None
     direct = candidate.get("cleaned_offset", candidate.get("offset"))
-    if type(direct) is int and 0 <= direct < len(text) and text[direct : direct + len(title)].casefold() == title.casefold() and _validate_boundary_safety(text, mapping, direct, allow_line_start=True):
+    if type(direct) is int and 0 <= direct < len(text) and text[direct : direct + len(title)].casefold() == title.casefold() and _validate_boundary_safety(text, mapping, direct, allow_line_start=True, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries):
         return direct
     page = candidate.get("source_page")
     if type(page) is not int or page < 1:
@@ -147,7 +154,7 @@ def _candidate_offset(text: str, mapping: list[dict[str, int]], candidate: Any) 
     if _source_type(_candidate_source(candidate)) == "outline":
         return start
     found = text.casefold().find(title.casefold(), start, end)
-    if found >= 0 and (_validate_boundary_safety(text, mapping, found) or _line_start(text, found)):
+    if found >= 0 and (_validate_boundary_safety(text, mapping, found, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries) or _line_start(text, found)):
         return found
     # Tolerate title punctuation/whitespace differences while remaining page-local.
     compact_title = re.sub(r"\s+", " ", title).casefold()
@@ -155,7 +162,7 @@ def _candidate_offset(text: str, mapping: list[dict[str, int]], candidate: Any) 
         line = re.sub(r"\s+", " ", line_match.group(0).strip()).casefold()
         if line == compact_title or compact_title in line:
             offset = start + line_match.start() + len(line_match.group(0)) - len(line_match.group(0).lstrip())
-            if _validate_boundary_safety(text, mapping, offset) or _line_start(text, offset):
+            if _validate_boundary_safety(text, mapping, offset, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries) or _line_start(text, offset):
                 return offset
     return None
 
@@ -204,9 +211,16 @@ def _line_start(text: str, offset: int) -> bool:
     return not text[line_start:offset].strip()
 
 
-def _safe_custom_candidates(text: str, mapping: list[dict[str, int]], supplied: Any) -> list[tuple[int, int, str | None, str]]:
-    headings = _heading_boundaries(text)
-    sentences = _sentence_boundaries(text)
+def _safe_custom_candidates(
+    text: str,
+    mapping: list[dict[str, int]],
+    supplied: Any,
+    *,
+    sentence_boundaries: set[int] | None = None,
+    heading_boundaries: dict[int, str] | None = None,
+) -> list[tuple[int, int, str | None, str]]:
+    headings = _heading_boundaries(text) if heading_boundaries is None else heading_boundaries
+    sentences = _sentence_boundaries(text) if sentence_boundaries is None else sentence_boundaries
     candidates: dict[int, tuple[int, str | None, str]] = {
         offset: (0, title, "heading") for offset, title in headings.items() if 0 < offset < len(text)
     }
@@ -214,7 +228,7 @@ def _safe_custom_candidates(text: str, mapping: list[dict[str, int]], supplied: 
         for candidate in supplied:
             if not isinstance(candidate, dict):
                 continue
-            offset = _candidate_offset(text, mapping, candidate)
+            offset = _candidate_offset(text, mapping, candidate, sentence_boundaries=sentences, heading_boundaries=headings)
             if offset is None or not 0 < offset < len(text):
                 continue
             title = candidate.get("title") if isinstance(candidate.get("title"), str) else None
@@ -277,12 +291,22 @@ def _assemble(text: str, mapping: list[dict[str, int]], boundaries: list[tuple[i
     return plan
 
 
-def _original_plan(text: str, mapping: list[dict[str, int]], candidates: Any, document_title: str | None) -> dict[str, Any]:
+def _original_plan(
+    text: str,
+    mapping: list[dict[str, int]],
+    candidates: Any,
+    document_title: str | None,
+    *,
+    sentence_boundaries: set[int] | None = None,
+    heading_boundaries: dict[int, str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(candidates, list):
         raise _fail("INVALID_CANDIDATES", "chapter_candidates must be a list")
+    sentence_boundaries = _sentence_boundaries(text) if sentence_boundaries is None else sentence_boundaries
+    heading_boundaries = _heading_boundaries(text) if heading_boundaries is None else heading_boundaries
     resolved_candidates: list[tuple[int, str, str, int]] = []
     for candidate in candidates:
-        offset = _candidate_offset(text, mapping, candidate)
+        offset = _candidate_offset(text, mapping, candidate, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
         if offset is None or offset < 0 or offset >= len(text):
             continue
         title = str(candidate.get("title", "")).strip()
@@ -321,10 +345,20 @@ def _original_plan(text: str, mapping: list[dict[str, int]], candidates: Any, do
     return _assemble(text, mapping, boundaries, [])
 
 
-def _custom_plan(text: str, mapping: list[dict[str, int]], candidates_input: Any, count: int) -> dict[str, Any]:
+def _custom_plan(
+    text: str,
+    mapping: list[dict[str, int]],
+    candidates_input: Any,
+    count: int,
+    *,
+    sentence_boundaries: set[int] | None = None,
+    heading_boundaries: dict[int, str] | None = None,
+) -> dict[str, Any]:
     if type(count) is not int or count < MIN_CUSTOM_COUNT or count > MAX_CUSTOM_COUNT:
         raise _fail("INVALID_COUNT", "custom count must be an integer from 2 through 50")
-    candidates = _safe_custom_candidates(text, mapping, candidates_input)
+    sentence_boundaries = _sentence_boundaries(text) if sentence_boundaries is None else sentence_boundaries
+    heading_boundaries = _heading_boundaries(text) if heading_boundaries is None else heading_boundaries
+    candidates = _safe_custom_candidates(text, mapping, candidates_input, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
     if len(candidates) < count - 1:
         raise _fail("COUNT_TOO_HIGH", "The requested chapter count cannot be reached safely.", recommended_maximum=len(candidates) + 1, mode="whole")
     word_starts = _word_starts(text)
@@ -348,14 +382,13 @@ def _custom_plan(text: str, mapping: list[dict[str, int]], candidates_input: Any
         chosen_pool = preferred or near or available
         _, priority, offset, previous_index, title, source_type = min(chosen_pool, key=lambda item: (item[1], item[0], item[2]))
         selected.append((offset, previous_index, title, source_type))
-    headings = _heading_boundaries(text)
-    first_title = headings.get(0)
+    first_title = heading_boundaries.get(0)
     first_source = "heading" if first_title else "custom"
     if isinstance(candidates_input, list):
         for candidate in candidates_input:
             if not isinstance(candidate, dict) or not isinstance(candidate.get("title"), str):
                 continue
-            offset = _candidate_offset(text, mapping, candidate)
+            offset = _candidate_offset(text, mapping, candidate, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
             if offset == 0:
                 first_title = candidate["title"].strip() or first_title
                 first_source = _source_type(_candidate_source(candidate))
@@ -364,8 +397,8 @@ def _custom_plan(text: str, mapping: list[dict[str, int]], candidates_input: Any
     boundaries: list[tuple[int, str, str]] = []
     for index, start in enumerate(starts, 1):
         selected_item = next((item for item in selected if item[0] == start), None)
-        title = selected_item[2] if selected_item and selected_item[2] else ((first_title or f"Chapter {index:02d}") if index == 1 else headings.get(start, f"Chapter {index:02d}"))
-        source_type = selected_item[3] if selected_item else (first_source if index == 1 else ("heading" if start in headings else "custom"))
+        title = selected_item[2] if selected_item and selected_item[2] else ((first_title or f"Chapter {index:02d}") if index == 1 else heading_boundaries.get(start, f"Chapter {index:02d}"))
+        source_type = selected_item[3] if selected_item else (first_source if index == 1 else ("heading" if start in heading_boundaries else "custom"))
         boundaries.append((start, title, source_type))
     warnings: list[str] = []
     if total_words / count < SHORT_CHAPTER_WORDS:
@@ -385,6 +418,8 @@ def create_chapter_plan(cleaned_text: str, cleaned_map: Any, chapter_candidates:
     """Create a deterministic original, custom, or whole-book plan."""
 
     mapping = _validate_inputs(cleaned_text, cleaned_map)
+    sentence_boundaries: set[int] | None = None
+    heading_boundaries: dict[int, str] | None = None
     if mode == "whole":
         title = _document_title(document_title) or "Whole Book"
         plan = {
@@ -396,20 +431,28 @@ def create_chapter_plan(cleaned_text: str, cleaned_map: Any, chapter_candidates:
             "warnings": [],
         }
     elif mode == "original":
-        plan = _original_plan(cleaned_text, mapping, chapter_candidates, document_title)
+        sentence_boundaries = _sentence_boundaries(cleaned_text)
+        heading_boundaries = _heading_boundaries(cleaned_text)
+        plan = _original_plan(cleaned_text, mapping, chapter_candidates, document_title, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
     elif mode == "custom":
-        plan = _custom_plan(cleaned_text, mapping, chapter_candidates, count if count is not None else 0)
+        sentence_boundaries = _sentence_boundaries(cleaned_text)
+        heading_boundaries = _heading_boundaries(cleaned_text)
+        plan = _custom_plan(cleaned_text, mapping, chapter_candidates, count if count is not None else 0, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
     else:
         raise _fail("INVALID_MODE", "mode must be original, custom, or whole")
-    return validate_chapter_plan(plan, cleaned_text, mapping)
+    return _validate_chapter_plan(plan, cleaned_text, mapping, sentence_boundaries=sentence_boundaries, heading_boundaries=heading_boundaries)
 
 
-def validate_chapter_plan(plan: Any, cleaned_text: str, cleaned_map: Any) -> dict[str, Any]:
-    """Strictly validate plan schema, coverage, hashes, pages, and safe boundaries."""
-
-    mapping = _validate_inputs(cleaned_text, cleaned_map)
-    sentence_boundaries = _sentence_boundaries(cleaned_text)
-    heading_boundaries = _heading_boundaries(cleaned_text)
+def _validate_chapter_plan(
+    plan: Any,
+    cleaned_text: str,
+    mapping: list[dict[str, int]],
+    *,
+    sentence_boundaries: set[int] | None = None,
+    heading_boundaries: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    sentence_boundaries = _sentence_boundaries(cleaned_text) if sentence_boundaries is None else sentence_boundaries
+    heading_boundaries = _heading_boundaries(cleaned_text) if heading_boundaries is None else heading_boundaries
     if not isinstance(plan, dict) or set(plan) != {"schema_version", "mode", "requested_count", "cleaned_text_sha256", "chapters", "warnings"}:
         raise _fail("INVALID_PLAN", "chapter plan schema mismatch")
     if type(plan["schema_version"]) is not int or plan["schema_version"] != SCHEMA_VERSION:
@@ -455,6 +498,13 @@ def validate_chapter_plan(plan: Any, cleaned_text: str, cleaned_map: Any) -> dic
     if expected_start != len(cleaned_text):
         raise _fail("INVALID_PLAN", "chapters do not cover the complete cleaned text")
     return plan
+
+
+def validate_chapter_plan(plan: Any, cleaned_text: str, cleaned_map: Any) -> dict[str, Any]:
+    """Strictly validate plan schema, coverage, hashes, pages, and safe boundaries."""
+
+    mapping = _validate_inputs(cleaned_text, cleaned_map)
+    return _validate_chapter_plan(plan, cleaned_text, mapping)
 
 
 def select_chapter_range(plan: Any, start: int | None = None, end: int | None = None) -> list[dict[str, Any]]:

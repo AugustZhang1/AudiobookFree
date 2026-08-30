@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "artifact": "interactive-accuracy-gold",
+  "books": [
+    {
+      "book_id": "book-alpha",
+      "text": "\"Hello, Bob.\" Alice said. \"Hi, Alice.\" Bob answered. \"Move!\" called Captain Vale. Captain Vale frowned. \"Soon.\" \"I agree,\" said Alice. \"You go,\" replied Bob. The young scout whispered, \"Ready?\" \"We wait,\" said Minor.",
+      "cast": [
+        {"speaker_id": "narrator", "role": "narrator"},
+        {"speaker_id": "alice", "role": "character"},
+        {"speaker_id": "bob", "role": "character"},
+        {"speaker_id": "captain_vale", "role": "character"},
+        {"speaker_id": "young_scout", "role": "character"},
+        {"speaker_id": "minor", "role": "character"}
+      ],
+      "gold_quotes": [
+        {"quote_id": "alpha-q1", "source_start": 0, "source_end": 13, "speaker_id": "alice", "category": "explicit"},
+        {"quote_id": "alpha-q2", "source_start": 26, "source_end": 38, "speaker_id": "bob", "category": "anaphoric"},
+        {"quote_id": "alpha-q3", "source_start": 53, "source_end": 60, "speaker_id": "captain_vale", "category": "role_named"},
+        {"quote_id": "alpha-q4", "source_start": 104, "source_end": 111, "speaker_id": "captain_vale", "category": "implicit"},
+        {"quote_id": "alpha-q5", "source_start": 112, "source_end": 122, "speaker_id": "alice", "category": "nested"},
+        {"quote_id": "alpha-q6", "source_start": 135, "source_end": 144, "speaker_id": "bob", "category": "alternating"},
+        {"quote_id": "alpha-q7", "source_start": 185, "source_end": 193, "speaker_id": "young_scout", "category": "surname_conflict"},
+        {"quote_id": "alpha-q8", "source_start": 194, "source_end": 204, "speaker_id": "minor", "category": "minor_character"}
+      ]
+    },
+    {
+      "book_id": "book-beta",
+      "text": "\"Start.\" The doctor nodded. \"End.\"",
+      "cast": [
+        {"speaker_id": "narrator", "role": "narrator"},
+        {"speaker_id": "doctor", "role": "character"},
+        {"speaker_id": "beta_scout", "role": "character"}
+      ],
+      "gold_quotes": [
+        {"quote_id": "beta-q1", "source_start": 0, "source_end": 8, "speaker_id": "doctor", "category": "selected_range"},
+        {"quote_id": "beta-q2", "source_start": 28, "source_end": 34, "speaker_id": "doctor", "category": "explicit"}
+      ]
+    }
+  ]
+}

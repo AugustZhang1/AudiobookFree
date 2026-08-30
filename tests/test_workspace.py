@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import threading
 import uuid
 import wave
 
@@ -1297,3 +1299,180 @@ def test_interactive_generation_changed_facts_filter_out_of_range_candidates(tmp
     )
     assert changed["completed_chunks"] == [first]
     assert changed["progress"] == {"completed": 1, "current": 0, "total": 1}
+
+
+def _prepared_generation_for_concurrency(tmp_path: Path) -> tuple[Workspace, str]:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"source")
+    workspace = Workspace(tmp_path / "data")
+    manifest = workspace.create_conversion(source)
+    workspace.configure_generation(manifest["conversion_id"], tts=_interactive_tts(), total_chunks=1)
+    return workspace, manifest["conversion_id"]
+
+
+def test_update_generation_retries_cas_without_losing_distinct_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    original_read_job = workspace.read_job
+    first_read = threading.Barrier(2)
+    seen_threads: set[str] = set()
+
+    def synchronized_read(job_id: str) -> dict[str, object]:
+        current = original_read_job(job_id)
+        name = threading.current_thread().name
+        if name in {"cas-writer-a", "cas-writer-b"} and name not in seen_threads:
+            seen_threads.add(name)
+            first_read.wait(timeout=5)
+        return current
+
+    monkeypatch.setattr(workspace, "read_job", synchronized_read)
+    failures: list[tuple[str, BaseException]] = []
+
+    def write_error() -> None:
+        try:
+            workspace.update_generation(conversion_id, error="writer-a")
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            failures.append(("a", exc))
+
+    def write_safe_error() -> None:
+        try:
+            workspace.update_generation(conversion_id, last_safe_error="writer-b")
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            failures.append(("b", exc))
+
+    threads = [
+        threading.Thread(target=write_error, name="cas-writer-a"),
+        threading.Thread(target=write_safe_error, name="cas-writer-b"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    final = original_read_job(conversion_id)
+    assert final["error"] == "writer-a"
+    assert final["last_safe_error"] == "writer-b"
+
+
+def test_update_generation_returns_distinct_error_after_bounded_lock_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    lock_path = workspace.conversion_path(conversion_id) / "job.json.generation.lock"
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "started_at": "2026-01-01T00:00:00Z"}), encoding="utf-8")
+    monkeypatch.setattr(workspace_module, "_GENERATION_UPDATE_RETRIES", 2, raising=False)
+    monkeypatch.setattr(workspace_module, "_GENERATION_UPDATE_DELAY_SECONDS", 0, raising=False)
+    conflict_error = getattr(workspace_module, "GenerationConflictError", RuntimeError)
+
+    with pytest.raises(conflict_error, match="generation update"):
+        workspace.update_generation(conversion_id, error="blocked")
+
+
+def test_cancelled_generation_is_terminal_against_inflight_progress_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    original_read_job = workspace.read_job
+    progress_read = threading.Event()
+    allow_progress = threading.Event()
+    progress_read_once = False
+
+    def paused_progress_read(job_id: str) -> dict[str, object]:
+        nonlocal progress_read_once
+        current = original_read_job(job_id)
+        if threading.current_thread().name == "progress-writer" and not progress_read_once:
+            progress_read_once = True
+            progress_read.set()
+            assert allow_progress.wait(timeout=5)
+        return current
+
+    monkeypatch.setattr(workspace, "read_job", paused_progress_read)
+    progress_result: list[dict[str, object]] = []
+    progress_failures: list[BaseException] = []
+
+    def write_progress() -> None:
+        try:
+            progress_result.append(
+                workspace.update_generation(
+                    conversion_id,
+                    status="synthesizing",
+                    stage="synthesis",
+                    progress={"completed": 0, "current": 1, "total": 1},
+                    worker={"pid": os.getpid(), "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            progress_failures.append(exc)
+
+    thread = threading.Thread(target=write_progress, name="progress-writer")
+    thread.start()
+    assert progress_read.wait(timeout=5)
+    cancelled = workspace.update_generation(
+        conversion_id,
+        status="cancelled",
+        stage="cancelled",
+        worker=None,
+        last_safe_error="cancelled",
+    )
+    allow_progress.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert progress_failures == []
+    assert cancelled["status"] == "cancelled"
+    assert progress_result and progress_result[0]["status"] == "cancelled"
+    assert original_read_job(conversion_id)["status"] == "cancelled"
+
+
+def test_cancelled_generation_rejects_later_failed_update(tmp_path: Path) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    cancelled = workspace.update_generation(
+        conversion_id,
+        status="cancelled",
+        stage="cancelled",
+        worker=None,
+        last_safe_error="cancelled",
+    )
+    returned = workspace.update_generation(
+        conversion_id,
+        status="failed",
+        stage="synthesis",
+        error="worker failed: RuntimeError",
+        last_safe_error="worker failed: RuntimeError",
+        worker=None,
+    )
+
+    assert cancelled["status"] == "cancelled"
+    assert returned["status"] == "cancelled"
+    assert returned == workspace.read_job(conversion_id)
+    # Cancellation is terminal for the STATUS, but a genuine failure must not be
+    # hidden behind it: the error detail the caller tried to record is preserved.
+    assert returned["error"] == "worker failed: RuntimeError"
+    assert returned["last_safe_error"] == "worker failed: RuntimeError"
+    assert returned["stage"] == "cancelled"
+
+
+def test_cancelled_generation_keeps_status_for_non_error_updates(tmp_path: Path) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    workspace.update_generation(conversion_id, status="cancelled", stage="cancelled", worker=None, last_safe_error="cancelled")
+    returned = workspace.update_generation(conversion_id, status="synthesizing", stage="synthesis")
+
+    assert returned["status"] == "cancelled"
+    assert returned["stage"] == "cancelled"
+    assert returned == workspace.read_job(conversion_id)
+
+
+def test_resume_claim_is_refused_while_cancellation_is_requested(tmp_path: Path) -> None:
+    workspace, conversion_id = _prepared_generation_for_concurrency(tmp_path)
+    workspace.update_generation(conversion_id, status="cancelled", stage="cancelled", worker=None, last_safe_error="cancelled")
+    workspace.request_cancel(conversion_id)
+
+    returned = workspace.update_generation(
+        conversion_id,
+        allow_cancelled_resume=True,
+        status="synthesizing",
+        stage="synthesis",
+        worker={"pid": os.getpid(), "started_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
+        error=None,
+        last_safe_error=None,
+    )
+
+    assert returned["status"] == "cancelled"
+    assert returned == workspace.read_job(conversion_id)

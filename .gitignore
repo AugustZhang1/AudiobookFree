@@ -2,6 +2,9 @@
 *.md
 *.txt
 !/README.md
+!/AGENTS.md
+!/THIRD_PARTY_NOTICES.md
+!/DESIGN.md
 !/requirements.txt
 /docs/
 /Reference Image/
@@ -22,6 +25,19 @@ __pycache__/
 .pytest-tmp/
 /tests/.pytest-*/
 /benchmark/.pytest-*/
+/analyzer_envs/**
+!/analyzer_envs/booknlp/
+!/analyzer_envs/booknlp/pyproject.toml
+/engine_envs/**
+!/engine_envs/chatterbox/
+!/engine_envs/chatterbox/pyproject.toml
+!/engine_envs/chatterbox/uv.lock
+/data/
+
+# Generated test data
+/tests/cb-smoke-*/
+/tests/debug-*/
+/tests/tmp-*/
 
 # Benchmark-only artifacts and environments (source code remains trackable)
 /benchmark/results/
@@ -57,9 +73,3 @@ Thumbs.db
 
 # Existing local marker
 FORME
-/tests
-/tests
-README.md
-*.md
-README.md
-/tests

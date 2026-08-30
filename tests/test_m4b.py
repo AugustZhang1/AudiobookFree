@@ -326,6 +326,187 @@ def test_verify_failure_does_not_publish(monkeypatch) -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _phase5_finalize_fixture():
+    root = Path("tests") / f".pytest-phase5-finalize-{uuid.uuid4().hex}"
+    phase5 = root / ".phase5"
+    phase5.mkdir(parents=True)
+    chapter = ChapterTiming(1, "Book", 0, 24000, 24000)
+    assembly = AssemblyResult(phase5 / "assembled.wav", 24000, 24000, (chapter,))
+    artifacts = (assembly.path, phase5 / "encoded.m4b", phase5 / "metadata.txt")
+
+    class FakeWorkspace:
+        def __init__(self) -> None:
+            self.job = {"worker": None, "original_display_filename": "Book.pdf"}
+            self.status_updates: list[dict[str, object]] = []
+            self.cancel_checks = 0
+            self.cancel_on_check: int | None = None
+
+        def read_job(self, _conversion_id: str) -> dict[str, object]:
+            return dict(self.job)
+
+        def cancellation_requested(self, _conversion_id: str) -> bool:
+            self.cancel_checks += 1
+            return self.cancel_checks == self.cancel_on_check
+
+        def update_generation(self, _conversion_id: str, **kwargs: object) -> None:
+            self.status_updates.append(dict(kwargs))
+            self.job.update(kwargs)
+
+        def load_analysis(self, _conversion_id: str) -> dict[str, str]:
+            return {"title": "Book"}
+
+        def conversion_path(self, _conversion_id: str) -> Path:
+            return root
+
+    return root, FakeWorkspace(), "conversion-id", assembly, artifacts, phase5
+
+
+def _stub_finalize_stages(monkeypatch, assembly: AssemblyResult) -> None:
+    import pdf_audiobook.m4b as m4b
+
+    def fake_assemble(_workspace, _conversion_id):
+        assembly.path.write_bytes(b"assembled")
+        return assembly
+
+    def fake_encode(_assembly, _metadata_path, destination, **_kwargs):
+        destination.write_bytes(b"encoded")
+        return destination
+
+    monkeypatch.setattr(m4b, "assemble_chapters", fake_assemble)
+    monkeypatch.setattr(m4b, "encode_m4b", fake_encode)
+
+
+def test_finalize_conversion_cleans_phase5_artifacts_only_after_publish(monkeypatch) -> None:
+    root, workspace, conversion_id, assembly, artifacts, _phase5 = _phase5_finalize_fixture()
+    try:
+        _stub_finalize_stages(monkeypatch, assembly)
+        import pdf_audiobook.m4b as m4b
+
+        verified = SimpleNamespace(duration_seconds=1.0, chapter_count=1, codec="aac")
+        monkeypatch.setattr(m4b, "verify_m4b", lambda *_args, **_kwargs: verified)
+        publish_observations: list[tuple[bool, ...]] = []
+        expected_output = {"path": str(root / "published.m4b"), "filename": "published.m4b"}
+
+        def fake_publish(_source, **_kwargs):
+            publish_observations.append(tuple(path.is_file() for path in artifacts))
+            return expected_output
+
+        monkeypatch.setattr(m4b, "publish_verified_output", fake_publish)
+
+        assert finalize_conversion(workspace, conversion_id, destination=root / "published") == expected_output
+        assert publish_observations == [(True, True, True)]
+        assert all(not path.exists() for path in artifacts)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+    root, workspace, conversion_id, assembly, artifacts, _phase5 = _phase5_finalize_fixture()
+    try:
+        _stub_finalize_stages(monkeypatch, assembly)
+
+        verified = SimpleNamespace(duration_seconds=1.0, chapter_count=1, codec="aac")
+        monkeypatch.setattr(m4b, "verify_m4b", lambda *_args, **_kwargs: verified)
+        publish_calls: list[tuple[bool, ...]] = []
+
+        def failed_publish(_source, **_kwargs):
+            publish_calls.append(tuple(path.is_file() for path in artifacts))
+            raise M4BError("bad publication")
+
+        monkeypatch.setattr(m4b, "publish_verified_output", failed_publish)
+
+        with pytest.raises(M4BError):
+            finalize_conversion(workspace, conversion_id, destination=root / "published")
+
+        assert all(path.is_file() for path in artifacts)
+        assert workspace.job["status"] == "failed"
+        assert publish_calls == [(True, True, True)]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+    root, workspace, conversion_id, assembly, artifacts, _phase5 = _phase5_finalize_fixture()
+    try:
+        _stub_finalize_stages(monkeypatch, assembly)
+
+        monkeypatch.setattr(m4b, "verify_m4b", lambda *_args, **_kwargs: (_ for _ in ()).throw(M4BError("bad verification")))
+        publish_calls: list[tuple[bool, ...]] = []
+        monkeypatch.setattr(m4b, "publish_verified_output", lambda *_args, **_kwargs: publish_calls.append(tuple(path.is_file() for path in artifacts)))
+
+        with pytest.raises(M4BError):
+            finalize_conversion(workspace, conversion_id, destination=root / "published")
+
+        assert all(path.is_file() for path in artifacts)
+        assert workspace.job["status"] == "failed"
+        assert publish_calls == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    root, workspace, conversion_id, assembly, artifacts, _phase5 = _phase5_finalize_fixture()
+    try:
+        workspace.cancel_on_check = 3
+        _stub_finalize_stages(monkeypatch, assembly)
+
+        verified = SimpleNamespace(duration_seconds=1.0, chapter_count=1, codec="aac")
+        monkeypatch.setattr(m4b, "verify_m4b", lambda *_args, **_kwargs: verified)
+        monkeypatch.setattr(m4b, "publish_verified_output", lambda *_args, **_kwargs: pytest.fail("cancelled conversion must not publish"))
+
+        with pytest.raises(Phase5Cancelled):
+            finalize_conversion(workspace, conversion_id, destination=root / "published")
+
+        assert all(path.is_file() for path in artifacts)
+        assert workspace.job["status"] == "cancelled"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_finalize_conversion_swallows_phase5_cleanup_failure_and_keeps_success_status(monkeypatch) -> None:
+    root, workspace, conversion_id, assembly, artifacts, phase5 = _phase5_finalize_fixture()
+    try:
+        _stub_finalize_stages(monkeypatch, assembly)
+        import pdf_audiobook.m4b as m4b
+
+        verified = SimpleNamespace(duration_seconds=1.0, chapter_count=1, codec="aac")
+        monkeypatch.setattr(m4b, "verify_m4b", lambda *_args, **_kwargs: verified)
+        expected_output = {"path": str(root / "published.m4b"), "filename": "published.m4b"}
+        publish_observations: list[tuple[bool, ...]] = []
+
+        def fake_publish(_source, **_kwargs):
+            publish_observations.append(tuple(path.is_file() for path in artifacts))
+            return expected_output
+
+        monkeypatch.setattr(m4b, "publish_verified_output", fake_publish)
+        cleanup_attempts: list[Path] = []
+        artifact_paths = {path.absolute() for path in artifacts}
+        original_unlink = Path.unlink
+
+        def failed_unlink(path, *args, **kwargs):
+            absolute = Path(path).absolute()
+            if absolute in artifact_paths:
+                cleanup_attempts.append(absolute)
+                raise OSError("phase5 artifact is busy")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", failed_unlink)
+        original_rmtree = m4b.shutil.rmtree
+
+        def failed_rmtree(path, *args, **kwargs):
+            absolute = Path(path).absolute()
+            if absolute == phase5.absolute():
+                cleanup_attempts.append(absolute)
+                raise OSError("phase5 directory is busy")
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(m4b.shutil, "rmtree", failed_rmtree)
+
+        with pytest.warns(RuntimeWarning, match="phase 5 working artifact cleanup failed"):
+            assert finalize_conversion(workspace, conversion_id, destination=root / "published") == expected_output
+        assert publish_observations == [(True, True, True)]
+        assert cleanup_attempts
+        assert workspace.job["status"] == "completed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def _v5_fixture(monkeypatch, *, thought: bool = False) -> tuple[object, dict, list[object], Path]:
     import pdf_audiobook.m4b as m4b
 
@@ -402,6 +583,20 @@ def test_v5_assembly_replans_selected_chapters_and_preserves_global_pcm_order(mo
         assert build_ffmetadata(assembly.chapters).count("[CHAPTER]") == 1
         assert assembly.frames == sum(240 for _ in chunks) + round(24000 * 150 / 1000)
         assert job["completed_chunks"][0]["source_start"] == chunks[0].source_start
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_recorded_chunk_duration_tolerates_sub_frame_float_drift(monkeypatch) -> None:
+    import pdf_audiobook.m4b as m4b
+
+    workspace, job, _chunks, root = _v5_fixture(monkeypatch)
+    try:
+        # The WAV has 240 frames at 24 kHz (0.01 seconds). This is the same
+        # duration expressed with harmless floating-point representation drift.
+        job["completed_chunks"][0]["duration_seconds"] = 0.010000000000000002
+        ordered = m4b._recorded_chunks(workspace, "conversion")[0]
+        assert ordered[0][2].frames == 240
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

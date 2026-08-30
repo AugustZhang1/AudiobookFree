@@ -4,15 +4,20 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import shutil
+import uuid
 import wave
 
 import pdf_audiobook.tts as tts
 import pytest
+from pdf_audiobook.audio import write_pcm_wav
+from pdf_audiobook.m4b import _recorded_chunks
 from pdf_audiobook.tts import EngineMetadata, SynthesisSettings, chunk_input_hash, plan_chunks, plan_interactive_chunks
 from pdf_audiobook import voice_registry
 from pdf_audiobook.engine_catalog import catalog_revision, get_capability, list_capabilities, require_enabled
 from pdf_audiobook.voice_plan import with_canonical_artifact_hash
 from pdf_audiobook.voice_settings import VoiceSettingsError, canonical_voice_settings, voice_settings_digest
+from pdf_audiobook.worker import ConversionWorker
 
 
 def _metadata() -> EngineMetadata:
@@ -77,6 +82,97 @@ def test_metadata_without_chunk_mode_retains_legacy_planning() -> None:
     del metadata["settings"]["chunk_mode"]
     chunks = plan_chunks(text, [{"index": 1, "start_offset": 0, "end_offset": len(text)}], metadata, cap=6)
     assert len(chunks) > 1
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected_chunk_count"),
+    [
+        pytest.param(None, 2, id="settings-absent"),
+        pytest.param({"speed": 1.0, "chunk_cap": 7}, 10, id="settings-partial-with-cap"),
+        pytest.param({"speed": 1.0}, 1, id="settings-partial-without-cap"),
+    ],
+)
+def test_v4_worker_and_assembler_share_worker_authoritative_planning_inputs(
+    settings: dict[str, object] | None, expected_chunk_count: int,
+) -> None:
+    """Legacy v4 records must be planned identically before assembly.
+
+    This intentionally uses the old ``model_id``-only metadata shape at the
+    planner boundary.  A strict current Workspace validator is not the subject
+    of this regression; the worker and assembler must still agree when reading
+    a legacy recovery manifest.
+    """
+
+    root = Path("tests") / f".pytest-v4-planning-{uuid.uuid4().hex}"
+    root.mkdir()
+    try:
+        text = "One. Two. Three. Four. Five. Six. Seven. Eight. Nine. Ten."
+        chapters = [{
+            "index": 1, "title": "Book", "start_offset": 0, "end_offset": len(text),
+            "start_page": 1, "end_page": 1, "source_type": "whole", "word_count": len(text.split()),
+        }]
+        tts = {
+            "engine": "fake",
+            "package_version": "builtin",
+            "model_id": "worker-authoritative-model",
+            "model_revision": "r1",
+            "model_checksum": "c1",
+            "voice": "fake-neutral",
+            "voice_version": "v1",
+            "voice_checksum": "c2",
+            "sample_rate": 24000,
+            "speed": 1.0,
+            "chunk_cap": 31,
+        }
+        if settings is not None:
+            tts["settings"] = settings
+        job = {"schema_version": 4, "tts": tts, "total_chunks": 0, "completed_chunks": []}
+        conversion_root = root / "conversion"
+        conversion_root.mkdir()
+
+        chapter_plan = {
+            "schema_version": 1,
+            "mode": "whole",
+            "requested_count": None,
+            "cleaned_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "chapters": chapters,
+            "warnings": [],
+        }
+
+        class LegacyWorkspace:
+            def read_job(self, _conversion_id: str) -> dict:
+                return job
+
+            def load_cleaned_artifacts(self, _conversion_id: str) -> tuple[str, list]:
+                return text, []
+
+            def load_chapter_plan(self, _conversion_id: str) -> dict:
+                return chapter_plan
+
+            def conversion_path(self, _conversion_id: str) -> Path:
+                return conversion_root
+
+        workspace = LegacyWorkspace()
+        worker_chunks = ConversionWorker(workspace, "legacy-conversion")._planned_chunks(job)
+        assert len(worker_chunks) == expected_chunk_count
+
+        records = []
+        for chunk in worker_chunks:
+            path = conversion_root / f"chunks/chapter-{chunk.chapter_index:03d}-chunk-{chunk.local_index:04d}.wav"
+            info = write_pcm_wav(path, b"\0\0" * 240, 24000)
+            relative = path.relative_to(conversion_root).as_posix()
+            records.append({
+                **chunk.manifest_record(relative, info.duration_seconds),
+                "wav_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        job["total_chunks"] = len(records)
+        job["completed_chunks"] = records
+
+        assembled, _plan, _job = _recorded_chunks(workspace, "legacy-conversion")
+        assert [chunk.text for chunk, _path, _info in assembled] == [chunk.text for chunk in worker_chunks]
+        assert [chunk.input_hash for chunk, _path, _info in assembled] == [chunk.input_hash for chunk in worker_chunks]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_plan_chunks_rejects_explicit_unsupported_chunk_mode() -> None:

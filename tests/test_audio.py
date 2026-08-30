@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from array import array
 from pathlib import Path
 import shutil
+import sys
 import subprocess
 import uuid
 
 import pytest
 
-from pdf_audiobook.audio import deterministic_pcm, validate_wav, write_pcm_wav
+from pdf_audiobook.audio import deterministic_pcm, pcm_from_audio, validate_wav, write_pcm_wav
 import pdf_audiobook.voice_shaping as shaping
 from pdf_audiobook.voice_shaping import BRIGHT_FILTER, SHAPING_IMPLEMENTATION, WARM_FILTER, ShapingCapability, VoiceShapingError, VoiceShapingUnavailable, shape_pcm
 
@@ -33,6 +35,70 @@ def test_existing_valid_wav_is_not_overwritten_by_default(workdir: Path) -> None
     before = path.read_bytes()
     with pytest.raises(FileExistsError): write_pcm_wav(path, deterministic_pcm("y", 10), 24000)
     assert path.read_bytes() == before
+
+
+def test_pcm_from_audio_uses_optional_numpy_dtype_fast_path_and_keeps_list_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeDType:
+        kind = "f"
+
+    class FakeArray:
+        dtype = FakeDType()
+        size = 2
+
+        def reshape(self, *shape: int) -> "FakeArray":
+            calls.append(("reshape", shape))
+            return self
+
+        def __mul__(self, scale: float) -> "FakeArray":
+            calls.append(("scale", scale))
+            return self
+
+        def astype(self, dtype: str) -> "FakeArray":
+            calls.append(("astype", dtype))
+            return self
+
+        def tobytes(self) -> bytes:
+            calls.append(("tobytes", None))
+            return b"numpy-fast-path"
+
+        def tolist(self) -> list[float]:
+            raise AssertionError("fast path must not materialize a Python list")
+
+    class FakeAll:
+        @staticmethod
+        def all() -> bool:
+            return True
+
+    class FakeNumpy:
+        ndarray = FakeArray
+
+        @staticmethod
+        def clip(value: FakeArray, lower: int, upper: int) -> FakeArray:
+            calls.append(("clip", (lower, upper)))
+            return value
+
+        @staticmethod
+        def isfinite(value: FakeArray) -> FakeAll:
+            calls.append(("isfinite", None))
+            return FakeAll()
+
+        @staticmethod
+        def rint(value: FakeArray) -> FakeArray:
+            # Round-half-to-even, matching the Python fallback's int(round(...)).
+            calls.append(("rint", None))
+            return value
+
+    monkeypatch.setitem(sys.modules, "numpy", FakeNumpy())
+    assert pcm_from_audio(FakeArray()) == b"numpy-fast-path"
+    assert ("scale", 32767.0) in calls
+    assert ("isfinite", None) in calls
+    assert ("rint", None) in calls
+    assert ("clip", (-32768, 32767)) in calls
+    assert ("astype", "<i2") in calls
+    assert ("tobytes", None) in calls
+    assert pcm_from_audio([0.5, -1.0]) == array("h", [16384, -32767]).tobytes()
 
 
 def _shaping_capability(*, rubberband: bool = True, tone: bool = True) -> ShapingCapability:
@@ -115,3 +181,29 @@ def test_shaping_timeout_is_bounded(monkeypatch) -> None:
     monkeypatch.setattr(shaping.subprocess, "run", timeout)
     with pytest.raises(VoiceShapingError, match="timed out"):
         shape_pcm(b"\x00\x00", 24000, {"speed": 1, "pitch_semitones": 1, "tone_preset": "neutral"})
+
+
+def test_numpy_pcm_fast_path_matches_the_python_fallback() -> None:
+    """The fast path must be numerically identical, not merely faster.
+
+    astype() truncates toward zero while the fallback uses int(round(...)),
+    which is round-half-to-even: 0.5*32767 = 16383.5 differed by one LSB on
+    every half-way sample before np.rint was used.
+    """
+
+    np = pytest.importorskip("numpy")
+    values = [0.0, 0.5 / 32767, 1.5 / 32767, 2.5 / 32767, 0.5, -0.5, 1.0, -1.0, 0.99999, -0.99999]
+
+    fallback = array("h", [max(-32768, min(32767, int(round(v * 32767.0)))) for v in values]).tobytes()
+    fast = pcm_from_audio(np.array(values, dtype=np.float64))
+
+    assert fast == fallback
+
+
+def test_numpy_pcm_fast_path_rejects_non_finite_samples() -> None:
+    """The fallback raises on NaN/inf; casting them would emit silent garbage."""
+
+    np = pytest.importorskip("numpy")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            pcm_from_audio(np.array([0.1, bad, 0.2], dtype=np.float64))

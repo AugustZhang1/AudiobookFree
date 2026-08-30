@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import time
 from pathlib import Path
 import shutil
 import uuid
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 from pdf_audiobook.audio import write_pcm_wav
 import pdf_audiobook.app as app_module
 from pdf_audiobook.app import create_app
+from pdf_audiobook.worker import WORKER_LOCK_FILENAME, _WORKER_LOCK_STALE_SECONDS
 from pdf_audiobook.workspace import Workspace, atomic_write_json
 from test_pdf import make_pdf
 
@@ -266,4 +269,42 @@ def test_cancel_accepts_live_local_process_before_manifest_pid_claim() -> None:
             assert conversion_id is not None
             assert Workspace(root / "data").cancel_marker_path(conversion_id).is_file()
     finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_stale_worker_lock_allows_restart_despite_live_looking_pid() -> None:
+    """An inaccessible crashed owner must not wedge generation start forever.
+
+    pid_is_alive() reports True for a Windows ACCESS_DENIED PID, so the recorded
+    PID alone previously blocked every restart. A lock file that is present but
+    stale proves the owner is gone.
+    """
+
+    root = Path("tests") / f".pytest-phase4-app-stale-{uuid.uuid4().hex}"; root.mkdir()
+    try:
+        conversion_id, headers = _prepared_generation(root, 19997)
+        workspace = Workspace(root / "data"); job = workspace.read_job(conversion_id)
+        job["status"] = "synthesizing"; job["worker"] = {"pid": os.getpid(), "started_at": job["created_at"], "updated_at": job["updated_at"]}
+        atomic_write_json(workspace.job_path(conversion_id), job)
+        lock_path = workspace.conversion_path(conversion_id) / WORKER_LOCK_FILENAME
+        lock_path.write_text(json.dumps({"pid": os.getpid(), "started_at": job["created_at"], "token": "stale"}), encoding="utf-8")
+        stale = time.time() - (_WORKER_LOCK_STALE_SECONDS + 60.0)
+        os.utime(lock_path, (stale, stale))
+        # The owner PID must be INACCESSIBLE, not merely recorded: a confirmed-live
+        # owner is never reclaimable, by design.
+        import pdf_audiobook.worker as _worker_module
+        monkey_original = _worker_module.pid_liveness
+        _worker_module.pid_liveness = lambda pid: "unknown"
+        launches: list[str] = []
+        app = create_app(port=19997, session_token="phase4-token", instance_file=root / "instance-3.json", data_root=root / "data", worker_launcher=lambda _root, cid, _mode: launches.append(cid))
+        with TestClient(app, base_url="http://127.0.0.1:19997") as client:
+            assert client.post("/api/session/bootstrap", json={"token": "phase4-token"}, headers=headers).status_code == 200
+            response = client.post("/api/generation/start", json={"voice": "af_heart", "speed": 1.0}, headers=headers)
+            assert response.status_code == 200, response.text
+            assert launches == [conversion_id]
+    finally:
+        try:
+            _worker_module.pid_liveness = monkey_original
+        except NameError:
+            pass
         shutil.rmtree(root, ignore_errors=True)

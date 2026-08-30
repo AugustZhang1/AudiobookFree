@@ -187,6 +187,64 @@ def _windows_pid_is_alive(pid: int) -> bool:
         return False
 
 
+PID_ALIVE = "alive"
+PID_DEAD = "dead"
+PID_UNKNOWN = "unknown"
+
+
+def pid_liveness(pid: int) -> str:
+    """Classify a PID as alive, dead, or unknown (not permitted to query).
+
+    ``pid_is_alive`` deliberately collapses "unknown" into "alive" so callers fail
+    safe. Ownership decisions need the distinction: stealing a lock from a
+    confirmed-live worker corrupts a run, while an inaccessible PID must not be
+    able to wedge a conversion forever.
+    """
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return PID_DEAD
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return PID_UNKNOWN
+        except (ProcessLookupError, OSError, OverflowError, ValueError):
+            return PID_DEAD
+        return PID_ALIVE
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    try:
+        try:
+            handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        except (OSError, OverflowError, ValueError):
+            return PID_DEAD
+        if not handle:
+            return PID_UNKNOWN if ctypes.get_last_error() == error_access_denied else PID_DEAD
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return PID_UNKNOWN if ctypes.get_last_error() == error_access_denied else PID_DEAD
+            return PID_ALIVE if exit_code.value == still_active else PID_DEAD
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, OverflowError, ValueError):
+        return PID_DEAD
+
+
 def pid_is_alive(pid: int) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
