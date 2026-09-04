@@ -1,10 +1,6 @@
 # Private/internal documentation and text artifacts
 *.md
 *.txt
-!/README.md
-!/AGENTS.md
-!/THIRD_PARTY_NOTICES.md
-!/DESIGN.md
 !/requirements.txt
 /docs/
 /Reference Image/
