@@ -1,6 +1,7 @@
 # Private/internal documentation and text artifacts
 *.md
 !/THIRD_PARTY_NOTICES.md
+!/README.md
 *.txt
 !/requirements.txt
 /docs/
