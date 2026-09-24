@@ -159,7 +159,7 @@ def _extract_pages(path: Path) -> tuple[PdfReader, list[PageEvidence]]:
             classification = "mixed" if has_images else "text"
         elif has_images:
             classification = "scanned"
-        elif text:
+        elif any(char.isalpha() for char in text):
             classification = "unsupported"
         else:
             classification = "blank"
@@ -363,10 +363,12 @@ def _validate_page_coverage(pages: list[PageEvidence], cleaned_text: str) -> Non
             raise _error(ERROR_NO_USABLE_TEXT, "The PDF has no usable selectable text.")
         raise _error(ERROR_OCR_REQUIRED, "This PDF has no usable selectable text; OCR is required.")
     interior = pages[1:-1]
-    if any(page.classification == "unsupported" for page in interior):
-        raise _error(ERROR_PARSER_FAILURE, "An interior page could not be reliably extracted.")
-    if any(page.classification == "scanned" for page in interior) or any(page.classification == "mixed" and len(_WORD.findall(page.text)) < MIXED_MIN_WORDS for page in interior):
-        raise _error(ERROR_OCR_REQUIRED, "An interior page requires OCR; the PDF was not silently omitted.")
+    unsupported = [page.number for page in interior if page.classification == "unsupported"]
+    if unsupported:
+        raise _error(ERROR_PARSER_FAILURE, f"Interior page(s) {', '.join(map(str, unsupported))} could not be reliably extracted.", pages=unsupported)
+    needs_ocr = [page.number for page in interior if page.classification == "scanned" or (page.classification == "mixed" and len(_WORD.findall(page.text)) < MIXED_MIN_WORDS)]
+    if needs_ocr:
+        raise _error(ERROR_OCR_REQUIRED, f"Interior page(s) {', '.join(map(str, needs_ocr))} require OCR; the PDF was not silently omitted.", pages=needs_ocr)
 
 
 def analyze_pdf(path: Path, *, fallback_title: str | None = None, check_disk: bool = True) -> dict[str, Any]:

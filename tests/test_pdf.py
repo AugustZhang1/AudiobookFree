@@ -144,3 +144,40 @@ def test_header_valid_structural_corruption_is_parser_failure(tmp_path: Path) ->
     with pytest.raises(PdfAnalysisError) as error:
         analyze_pdf(path)
     assert error.value.code == pdf.ERROR_PARSER_FAILURE
+
+
+@pytest.mark.parametrize("interior", ["42", "* * *"])
+def test_interior_page_without_letters_is_blank(tmp_path: Path, interior: str) -> None:
+    path = make_pdf(
+        tmp_path / "blank.pdf",
+        [
+            "The English text is sufficient for analysis and review of this book.",
+            interior,
+            "A different English passage continues the story for the reader.",
+        ],
+    )
+    result = analyze_pdf(path)
+    assert result["page_classifications"][1]["classification"] == "blank"
+
+
+def test_interior_unsupported_page_names_the_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = make_pdf(
+        tmp_path / "unsupported.pdf",
+        [
+            "The English text is sufficient for review.",
+            "unsupported",
+            "More English text is sufficient for review.",
+        ],
+    )
+    reader = pdf.PdfReader(str(path), strict=False)
+    pages = [
+        PageEvidence(1, "The English text is sufficient for review.", "text", False),
+        PageEvidence(2, "", "unsupported", False, ("text extraction failed",)),
+        PageEvidence(3, "More English text is sufficient for review.", "text", False),
+    ]
+    monkeypatch.setattr(pdf, "_extract_pages", lambda _path: (reader, pages))
+    with pytest.raises(PdfAnalysisError) as error:
+        analyze_pdf(path)
+    assert error.value.code == pdf.ERROR_PARSER_FAILURE
+    assert error.value.details["pages"] == [2]
+    assert "2" in error.value.message
