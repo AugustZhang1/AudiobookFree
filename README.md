@@ -72,7 +72,7 @@ If your computer is slow or you can't install anything, run the Kokoro pipeline 
 2. Run the cells top to bottom. Pick a voice in the **Settings** cell (you can preview it before converting).
 3. Upload your PDF when prompted and download the finished M4B at the end.
 
-Free Colab sessions can disconnect; the notebook checkpoints after every chapter and resumes where it left off if you rerun it with the same settings.
+Free Colab sessions can disconnect; the notebook checkpoints every few pages and resumes where it left off if you rerun it with the same settings. There is no page limit on the PDF (the file-size limit is 100 MiB).
 
 ## Requirements
 

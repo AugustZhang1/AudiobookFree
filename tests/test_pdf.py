@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import shutil
+from typing import Any
 import uuid
 
 import pytest
@@ -83,9 +84,8 @@ def test_signature_corrupt_encrypted_and_ocr_errors(tmp_path: Path) -> None:
     assert ocr_error.value.code == pdf.ERROR_OCR_REQUIRED
 
 
-def test_limits_disk_and_page_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_limits_and_disk_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = make_pdf(tmp_path / "book.pdf", ["The English text is sufficient for analysis and review."])
-    real_disk_usage = shutil.disk_usage
     monkeypatch.setattr(pdf, "MAX_PDF_BYTES", 1)
     with pytest.raises(PdfAnalysisError) as size_error:
         analyze_pdf(path)
@@ -95,12 +95,6 @@ def test_limits_disk_and_page_errors(tmp_path: Path, monkeypatch: pytest.MonkeyP
     with pytest.raises(PdfAnalysisError) as disk_error:
         analyze_pdf(path)
     assert disk_error.value.code == pdf.ERROR_INSUFFICIENT_DISK
-
-    monkeypatch.setattr(pdf.shutil, "disk_usage", real_disk_usage)
-    monkeypatch.setattr(pdf, "MAX_PAGES", 0)
-    with pytest.raises(PdfAnalysisError) as page_error:
-        analyze_pdf(path)
-    assert page_error.value.code == pdf.ERROR_PAGE_LIMIT
 
 
 def test_unsupported_language_is_explicit(tmp_path: Path) -> None:
@@ -181,3 +175,164 @@ def test_interior_unsupported_page_names_the_page(tmp_path: Path, monkeypatch: p
     assert error.value.code == pdf.ERROR_PARSER_FAILURE
     assert error.value.details["pages"] == [2]
     assert "2" in error.value.message
+
+
+def test_long_pdf_has_no_page_limit(tmp_path: Path) -> None:
+    pages = [f"Chapter {n}\nThe quick brown fox jumps over the lazy dog on page {n}." for n in range(1, 2002)]
+    path = make_pdf(tmp_path / "long.pdf", pages)
+    result = analyze_pdf(path, layout_warnings=False)
+    assert result["page_count"] == 2001
+
+
+def test_layout_warnings_can_be_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = make_pdf(tmp_path / "normal.pdf", ["Chapter 1\nThe quick brown fox jumps over the lazy dog.", "Chapter 2\nAnother page for testing."])
+    monkeypatch.setattr(pdf, "_layout_warnings", lambda *args, **kwargs: pytest.fail("_layout_warnings should not be called"))
+    result = analyze_pdf(path, layout_warnings=False)
+    assert result["page_count"] == 2
+
+
+def test_pdfplumber_pages_are_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "test.pdf"
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.chars: list[dict[str, Any]] = []
+            self.width = 612.0
+            self.height = 792.0
+            self.closed = False
+
+        def extract_words(self) -> list[dict[str, Any]]:
+            return []
+
+        def extract_text_lines(self) -> list[dict[str, Any]]:
+            return []
+
+        def find_tables(self) -> list[Any]:
+            return []
+
+        def extract_text(self) -> str:
+            return ""
+
+        def close(self) -> None:
+            self.closed = True
+
+    created_pages: list[FakePage] = []
+
+    class FakePdf:
+        def __init__(self) -> None:
+            self.pages = [FakePage(), FakePage()]
+            created_pages.extend(self.pages)
+
+        def __enter__(self) -> FakePdf:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    monkeypatch.setattr(pdf.pdfplumber, "open", lambda _path: FakePdf())
+    pdf._layout_heading_candidates(path, 2)
+    assert len(created_pages) == 2
+    assert all(page.closed for page in created_pages)
+    pdf._layout_warnings(path, 2)
+    assert len(created_pages) == 4
+    assert all(page.closed for page in created_pages)
+
+
+def _assert_page_clean_mapping(text: str, mapping: list[dict[str, int]], page2_expected: str) -> None:
+    assert len(mapping) == 2
+    assert mapping[0]["source_page"] == 1
+    assert mapping[1]["source_page"] == 2
+    assert mapping[0]["cleaned_start"] == 0
+    assert mapping[0]["cleaned_start"] < mapping[0]["cleaned_end"]
+    assert mapping[0]["cleaned_end"] <= mapping[1]["cleaned_start"]
+    assert mapping[1]["cleaned_start"] < mapping[1]["cleaned_end"]
+    assert mapping[-1]["cleaned_end"] == len(text)
+    assert text[mapping[1]["cleaned_start"]:mapping[1]["cleaned_end"]] == page2_expected
+
+
+def test_clean_pages_lowercase_continuation() -> None:
+    p1 = "It was a bright day and the wealthy families hired"
+    p2 = "private tutors for their children."
+    text, mapping, _ = pdf._clean_pages([PageEvidence(1, p1, "text", False), PageEvidence(2, p2, "text", False)])
+    assert text == "It was a bright day and the wealthy families hired private tutors for their children."
+    assert "\n\n" not in text
+    _assert_page_clean_mapping(text, mapping, p2)
+    assert text[mapping[0]["cleaned_start"]:mapping[0]["cleaned_end"]] == p1
+
+
+def test_clean_pages_lowercase_word_next_capitalized() -> None:
+    p1 = "He studied the details of your"
+    p2 = "Appraisal before the trial began."
+    text, mapping, _ = pdf._clean_pages([PageEvidence(1, p1, "text", False), PageEvidence(2, p2, "text", False)])
+    assert text == "He studied the details of your Appraisal before the trial began."
+    assert "\n\n" not in text
+    _assert_page_clean_mapping(text, mapping, p2)
+    assert text[mapping[0]["cleaned_start"]:mapping[0]["cleaned_end"]] == p1
+
+
+def test_clean_pages_ends_with_comma() -> None:
+    p1 = "When the bell rang at noon,"
+    p2 = "Sunny left the hall."
+    text, mapping, _ = pdf._clean_pages([PageEvidence(1, p1, "text", False), PageEvidence(2, p2, "text", False)])
+    assert text == "When the bell rang at noon, Sunny left the hall."
+    assert "\n\n" not in text
+    _assert_page_clean_mapping(text, mapping, p2)
+    assert text[mapping[0]["cleaned_start"]:mapping[0]["cleaned_end"]] == p1
+
+
+@pytest.mark.parametrize(
+    "p1,p2,expected",
+    [
+        (
+            "He slept well.",
+            "Early in the morning he woke.",
+            "He slept well.\n\nEarly in the morning he woke.",
+        ),
+        (
+            "He slept well.\n***",
+            "Early in the morning he woke.",
+            "He slept well.\n***\n\nEarly in the morning he woke.",
+        ),
+        (
+            "and so the long night ended",
+            "Chapter 2\nThe next day came.",
+            "and so the long night ended\n\nChapter 2\nThe next day came.",
+        ),
+        (
+            "The end came.\nChapter 7: the fall",
+            "It began at night.",
+            "The end came.\nChapter 7: the fall\n\nIt began at night.",
+        ),
+    ],
+)
+def test_clean_pages_keeps_double_newline(p1: str, p2: str, expected: str) -> None:
+    text, mapping, _ = pdf._clean_pages([PageEvidence(1, p1, "text", False), PageEvidence(2, p2, "text", False)])
+    assert text == expected
+    _assert_page_clean_mapping(text, mapping, p2)
+    assert text[mapping[0]["cleaned_start"]:mapping[0]["cleaned_end"]] == p1
+
+
+def test_clean_pages_hyphenation_across_pages() -> None:
+    p1 = "It was an extraordinary compre-"
+    p2 = "hension of the matter."
+    text, mapping, _ = pdf._clean_pages([PageEvidence(1, p1, "text", False), PageEvidence(2, p2, "text", False)])
+    assert "comprehension" in text
+    assert text == "It was an extraordinary comprehension of the matter."
+    assert text[0:mapping[0]["cleaned_end"]] == "It was an extraordinary compre"
+    assert mapping[1]["cleaned_start"] == mapping[0]["cleaned_end"]
+    _assert_page_clean_mapping(text, mapping, p2)
+
+
+def test_page_separator_rules() -> None:
+    assert pdf._page_separator("families hired", "private tutors") == " "
+    assert pdf._page_separator("details of your", "Appraisal before") == " "
+    assert pdf._page_separator("noon,", "Sunny left") == " "
+    assert pdf._page_separator("He slept well.", "Early in") == "\n\n"
+    assert pdf._page_separator("He slept well.\n***", "Early in") == "\n\n"
+    assert pdf._page_separator("night ended", "Chapter 2\nNext") == "\n\n"
+    assert pdf._page_separator("End.\nChapter 7: the fall", "It began") == "\n\n"
+    assert pdf._page_separator("compre-", "hension") == ""
+    assert pdf._page_separator("Upper-", "Case") == "\n\n"
+    assert pdf._page_separator('said, "Wait!"', "Next line") == "\n\n"
+    assert pdf._page_separator("Waiting…", "Next line") == "\n\n"
+

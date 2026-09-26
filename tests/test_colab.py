@@ -999,3 +999,46 @@ def test_preview_voice_rejects_an_uncoercible_speed_before_cuda(speed, sandbox_p
             preview=lambda *args, **kwargs: pytest.fail("no preview may be rendered"),
         )
     assert not (sandbox_path / "previews").exists()
+
+
+def test_expected_tts_uses_bounded_paragraph_chunks() -> None:
+    paragraph = "This sentence tests bounded chunking. " * 30
+    text = "\n\n".join(paragraph.strip() for _ in range(12))
+    plan = {"chapters": [{"index": 1, "title": "Whole", "start_offset": 0, "end_offset": len(text)}]}
+    tts, chunk_count = colab._expected_tts(text, plan, "af_heart", 1.0)
+    assert tts["settings"]["chunk_mode"] == "paragraph"
+    assert tts["chunk_cap"] == 5000
+    assert chunk_count > 1
+
+
+def test_default_analyzer_skips_layout_warnings() -> None:
+    import functools
+    import inspect
+    from pdf_audiobook.pdf import analyze_pdf
+
+    signature = inspect.signature(colab.run_conversion)
+    param = signature.parameters["analyzer"]
+    assert isinstance(param.default, functools.partial)
+    assert param.default.func is analyze_pdf
+    assert param.default.keywords == {"layout_warnings": False}
+
+
+def test_progress_display_throttles_long_runs() -> None:
+    lines: list[str] = []
+    display = colab.ColabProgressDisplay({"chapters": [{"index": 1}]}, output=lines.append)
+
+    for completed in range(1, 1001):
+        display.render(_progress_manifest(completed=completed, total=1000, chapter=1))
+
+    assert 95 <= len(lines) <= 105
+    assert "100.0%" in lines[-1]
+
+    chapter_lines: list[str] = []
+    chapter_display = colab.ColabProgressDisplay(
+        {"chapters": [{"index": 1}, {"index": 2}]},
+        output=chapter_lines.append,
+    )
+    chapter_display.render(_progress_manifest(completed=1, total=1000, chapter=1))
+    chapter_display.render(_progress_manifest(completed=2, total=1000, chapter=2))
+
+    assert len(chapter_lines) == 2

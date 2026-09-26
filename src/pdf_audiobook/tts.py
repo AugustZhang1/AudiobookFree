@@ -6,6 +6,7 @@ the worker side, so normal application startup and tests never import a model.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import hashlib
@@ -43,7 +44,7 @@ CHATTERBOX_CHUNK_CAP = 300
 DEFAULT_CHUNK_CAP = 900
 DEFAULT_TORCH_THREADS = 8
 TORCH_THREADS_ENV = "PDF_AUDIOBOOK_TORCH_THREADS"
-CHUNK_MODES = ("chapter", "legacy")
+CHUNK_MODES = ("chapter", "legacy", "paragraph")
 _KOKORO_SILENCE_DURATION_SECONDS = 0.05
 KOKORO_SYNTHESIS_IMPLEMENTATION = "kokoro-synthesis-v2"
 _KOKORO_PARAGRAPH_PAUSE_SECONDS = 0.4  # matches m4b.PARAGRAPH_PAUSE_MS
@@ -449,6 +450,21 @@ def _paragraph_ends(text: str) -> set[int]:
     return ends
 
 
+def _speakable_paragraph_cuts(text: str) -> list[int]:
+    """Paragraph ends whose last line is spoken, so a cut there keeps chapter-mode pauses."""
+
+    cuts: list[int] = []
+    for match in _PARAGRAPH_SPLIT.finditer(text):
+        last_line = text[text.rfind("\n", 0, match.start()) + 1:match.start()]
+        if not any(character.isalnum() for character in last_line):
+            continue
+        end = match.end()
+        while end < len(text) and text[end].isspace():
+            end += 1
+        cuts.append(end)
+    return cuts
+
+
 @dataclass(frozen=True)
 class TextChunk:
     chapter_index: int
@@ -840,6 +856,29 @@ def plan_chunks(cleaned_text: str, chapters: list[dict[str, Any]], metadata: Eng
                 raise ValueError("invalid chapter range")
             text = cleaned_text[start:end]
             result.append(TextChunk(chapter_index, len(result), 0, start, end, text, chunk_input_hash(text, metadata)))
+        return result
+    if mode == "paragraph":
+        result: list[TextChunk] = []
+        for chapter in chapters:
+            chapter_index = chapter["index"]
+            start, end = chapter["start_offset"], chapter["end_offset"]
+            if not isinstance(chapter_index, int) or not (0 <= start < end <= len(cleaned_text)):
+                raise ValueError("invalid chapter range")
+            text = cleaned_text[start:end]
+            cuts = _speakable_paragraph_cuts(text)
+            last_spoken = next((index for index in range(len(text) - 1, -1, -1) if text[index].isalnum()), -1)
+            cursor = 0
+            local = 0
+            while cursor < len(text):
+                within = bisect_right(cuts, cursor + cap)
+                after = bisect_right(cuts, cursor)
+                boundary = cuts[within - 1] if within > after else cuts[after] if after < len(cuts) else len(text)
+                if boundary > last_spoken:
+                    boundary = len(text)
+                piece = text[cursor:boundary]
+                result.append(TextChunk(chapter_index, len(result), local, start + cursor, start + boundary, piece, chunk_input_hash(piece, metadata)))
+                local += 1
+                cursor = boundary
         return result
     if mode != "legacy":
         raise ValueError(f"unsupported chunk mode: {mode}")

@@ -17,7 +17,6 @@ from pypdf import PdfReader
 
 
 MAX_PDF_BYTES = 100 * 1024 * 1024
-MAX_PAGES = 2_000
 REQUIRED_DISK_MULTIPLIER = 3
 REQUIRED_DISK_RESERVE = 256 * 1024 * 1024
 WORDS_PER_MINUTE = 150
@@ -30,7 +29,6 @@ ERROR_SIZE_LIMIT = "SIZE_LIMIT"
 ERROR_INSUFFICIENT_DISK = "INSUFFICIENT_DISK"
 ERROR_PARSER_FAILURE = "PARSER_FAILURE"
 ERROR_ENCRYPTED = "ENCRYPTED_PASSWORD_REQUIRED"
-ERROR_PAGE_LIMIT = "PAGE_LIMIT"
 ERROR_NO_USABLE_TEXT = "NO_USABLE_TEXT"
 ERROR_OCR_REQUIRED = "OCR_REQUIRED"
 ERROR_UNSUPPORTED_LANGUAGE = "UNSUPPORTED_LANGUAGE"
@@ -39,6 +37,8 @@ _WORD = re.compile(r"[A-Za-z][A-Za-z'’-]*")
 _ANY_WORD = re.compile(r"[^\W\d_]+(?:['-][^\W\d_]+)?", re.UNICODE)
 _PAGE_NUMBER = re.compile(r"^(?:page\s+)?\d+$", re.IGNORECASE)
 _HEADING = re.compile(r"^(chapter|part|section)\b\s*(.*)$", re.IGNORECASE)
+_TERMINAL_PUNCTUATION = re.compile(r'[.!?:;…]["\'’”»›)\]}]*$')
+_PAGE_HYPHEN = re.compile(r"[A-Za-z]-$")
 _ENGLISH_MARKERS = {
     "the", "and", "of", "to", "in", "a", "is", "that", "for", "it", "as", "with", "was", "on", "by", "this", "from", "or", "an", "be", "are", "at", "not", "which", "but", "have", "has", "their", "they", "you", "we", "he", "she", "his", "her", "one", "all", "can", "will", "more", "would", "there", "what", "when", "who", "how", "were", "been", "into", "than", "then", "so", "if", "about", "out", "up", "do", "no", "my", "me", "our", "your",
 }
@@ -143,8 +143,6 @@ def _extract_pages(path: Path) -> tuple[PdfReader, list[PageEvidence]]:
         page_count = len(reader.pages)
     except Exception as exc:
         raise _error(ERROR_PARSER_FAILURE, "The PDF page tree could not be read.") from exc
-    if page_count > MAX_PAGES:
-        raise _error(ERROR_PAGE_LIMIT, "The PDF exceeds the 2,000 page limit.", maximum_pages=MAX_PAGES)
     evidence: list[PageEvidence] = []
     for index, page in enumerate(reader.pages):
         try:
@@ -191,6 +189,20 @@ def _repeated_lines(pages: list[PageEvidence]) -> set[str]:
     return {line for line, count in counts.items() if count >= threshold and len(line) > 2}
 
 
+def _page_separator(previous: str, following: str) -> str:
+    if not previous or not following:
+        return "\n\n"
+    if _TERMINAL_PUNCTUATION.search(previous):
+        return "\n\n"
+    if _HEADING.match(previous.rsplit("\n", 1)[-1].strip()):
+        return "\n\n"
+    if following[0].islower():
+        return "" if _PAGE_HYPHEN.search(previous) else " "
+    if (previous[-1].islower() or previous[-1] == ",") and _HEADING.match(following.split("\n", 1)[0].strip()) is None:
+        return " "
+    return "\n\n"
+
+
 def _clean_pages(pages: list[PageEvidence]) -> tuple[str, list[dict[str, int]], list[str]]:
     repeated = _repeated_lines(pages)
     warnings: list[str] = []
@@ -223,8 +235,13 @@ def _clean_pages(pages: list[PageEvidence]) -> tuple[str, list[dict[str, int]], 
         page_text = "\n".join(joined).strip()
         if page_text:
             if pieces:
-                pieces.append("\n\n")
-                offset += 2
+                separator = _page_separator(pieces[-1], page_text)
+                if separator == "":
+                    pieces[-1] = pieces[-1][:-1]
+                    offset -= 1
+                    mapping[-1]["cleaned_end"] -= 1
+                pieces.append(separator)
+                offset += len(separator)
             start = offset
             pieces.append(page_text)
             offset += len(page_text)
@@ -283,24 +300,27 @@ def _layout_heading_candidates(path: Path, page_count: int) -> list[dict[str, An
     try:
         with pdfplumber.open(path) as pdf:
             for index, page in enumerate(pdf.pages[:page_count]):
-                chars = page.chars or []
-                sizes = sorted(float(char.get("size", 0)) for char in chars if char.get("size") is not None)
-                baseline = sizes[len(sizes) // 2] if sizes else 0
-                if not baseline:
-                    continue
-                grouped: dict[float, list[dict[str, Any]]] = {}
-                for char in chars:
-                    top = round(float(char.get("top", 0)), 1)
-                    grouped.setdefault(top, []).append(char)
-                for line_chars in grouped.values():
-                    text = "".join(str(char.get("text", "")) for char in sorted(line_chars, key=lambda item: float(item.get("x0", 0)))).strip()
-                    words = _WORD.findall(text)
-                    if not (2 <= len(words) <= 10 and len(text) <= 100):
+                try:
+                    chars = page.chars or []
+                    sizes = sorted(float(char.get("size", 0)) for char in chars if char.get("size") is not None)
+                    baseline = sizes[len(sizes) // 2] if sizes else 0
+                    if not baseline:
                         continue
-                    max_size = max(float(char.get("size", 0)) for char in line_chars)
-                    bold = any("bold" in str(char.get("fontname", "")).lower() for char in line_chars)
-                    if max_size >= baseline * 1.25 or bold:
-                        candidates.append({"title": text, "source_page": index + 1, "source": "layout"})
+                    grouped: dict[float, list[dict[str, Any]]] = {}
+                    for char in chars:
+                        top = round(float(char.get("top", 0)), 1)
+                        grouped.setdefault(top, []).append(char)
+                    for line_chars in grouped.values():
+                        text = "".join(str(char.get("text", "")) for char in sorted(line_chars, key=lambda item: float(item.get("x0", 0)))).strip()
+                        words = _WORD.findall(text)
+                        if not (2 <= len(words) <= 10 and len(text) <= 100):
+                            continue
+                        max_size = max(float(char.get("size", 0)) for char in line_chars)
+                        bold = any("bold" in str(char.get("fontname", "")).lower() for char in line_chars)
+                        if max_size >= baseline * 1.25 or bold:
+                            candidates.append({"title": text, "source_page": index + 1, "source": "layout"})
+                finally:
+                    page.close()
     except Exception:
         return []
     return candidates
@@ -334,23 +354,26 @@ def _layout_warnings(path: Path, page_count: int) -> list[str]:
     try:
         with pdfplumber.open(path) as pdf:
             for index, page in enumerate(pdf.pages[:page_count]):
-                words = page.extract_words() or []
-                lines = page.extract_text_lines() or []
-                midpoint = page.width / 2
-                left = [line for line in lines if float(line.get("x1", 0)) < midpoint - 20]
-                right = [line for line in lines if float(line.get("x0", 0)) > midpoint + 20]
-                if len(left) >= 3 and len(right) >= 3 and len(words) >= 20:
-                    warnings.append(f"Page {index + 1} may use multiple columns; reading order was inferred.")
                 try:
-                    if page.find_tables():
-                        warnings.append(f"Page {index + 1} contains table-like layout; reading order was inferred.")
-                except Exception:
-                    pass
-                extracted = page.extract_text() or ""
-                if re.search(r"(?:=\s*[A-Za-z0-9]|\b(?:eq|equation)\b)", extracted, re.IGNORECASE):
-                    warnings.append(f"Page {index + 1} may contain equations; review the extracted text.")
-                if any("top" in word and "bottom" in word and float(word["bottom"]) - float(word["top"]) > page.height * 0.15 for word in words):
-                    warnings.append(f"Page {index + 1} contains unusually large layout elements.")
+                    words = page.extract_words() or []
+                    lines = page.extract_text_lines() or []
+                    midpoint = page.width / 2
+                    left = [line for line in lines if float(line.get("x1", 0)) < midpoint - 20]
+                    right = [line for line in lines if float(line.get("x0", 0)) > midpoint + 20]
+                    if len(left) >= 3 and len(right) >= 3 and len(words) >= 20:
+                        warnings.append(f"Page {index + 1} may use multiple columns; reading order was inferred.")
+                    try:
+                        if page.find_tables():
+                            warnings.append(f"Page {index + 1} contains table-like layout; reading order was inferred.")
+                    except Exception:
+                        pass
+                    extracted = page.extract_text() or ""
+                    if re.search(r"(?:=\s*[A-Za-z0-9]|\b(?:eq|equation)\b)", extracted, re.IGNORECASE):
+                        warnings.append(f"Page {index + 1} may contain equations; review the extracted text.")
+                    if any("top" in word and "bottom" in word and float(word["bottom"]) - float(word["top"]) > page.height * 0.15 for word in words):
+                        warnings.append(f"Page {index + 1} contains unusually large layout elements.")
+                finally:
+                    page.close()
     except Exception:
         warnings.append("Layout evidence was unavailable for one or more pages.")
     return warnings
@@ -371,7 +394,7 @@ def _validate_page_coverage(pages: list[PageEvidence], cleaned_text: str) -> Non
         raise _error(ERROR_OCR_REQUIRED, f"Interior page(s) {', '.join(map(str, needs_ocr))} require OCR; the PDF was not silently omitted.", pages=needs_ocr)
 
 
-def analyze_pdf(path: Path, *, fallback_title: str | None = None, check_disk: bool = True) -> dict[str, Any]:
+def analyze_pdf(path: Path, *, fallback_title: str | None = None, check_disk: bool = True, layout_warnings: bool = True) -> dict[str, Any]:
     """Validate and analyze a workspace PDF, returning JSON-safe review data."""
 
     path = Path(path)
@@ -385,7 +408,8 @@ def analyze_pdf(path: Path, *, fallback_title: str | None = None, check_disk: bo
     _validate_page_coverage(pages, cleaned_text)
     language, language_warnings = _language(cleaned_text)
     warnings.extend(language_warnings)
-    warnings.extend(_layout_warnings(path, len(pages)))
+    if layout_warnings:
+        warnings.extend(_layout_warnings(path, len(pages)))
     words = len(_WORD.findall(cleaned_text))
     metadata = reader.metadata or {}
     title = str(getattr(metadata, "title", None) or metadata.get("/Title") or fallback_title or path.name)
@@ -415,11 +439,9 @@ __all__ = [
     "ERROR_INVALID_SIGNATURE",
     "ERROR_NO_USABLE_TEXT",
     "ERROR_OCR_REQUIRED",
-    "ERROR_PAGE_LIMIT",
     "ERROR_PARSER_FAILURE",
     "ERROR_SIZE_LIMIT",
     "ERROR_UNSUPPORTED_LANGUAGE",
-    "MAX_PAGES",
     "MAX_PDF_BYTES",
     "MIXED_MIN_WORDS",
     "PdfAnalysisError",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import functools
 import hashlib
 import importlib
 import math
@@ -120,7 +121,9 @@ def _validate_voice_speed(voice: str, speed: float) -> None:
 
 def _expected_tts(cleaned_text: str, plan: dict[str, Any], voice: str, speed: float) -> tuple[dict[str, Any], int]:
     _validate_voice_speed(voice, speed)
-    settings = SynthesisSettings(speed=speed)
+    # Whole-paragraph chunks sound identical to the desktop's chapter mode but
+    # keep memory and checkpoints bounded for very long books.
+    settings = SynthesisSettings(speed=speed, chunk_mode="paragraph", chunk_cap=5000)
     metadata = EngineMetadata(
         "kokoro", "0.9.4", "hexgrad/Kokoro-82M", "captured-at-download", "unrecorded",
         voice, "captured-at-download", "unrecorded", settings.sample_rate, settings.as_dict(),
@@ -199,6 +202,7 @@ class ColabProgressDisplay:
         self._output = output if output is not None else _print_progress
         self._bar_width = max(8, min(int(bar_width), 48))
         self._last_key: tuple[Any, ...] | None = None
+        self._last_milestone: tuple[Any, ...] | None = None
 
     @staticmethod
     def _ascii(value: Any, limit: int = 32) -> str:
@@ -240,9 +244,16 @@ class ColabProgressDisplay:
             key = self._snapshot_key(manifest)
             if key == self._last_key:
                 return
+            # Long books have thousands of chunks; print only when the stage,
+            # chapter, or whole percentage changes.
+            status, stage, completed, _current, total, latest = key
+            milestone = (status, stage, latest[1] if latest else None, completed * 100 // total if total else 100)
+            if milestone == self._last_milestone:
+                return
             line = self._format(manifest)
             self._output(line)
             self._last_key = key
+            self._last_milestone = milestone
         except Exception:
             # Display is best-effort.  The workspace update has already
             # succeeded, and an output/formatting failure must not change it.
@@ -291,7 +302,7 @@ def run_conversion(
     chapter_count: int | None = None,
     start_new: bool = False,
     cuda_check: Callable[[], Any] = _cuda_module,
-    analyzer: Callable[..., dict[str, Any]] = analyze_pdf,
+    analyzer: Callable[..., dict[str, Any]] = functools.partial(analyze_pdf, layout_warnings=False),
     worker_class: Callable[..., Any] = ConversionWorker,
     engine_factory: Callable[..., Any] | None = None,
 ) -> Path:
