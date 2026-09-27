@@ -410,11 +410,35 @@ def _run(command_runner: Callable[..., Any] | None, argv: list[str]) -> Any:
         raise M4BError("external media tool failed to start") from exc
 
 
+def _run_with_progress(argv: list[str], duration_seconds: float) -> Any:
+    """Run ffmpeg while printing its encode progress every 5%."""
+    argv = [*argv[:-1], "-progress", "pipe:1", "-nostats", argv[-1]]
+    try:
+        process = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError as exc:
+        raise M4BError("external media tool failed to start") from exc
+    print("Encoding M4B: 0%", flush=True)
+    reported = 0
+    assert process.stdout is not None
+    for line in process.stdout:
+        if not line.startswith("out_time_us=") or duration_seconds <= 0:
+            continue
+        try:
+            percent = int(int(line.split("=", 1)[1]) / 1_000_000 / duration_seconds * 100)
+        except ValueError:
+            continue
+        if percent >= reported + 5:
+            reported = min(percent // 5 * 5, 100)
+            print(f"Encoding M4B: {reported}%", flush=True)
+    process.wait()
+    return process
+
+
 def encode_m4b(assembly: AssemblyResult, metadata_path: Path, destination: Path, *, command_runner: Callable[..., Any] | None = None) -> Path:
     _prepare_working_file(destination)
     ffmpeg = discover_tool("ffmpeg", "PDF_AUDIOBOOK_FFMPEG")
-    argv = [ffmpeg, "-y", "-i", str(assembly.path), "-f", "ffmetadata", "-i", str(metadata_path), "-map", "0:a:0", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "aac", "-af", "loudnorm=I=-18:TP=-3:LRA=11", "-ar", str(assembly.sample_rate), "-movflags", "+faststart", str(destination)]
-    result = _run(command_runner, argv)
+    argv = [ffmpeg, "-nostdin", "-y", "-i", str(assembly.path), "-f", "ffmetadata", "-i", str(metadata_path), "-map", "0:a:0", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "aac", "-af", "loudnorm=I=-18:TP=-3:LRA=11", "-ar", str(assembly.sample_rate), "-movflags", "+faststart", str(destination)]
+    result = _run(command_runner, argv) if command_runner else _run_with_progress(argv, assembly.duration_seconds)
     if type(getattr(result, "returncode", None)) is not int or result.returncode != 0:
         raise M4BError("ffmpeg encoding failed")
     _safe_regular_file(destination, "encoded M4B")
