@@ -1,0 +1,9 @@
+# Kokoro packages for the Colab notebook's venv. torch is installed separately to match
+# Colab's CUDA driver. After editing this file, regenerate constraints.txt with the
+# command in its header.
+kokoro==0.9.4
+# Without this, huggingface-hub 2.x makes uv fall back to transformers 4.12, which needs
+# a Rust build. 5.14.1 matches benchmark/environments/kokoro/uv.lock.
+transformers==5.14.1
+spacy<4
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0.tar.gz
