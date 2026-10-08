@@ -39,7 +39,7 @@ def test_setup_cell_torch_mirror_before_kokoro() -> None:
     setup_cell = _get_setup_cell(data)
     source_lines = setup_cell.get("source", [])
     torch_mirror_indices = [i for i, line in enumerate(source_lines) if "--index-url {TORCH_INDEX}" in line]
-    kokoro_indices = [i for i, line in enumerate(source_lines) if "'kokoro==0.9.4'" in line]
+    kokoro_indices = [i for i, line in enumerate(source_lines) if "-r {REPO}/colab/requirements.in" in line]
 
     assert len(torch_mirror_indices) == 1
     assert len(kokoro_indices) == 1
@@ -50,7 +50,7 @@ def test_setup_cell_kokoro_line_contains_torch_version() -> None:
     data = _load_notebook()
     setup_cell = _get_setup_cell(data)
     source_lines = setup_cell.get("source", [])
-    kokoro_lines = [line for line in source_lines if "'kokoro==0.9.4'" in line]
+    kokoro_lines = [line for line in source_lines if "-r {REPO}/colab/requirements.in" in line]
     assert len(kokoro_lines) == 1
     assert "torch=={TORCH_VERSION}" in kokoro_lines[0]
 
@@ -61,3 +61,93 @@ def test_setup_cell_raises_when_gpu_check_fails() -> None:
     source_text = "".join(setup_cell.get("source", []))
     assert "cannot see the GPU" in source_text
     assert "raise RuntimeError" in source_text
+    # A failed Kokoro install must stop setup, not surface later at preview time.
+    assert "import torch, kokoro;" in source_text
+
+
+def test_setup_cell_constrains_every_install_except_torch() -> None:
+    source_lines = _get_setup_cell(_load_notebook()).get("source", [])
+    installs = [line for line in source_lines if line.startswith("!uv pip install --python {PY}")]
+    assert len(installs) == 3
+    for line in installs:
+        assert ("--index-url {TORCH_INDEX}" in line) != ("-c {REPO}/colab/constraints.txt" in line), line
+
+
+def _requirement_names(path: Path) -> set[str]:
+    names = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith((" ", "#")):
+            for separator in ("==", "<", " @ "):
+                line = line.split(separator)[0]
+            names.add(line.strip().lower().replace("_", "-"))
+    return names
+
+
+def test_constraints_pin_every_requirement_and_leave_torch_to_colab() -> None:
+    colab_dir = NOTEBOOK_PATH.parent
+    pinned = _requirement_names(colab_dir / "constraints.txt")
+    assert _requirement_names(colab_dir / "requirements.in") <= pinned, "regenerate colab/constraints.txt (command in its header)"
+    assert not pinned & _requirement_names(colab_dir / "excludes.txt")
+    assert not {name for name in pinned if name == "triton" or name.startswith(("nvidia-", "cuda-"))}
+
+
+def _get_panel_cell(data: dict) -> dict:
+    for cell in data.get("cells", []):
+        source = "".join(cell.get("source", []))
+        if "voice_picker" in source and "render_previews" in source:
+            return cell
+    raise AssertionError("Panel cell not found in notebook")
+
+
+def _get_generate_cell(data: dict) -> dict:
+    for cell in data.get("cells", []):
+        source = "".join(cell.get("source", []))
+        if "# One long, resumable headless run" in source:
+            return cell
+    raise AssertionError("Generate cell not found in notebook")
+
+
+def test_panel_cell_calls_cli_and_parses_preview_wav() -> None:
+    data = _load_notebook()
+    panel_cell = _get_panel_cell(data)
+    source = "".join(panel_cell.get("source", []))
+    assert "--preview-dir" in source
+    assert "--preview-text" in source
+    assert "Preview WAV " in source
+
+
+def test_no_cell_contains_preview_out_or_param() -> None:
+    data = _load_notebook()
+    for i, cell in enumerate(data.get("cells", [])):
+        source = "".join(cell.get("source", []))
+        assert "--preview-out" not in source, f"Cell {i} contains '--preview-out'"
+        assert "# @param" not in source, f"Cell {i} contains '# @param'"
+
+
+def test_generate_cell_reads_panel_values() -> None:
+    data = _load_notebook()
+    generate_cell = _get_generate_cell(data)
+    source = "".join(generate_cell.get("source", []))
+    assert "voice_picker.value" in source
+    assert "start_new_box.value" in source
+
+
+def test_panel_cell_contains_all_approved_voice_ids() -> None:
+    from pdf_audiobook.voice_registry import APPROVED_VOICE_IDS
+
+    data = _load_notebook()
+    panel_cell = _get_panel_cell(data)
+    source = "".join(panel_cell.get("source", []))
+    for voice_id in APPROVED_VOICE_IDS:
+        assert voice_id in source, f"Voice {voice_id} missing from panel cell source"
+
+
+def test_every_code_cell_compiles() -> None:
+    data = _load_notebook()
+    for i, cell in enumerate(data.get("cells", [])):
+        if cell.get("cell_type") != "code":
+            continue
+        lines = cell.get("source", [])
+        filtered_lines = [line for line in lines if not line.strip().startswith("!")]
+        code_text = "".join(filtered_lines)
+        compile(code_text, f"<cell_{i}>", "exec")

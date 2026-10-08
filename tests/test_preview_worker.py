@@ -44,6 +44,21 @@ def test_generate_preview_uses_fixed_sentence_and_publishes_valid_wav() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_generate_preview_uses_custom_text_when_provided() -> None:
+    root = Path("tests") / f".pytest-preview-worker-{uuid.uuid4().hex}"
+    root.mkdir()
+    target = root / "sample-kokoro-af_heart.wav"
+    fake = _FakeVoice()
+    try:
+        result = generate_preview("af_heart", target, voice_loader=lambda voice, settings: fake, text="Custom words.")
+        assert result == target
+        assert fake.text == "Custom words." and fake.closed
+        assert validate_wav(target, expected_sample_rate=24000).frames == 240
+        assert not list(root.glob(".*.tmp"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_generate_preview_closes_voice_and_cleans_temp_on_failure() -> None:
     root = Path("tests") / f".pytest-preview-worker-failure-{uuid.uuid4().hex}"
     root.mkdir()

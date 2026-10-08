@@ -69,7 +69,7 @@ If your computer is slow or you can't install anything, run the Kokoro pipeline 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AugustZhang1/AudiobookFree/blob/main/colab/PDF_Audiobook_Colab.ipynb)
 
 1. Open the link above and choose **Runtime → Change runtime type → T4 GPU**.
-2. Run the cells top to bottom. Pick a voice in the **Settings** cell (you can preview it before converting).
+2. Run the cells top to bottom. Pick a voice in the **Choose a voice** panel — preview or compare voices on your own sample text before converting.
 3. Upload your PDF when prompted and download the finished M4B at the end.
 
 Free Colab sessions can disconnect; the notebook checkpoints every few pages and resumes where it left off if you rerun it with the same settings. There is no page limit on the PDF (the file-size limit is 100 MiB).

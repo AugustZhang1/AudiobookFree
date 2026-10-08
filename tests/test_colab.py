@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
 from pathlib import Path
 import re
 import shutil
 from types import SimpleNamespace
+from typing import Any
 import uuid
 
 import pytest
@@ -627,9 +629,9 @@ def test_preview_voice_forwards_request_and_creates_the_parent_directory(sandbox
     captured: dict = {}
     factory = lambda *args, **kwargs: None
 
-    def fake_preview(voice, destination, *, settings, voice_loader):
+    def fake_preview(voice, destination, *, settings, voice_loader, text=None):
         assert Path(destination).parent.is_dir()
-        captured.update({"voice": voice, "destination": Path(destination), "settings": settings, "loader": voice_loader})
+        captured.update({"voice": voice, "destination": Path(destination), "settings": settings, "loader": voice_loader, "text": text})
         return Path(destination)
 
     result = colab.preview_voice("bf_emma", target, speed=1.25, cuda_check=lambda: None, engine_factory=factory, preview=fake_preview)
@@ -638,6 +640,7 @@ def test_preview_voice_forwards_request_and_creates_the_parent_directory(sandbox
     assert captured["voice"] == "bf_emma"
     assert captured["settings"] == {"speed": 1.25}
     assert captured["loader"] is factory
+    assert captured["text"] == colab.PREVIEW_TEXT
     assert target.parent.is_dir()
 
 
@@ -704,18 +707,38 @@ def test_real_cuda_factory_drives_generate_preview_to_a_valid_wav(sandbox_path: 
     assert synthesis and synthesis[0]["voice"] == "bf_emma" and synthesis[0]["speed"] == 1.0
 
 
-def test_main_preview_out_needs_no_pdf(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    target = sandbox_path / "preview.wav"
-    calls: list[tuple] = []
+def test_main_preview_dir_needs_no_pdf(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    out_dir = sandbox_path / "previews"
+    captured: dict[str, Any] = {}
 
-    def fake_preview_voice(voice, out, *, speed=1.0):
-        calls.append((voice, Path(out), speed))
-        return Path(out)
+    def fake_preview_voices(voices, directory, *, speed=1.0, text=None):
+        captured.update({"voices": voices, "directory": Path(directory), "speed": speed, "text": text})
+        return {"af_heart": Path(directory) / "af_heart.wav", "bf_emma": Path(directory) / "bf_emma.wav"}
 
-    monkeypatch.setattr(colab, "preview_voice", fake_preview_voice)
-    assert colab.main(["--preview-out", str(target), "--voice", "bf_emma"]) == 0
-    assert capsys.readouterr().out.strip() == f"Preview WAV: {target}"
-    assert calls == [("bf_emma", target, 1.0)]
+    monkeypatch.setattr(colab, "preview_voices", fake_preview_voices)
+    assert colab.main([
+        "--preview-dir", str(out_dir),
+        "--voice", "af_heart",
+        "--voice", "bf_emma",
+        "--preview-text", "Custom preview sentence.",
+        "--speed", "1.25",
+    ]) == 0
+    assert captured["voices"] == ["af_heart", "bf_emma"]
+    assert captured["directory"] == out_dir
+    assert captured["speed"] == 1.25
+    assert captured["text"] == "Custom preview sentence."
+    assert capsys.readouterr().out.strip().splitlines() == [
+        f"Preview WAV af_heart: {out_dir / 'af_heart.wav'}",
+        f"Preview WAV bf_emma: {out_dir / 'bf_emma.wav'}",
+    ]
+
+
+def test_main_rejects_multiple_voices_for_conversion(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(colab, "run_conversion", lambda *args, **kwargs: pytest.fail("run_conversion must not be called"))
+    pdf = sandbox_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-test")
+    assert colab.main([str(pdf), "--voice", "af_heart", "--voice", "bf_emma"]) == 2
+    assert "Colab conversion failed: a conversion uses exactly one --voice" in capsys.readouterr().out
 
 
 def test_main_without_pdf_or_preview_reports_a_required_pdf(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -757,7 +780,7 @@ def test_notebook_parses_and_generate_cell_does_not_reassign_chapter_count() -> 
     assert "chapter_count = None" not in generate[0]
     assert "chapter_count=None" not in generate[0]
     assert "--chapter-count" in generate[0]
-    derivation = re.search(r"^(\w+) = chapter_count if chapter_mode == 'custom' else None$", generate[0], re.MULTILINE)
+    derivation = re.search(r"^(\w+) = chapter_count_box\.value if chapter_mode == 'custom' else None$", generate[0], re.MULTILINE)
     assert derivation is not None
     assert derivation.group(1) != "chapter_count"
     assert f"'--chapter-count', str({derivation.group(1)})" in generate[0]
@@ -908,7 +931,7 @@ def test_preview_voice_coerces_the_requested_speed_exactly_once(sandbox_path: Pa
     speed = _CountingSpeed(1.0)
     captured: dict = {}
 
-    def fake_preview(voice, destination, *, settings, voice_loader):
+    def fake_preview(voice, destination, *, settings, voice_loader, **kwargs):
         captured.update(settings)
         return Path(destination)
 
@@ -1042,3 +1065,198 @@ def test_progress_display_throttles_long_runs() -> None:
     chapter_display.render(_progress_manifest(completed=2, total=1000, chapter=2))
 
     assert len(chapter_lines) == 2
+
+
+def test_make_cuda_kokoro_factory_caches_pipeline_per_language() -> None:
+    pipeline_calls: list[dict] = []
+
+    class Torch:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+        @staticmethod
+        def inference_mode():
+            return nullcontext()
+
+    class Pipeline:
+        def __init__(self, **kwargs):
+            pipeline_calls.append(kwargs)
+
+    factory = colab.make_cuda_kokoro_factory(
+        torch_loader=lambda: Torch,
+        kokoro_loader=lambda: SimpleNamespace(KPipeline=Pipeline),
+    )
+
+    v1 = factory("af_heart")
+    v2 = factory("af_bella")
+    v3 = factory("bf_emma")
+
+    assert len(pipeline_calls) == 2
+    assert pipeline_calls == [
+        {"lang_code": "a", "device": "cuda"},
+        {"lang_code": "b", "device": "cuda"},
+    ]
+    assert v1 is not v2
+    assert v1.pipeline is v2.pipeline
+    assert v3.pipeline is not v1.pipeline
+
+
+def test_preview_voices_renders_each_voice_calls_cuda_check_once_and_shares_factory(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cuda_calls = 0
+
+    def fake_cuda():
+        nonlocal cuda_calls
+        cuda_calls += 1
+
+    factory_instance = object()
+    factory_build_count = 0
+
+    def fake_factory_builder():
+        nonlocal factory_build_count
+        factory_build_count += 1
+        return factory_instance
+
+    monkeypatch.setattr(colab, "make_cuda_kokoro_factory", fake_factory_builder)
+
+    preview_calls: list[dict] = []
+
+    def fake_preview(voice, destination, *, settings, voice_loader, text=None):
+        preview_calls.append({
+            "voice": voice,
+            "destination": Path(destination),
+            "settings": settings,
+            "loader": voice_loader,
+            "text": text,
+        })
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"RIFF-fake")
+        return dest
+
+    out_dir = sandbox_path / "previews"
+    voices = ["af_heart", "bf_emma", "af_heart"]
+    results = colab.preview_voices(
+        voices,
+        out_dir,
+        speed=1.0,
+        text="Sample text",
+        cuda_check=fake_cuda,
+        engine_factory=None,
+        preview=fake_preview,
+    )
+
+    assert cuda_calls == 1
+    assert factory_build_count == 1
+    assert len(preview_calls) == 2
+    assert [c["voice"] for c in preview_calls] == ["af_heart", "bf_emma"]
+    assert preview_calls[0]["loader"] is factory_instance
+    assert preview_calls[1]["loader"] is factory_instance
+    assert preview_calls[0]["text"] == "Sample text"
+    assert preview_calls[1]["text"] == "Sample text"
+    assert list(results.keys()) == ["af_heart", "bf_emma"]
+    assert results["af_heart"] == preview_calls[0]["destination"]
+    assert results["bf_emma"] == preview_calls[1]["destination"]
+
+
+def test_preview_voices_reuses_existing_wav_and_skips_cuda(sandbox_path: Path) -> None:
+    out_dir = sandbox_path / "previews"
+    out_dir.mkdir(parents=True)
+    text = "Preview reusing test."
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    existing_target = out_dir / f"af_heart-1-{digest}.wav"
+    existing_target.write_bytes(b"existing-wav")
+
+    rendered_voices: list[str] = []
+    cuda_called = False
+
+    def fake_cuda():
+        nonlocal cuda_called
+        cuda_called = True
+
+    def fake_preview(voice, destination, *, settings, voice_loader, text=None):
+        rendered_voices.append(voice)
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"new-wav")
+        return dest
+
+    results = colab.preview_voices(
+        ["af_heart", "bf_emma"],
+        out_dir,
+        speed=1.0,
+        text=text,
+        cuda_check=fake_cuda,
+        engine_factory=lambda *args, **kwargs: None,
+        preview=fake_preview,
+    )
+    assert cuda_called is True
+    assert rendered_voices == ["bf_emma"]
+    assert results["af_heart"] == existing_target
+    assert results["bf_emma"] == out_dir / f"bf_emma-1-{digest}.wav"
+    assert existing_target.read_bytes() == b"existing-wav"
+
+    cuda_called = False
+    rendered_voices.clear()
+    results2 = colab.preview_voices(
+        ["af_heart", "bf_emma"],
+        out_dir,
+        speed=1.0,
+        text=text,
+        cuda_check=lambda: pytest.fail("cuda_check should not be called when all targets exist"),
+        engine_factory=lambda *args, **kwargs: pytest.fail("engine_factory should not be called"),
+        preview=lambda *args, **kwargs: pytest.fail("preview should not be called"),
+    )
+    assert cuda_called is False
+    assert rendered_voices == []
+    assert results2 == results
+
+
+def test_preview_voices_validates_everything_first(sandbox_path: Path) -> None:
+    out_dir = sandbox_path / "never_created_dir"
+    with pytest.raises(colab.ColabError, match="voice is not approved: zz_nobody"):
+        colab.preview_voices(
+            ["af_heart", "zz_nobody"],
+            out_dir,
+            cuda_check=lambda: pytest.fail("CUDA must not be probed"),
+            preview=lambda *args, **kwargs: pytest.fail("preview must not be rendered"),
+        )
+    assert not out_dir.exists()
+
+
+def test_preview_voices_rejects_empty_voices(sandbox_path: Path) -> None:
+    with pytest.raises(colab.ColabError, match="choose at least one voice to preview"):
+        colab.preview_voices([], sandbox_path / "out")
+
+
+@pytest.mark.parametrize("bad_text", ["", "   ", "x" * 501, 123])
+def test_preview_text_validation_rejects_before_cuda(sandbox_path: Path, bad_text: Any) -> None:
+    with pytest.raises(colab.ColabError, match="preview text must be 1 to 500 characters"):
+        colab.preview_voice(
+            "af_heart",
+            sandbox_path / "p.wav",
+            text=bad_text,
+            cuda_check=lambda: pytest.fail("CUDA must not be probed"),
+        )
+    with pytest.raises(colab.ColabError, match="preview text must be 1 to 500 characters"):
+        colab.preview_voices(
+            ["af_heart"],
+            sandbox_path / "out",
+            text=bad_text,
+            cuda_check=lambda: pytest.fail("CUDA must not be probed"),
+        )
+
+
+def test_preview_voice_forwards_custom_text_and_none_forwards_default(sandbox_path: Path) -> None:
+    captured: list[str | None] = []
+
+    def fake_preview(voice, destination, *, settings, voice_loader, text=None):
+        captured.append(text)
+        return Path(destination)
+
+    colab.preview_voice("af_heart", sandbox_path / "p1.wav", text="Hello world!", cuda_check=lambda: None, preview=fake_preview)
+    assert captured[-1] == "Hello world!"
+
+    colab.preview_voice("af_heart", sandbox_path / "p2.wav", text=None, cuda_check=lambda: None, preview=fake_preview)
+    assert captured[-1] == colab.PREVIEW_TEXT

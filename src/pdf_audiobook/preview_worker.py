@@ -90,6 +90,7 @@ def generate_preview(
     *,
     settings: SynthesisSettings | dict[str, Any] | None = None,
     voice_loader: Callable[[str, SynthesisSettings], Any] | None = None,
+    text: str | None = None,
 ) -> Path:
     """Synthesize and atomically publish one validated 24 kHz preview.
 
@@ -110,7 +111,8 @@ def generate_preview(
     temporary: Path | None = None
     try:
         loaded = loader(voice, settings)
-        pcm = shape_pcm(loaded.synthesize(PREVIEW_TEXT), KOKORO_SAMPLE_RATE, settings.as_dict())
+        sample_text = text if text is not None else PREVIEW_TEXT
+        pcm = shape_pcm(loaded.synthesize(sample_text), KOKORO_SAMPLE_RATE, settings.as_dict())
         fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=parent)
         os.close(fd)
         temporary = Path(name)

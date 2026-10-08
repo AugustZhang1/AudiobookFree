@@ -4,6 +4,7 @@
 !/README.md
 *.txt
 !/requirements.txt
+!/colab/*.txt
 /docs/
 /Reference Image/
 /graphify-out/

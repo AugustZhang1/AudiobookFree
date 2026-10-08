@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterator
 
 from .chapters import create_chapter_plan
 from .pdf import analyze_pdf
-from .preview_worker import generate_preview
+from .preview_worker import PREVIEW_TEXT, generate_preview
 from .security import pid_is_alive
 from .tts import EngineMetadata, KokoroVoice, SynthesisSettings, plan_chunks
 from .voice_registry import APPROVED_VOICE_IDS
@@ -54,6 +54,7 @@ def make_cuda_kokoro_factory(*, torch_loader: Callable[[], Any] | None = None, k
 
     load_torch = torch_loader or _cuda_module
     load_kokoro = kokoro_loader or (lambda: _import("kokoro"))
+    pipelines: dict[str, Any] = {}
 
     def factory(voice: str, settings: SynthesisSettings | None = None, *, engine: str = "kokoro") -> KokoroVoice:
         if engine != "kokoro":
@@ -69,7 +70,9 @@ def make_cuda_kokoro_factory(*, torch_loader: Callable[[], Any] | None = None, k
             kokoro = load_kokoro()
             pipeline_class = getattr(kokoro, "KPipeline")
             language = "a" if voice.startswith("a") else "b"
-            pipeline = pipeline_class(lang_code=language, device="cuda")
+            if language not in pipelines:
+                pipelines[language] = pipeline_class(lang_code=language, device="cuda")
+            pipeline = pipelines[language]
             return KokoroVoice(pipeline, voice, settings, inference_context=inference_mode)
         except ColabError:
             raise
@@ -117,6 +120,17 @@ def _validate_voice_speed(voice: str, speed: float) -> None:
         raise ColabError(f"voice is not approved: {voice}")
     if not math.isfinite(speed) or not 0.5 <= speed <= 2.0:
         raise ColabError("speed must be between 0.5 and 2.0")
+
+
+def _preview_text(text: Any) -> str:
+    if text is None:
+        return PREVIEW_TEXT
+    if not isinstance(text, str):
+        raise ColabError("preview text must be 1 to 500 characters")
+    cleaned = text.strip()
+    if not (1 <= len(cleaned) <= 500):
+        raise ColabError("preview text must be 1 to 500 characters")
+    return cleaned
 
 
 def _expected_tts(cleaned_text: str, plan: dict[str, Any], voice: str, speed: float) -> tuple[dict[str, Any], int]:
@@ -391,6 +405,7 @@ def preview_voice(
     target: str | os.PathLike[str],
     *,
     speed: float = 1.0,
+    text: str | None = None,
     cuda_check: Callable[[], Any] = _cuda_module,
     engine_factory: Callable[..., Any] | None = None,
     preview: Callable[..., Path] = generate_preview,
@@ -399,16 +414,68 @@ def preview_voice(
 
     requested_speed = _normalized_speed(speed)
     _validate_voice_speed(voice, requested_speed)
+    sample_text = _preview_text(text)
     cuda_check()
     destination = Path(target).expanduser().absolute()
     destination.parent.mkdir(parents=True, exist_ok=True)
     factory = engine_factory or make_cuda_kokoro_factory()
     try:
-        return preview(voice, destination, settings={"speed": requested_speed}, voice_loader=factory)
+        return preview(voice, destination, settings={"speed": requested_speed}, voice_loader=factory, text=sample_text)
     except ColabError:
         raise
     except Exception as exc:
         raise ColabError(f"voice preview failed for {voice}") from exc
+
+
+def preview_voices(
+    voices: list[str],
+    out_dir: str | os.PathLike[str],
+    *,
+    speed: float = 1.0,
+    text: str | None = None,
+    cuda_check: Callable[[], Any] = _cuda_module,
+    engine_factory: Callable[..., Any] | None = None,
+    preview: Callable[..., Path] = generate_preview,
+) -> dict[str, Path]:
+    """Render preview WAVs for multiple voices using custom or default text."""
+
+    voice_list = list(voices)
+    if not voice_list:
+        raise ColabError("choose at least one voice to preview")
+    # Validate the whole request before CUDA is probed or any file is written.
+
+    requested_speed = _normalized_speed(speed)
+    sample_text = _preview_text(text)
+    for voice in voice_list:
+        _validate_voice_speed(voice, requested_speed)
+
+    unique_voices = list(dict.fromkeys(voice_list))
+    digest = hashlib.sha256(sample_text.encode("utf-8")).hexdigest()[:12]
+    directory = Path(out_dir).expanduser().absolute()
+
+    results: dict[str, Path] = {}
+    missing: list[tuple[str, Path]] = []
+    for voice in unique_voices:
+        target = directory / f"{voice}-{requested_speed:g}-{digest}.wav"
+        results[voice] = target
+        if not target.is_file():
+            missing.append((voice, target))
+
+    if missing:
+        cuda_check()
+        factory = engine_factory or make_cuda_kokoro_factory()
+        for voice, target in missing:
+            results[voice] = preview_voice(
+                voice,
+                target,
+                speed=requested_speed,
+                text=sample_text,
+                cuda_check=lambda: None,
+                engine_factory=factory,
+                preview=preview,
+            )
+
+    return results
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -416,7 +483,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("pdf", type=Path, nargs="?")
     parser.add_argument("--workspace-root", type=Path, default=Path("/content/pdf-audiobook-workspace"))
     parser.add_argument("--output-dir", type=Path, default=Path("/content/pdf-audiobook-output"))
-    parser.add_argument("--voice", choices=APPROVED_VOICE_IDS, default="af_heart")
+    parser.add_argument(
+        "--voice",
+        action="append",
+        choices=APPROVED_VOICE_IDS,
+        help="Kokoro voice; repeat with --preview-dir to preview several voices",
+    )
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--chapter-mode", choices=("original", "whole", "custom"), default="original")
     parser.add_argument("--chapter-count", type=int)
@@ -429,29 +501,43 @@ def _parser() -> argparse.ArgumentParser:
             "An already-published M4B is not affected."
         ),
     )
-    parser.add_argument("--preview-out", type=Path, help="Render a short voice preview WAV to this path and exit; no PDF is needed")
+    parser.add_argument(
+        "--preview-dir",
+        type=Path,
+        help="Render a short preview WAV for each --voice into this directory and exit; no PDF is needed",
+    )
+    parser.add_argument(
+        "--preview-text",
+        type=str,
+        help="Custom preview text (1-500 characters); defaults to the built-in sample sentence",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.preview_out is not None:
+    voices = args.voice or ["af_heart"]
+    if args.preview_dir is not None:
         try:
-            sample = preview_voice(args.voice, args.preview_out, speed=args.speed)
+            previews = preview_voices(voices, args.preview_dir, speed=args.speed, text=args.preview_text)
         except (ColabError, OSError, ValueError) as exc:
             print(f"Colab voice preview failed: {exc}")
             return 2
-        print(f"Preview WAV: {sample}")
+        for voice, path in previews.items():
+            print(f"Preview WAV {voice}: {path}")
         return 0
+    if len(voices) > 1:
+        print("Colab conversion failed: a conversion uses exactly one --voice")
+        return 2
     if args.pdf is None:
-        print("Colab conversion failed: a PDF path is required unless --preview-out is used")
+        print("Colab conversion failed: a PDF path is required unless --preview-dir is used")
         return 2
     try:
         result = run_conversion(
             args.pdf,
             workspace_root=args.workspace_root,
             output_dir=args.output_dir,
-            voice=args.voice,
+            voice=voices[0],
             speed=args.speed,
             chapter_mode=args.chapter_mode,
             chapter_count=args.chapter_count,
@@ -468,4 +554,4 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "preview_voice", "run_conversion"]
+__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "preview_voice", "preview_voices", "run_conversion"]

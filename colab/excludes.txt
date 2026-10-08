@@ -1,0 +1,13 @@
+# Colab installs torch itself, matched to its GPU driver. torch and the packages its
+# install brings in are left out of constraints.txt so they can never conflict with
+# whichever torch version Colab ships.
+torch
+filelock
+fsspec
+jinja2
+markupsafe
+mpmath
+networkx
+setuptools
+sympy
+typing-extensions
