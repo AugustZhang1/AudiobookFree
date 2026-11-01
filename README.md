@@ -99,10 +99,10 @@ Under **Design a voice**, describe any voice ("a gruff old man with a deep, grav
 Give each character in the book their own voice, with the narrator reading everything else:
 
 1. Set **Narration** at the top of the panel to **Character voices (Gemini)**. It is off (**One voice**) by default.
-2. Choose your book and chapter mode, then click **Make script**. Gemini works out who says each quote. The book's words are never changed: the app splits the text at the quotation marks and Gemini only names the speaker of each quote.
+2. Set the chapter mode, then choose your book. The script starts by itself (or click **Make script** to redo it): Gemini works out who says each quote. The book's words are never changed: the app splits the text at the quotation marks and Gemini only names the speaker of each quote.
 3. Each character gets a short summary of who they are in the story and a description of how they sound, written by Gemini from the book. By default every main character gets a new voice designed from that description (see **Design a voice**). Untick **Design a unique voice for each character** to have Gemini pick from your existing voices instead. Change any voice, or pick **Narrator voice**. Designed voices are read by your custom voice model (Qwen3 by default; Chatterbox models need the voice-cloning setup cell).
 4. Characters with fewer lines than **Own voice from** (5 by default) are read by the narrator, so a large book doesn't need a voice for every minor character.
-5. Click **Preview cast** to hear each character read one of their own lines, then run the last cell.
+5. Once the cast is chosen, each character reads one of their own lines below it. Change any voice and click **Preview cast** to hear it again, then click **Confirm and generate**. The finished M4B downloads at the end.
 
 It uses Colab's built-in Gemini through your Google login, so no key is needed. If that is unavailable or hits its limit, paste a free API key from [aistudio.google.com](https://aistudio.google.com/apikey). The script is saved to `MyDrive/AudiobookFree/cast` as a text file (`[Mara] "Are you coming?"`) that you can edit to fix a speaker. Every rendered line is cached there too, so a rerun after a disconnect continues where it stopped. Dialogue without quotation marks (dashes, italic thoughts) stays with the narrator.
 

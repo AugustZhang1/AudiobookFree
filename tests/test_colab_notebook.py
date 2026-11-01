@@ -178,7 +178,7 @@ def test_custom_voice_model_reaches_preview_and_generation() -> None:
     assert "value='index',\n    description='Custom voice model'," in panel
     assert "def ensure_qwen_env(" in panel and "'pypdf==6.15.0', 'pdfplumber==0.11.10'" in panel
     assert "def ensure_index_env(" in panel and "snapshot_download('IndexTeam/IndexTTS-2'" in panel
-    assert "(clone_python(), '--clone') if custom" in generate and "stream([clone_python(), *cast_cmd, 'render'" in generate
+    assert "(clone_python(), '--clone') if custom" in generate and "stream([clone_python(), *cast_cmd, 'render'" in panel
 
 
 def test_character_voices_are_an_opt_in_dropdown_at_the_top() -> None:
@@ -194,6 +194,14 @@ def test_character_voices_are_an_opt_in_dropdown_at_the_top() -> None:
     assert "cast_tools.recommend_voices(" in panel and "own_voice_from = widgets.BoundedIntText(" in panel
     assert "design_button.on_click(design_one)" in panel and "'pdf_audiobook.voice_design', '--batch'" in panel
     assert "design_cast_box = widgets.Checkbox(\n    value=True," in panel and "suggested.update(cast_state.get('designed', {}))" in panel
-    assert "if narration_picker.value == 'cast':" in generate
+    assert "if narration_picker.value == 'cast':" in generate and "generate_cast()" in generate
     for step in ("'render'", "'--engine', 'kokoro'", "'--engine', 'clone'", "'build'"):
-        assert step in generate
+        assert step in panel
+
+
+def test_character_voices_start_on_upload_and_generate_on_confirm() -> None:
+    panel = "".join(_get_panel_cell(_load_notebook()).get("source", []))
+    assert "book_upload.observe(auto_make_script, names='value')" in panel
+    assert "if preview_cast(None):" in panel.split("def make_script(", 1)[1]
+    assert "generate_cast_button.on_click(confirm_and_generate)" in panel
+    assert "    generate_cast_button,\n    generate_output,\n], layout=widgets.Layout(display='none'))" in panel
