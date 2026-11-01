@@ -86,7 +86,7 @@ The notebook can narrate with any voice you have a clip of. By default it uses [
    - **Original**: the largest and slowest model. Use its **Expression** slider instead of tags.
    - **Nano**: the fastest model, with the lowest quality.
 
-Qwen3 needs to know what is said in the clip: the first time a voice is used, Whisper transcribes it and saves `name.transcript.txt` beside the clip. If the transcript is wrong, fix that file; an accurate transcript gives a closer voice. Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
+Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
 
 ### Design a voice
 
