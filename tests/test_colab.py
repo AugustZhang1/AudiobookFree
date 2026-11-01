@@ -780,7 +780,7 @@ def test_notebook_parses_and_generate_cell_does_not_reassign_chapter_count() -> 
     assert "chapter_count = None" not in generate[0]
     assert "chapter_count=None" not in generate[0]
     assert "--chapter-count" in generate[0]
-    derivation = re.search(r"^(\w+) = chapter_count_box\.value if chapter_mode == 'custom' else None$", generate[0], re.MULTILINE)
+    derivation = re.search(r"^\s*(\w+) = chapter_count_box\.value if chapter_mode == 'custom' else None$", generate[0], re.MULTILINE)
     assert derivation is not None
     assert derivation.group(1) != "chapter_count"
     assert f"'--chapter-count', str({derivation.group(1)})" in generate[0]
@@ -1230,16 +1230,16 @@ def test_preview_voices_rejects_empty_voices(sandbox_path: Path) -> None:
         colab.preview_voices([], sandbox_path / "out")
 
 
-@pytest.mark.parametrize("bad_text", ["", "   ", "x" * 501, 123])
+@pytest.mark.parametrize("bad_text", ["", "   ", "x" * 10001, 123])
 def test_preview_text_validation_rejects_before_cuda(sandbox_path: Path, bad_text: Any) -> None:
-    with pytest.raises(colab.ColabError, match="preview text must be 1 to 500 characters"):
+    with pytest.raises(colab.ColabError, match="preview text must be 1 to 10000 characters"):
         colab.preview_voice(
             "af_heart",
             sandbox_path / "p.wav",
             text=bad_text,
             cuda_check=lambda: pytest.fail("CUDA must not be probed"),
         )
-    with pytest.raises(colab.ColabError, match="preview text must be 1 to 500 characters"):
+    with pytest.raises(colab.ColabError, match="preview text must be 1 to 10000 characters"):
         colab.preview_voices(
             ["af_heart"],
             sandbox_path / "out",
@@ -1260,3 +1260,193 @@ def test_preview_voice_forwards_custom_text_and_none_forwards_default(sandbox_pa
 
     colab.preview_voice("af_heart", sandbox_path / "p2.wav", text=None, cuda_check=lambda: None, preview=fake_preview)
     assert captured[-1] == colab.PREVIEW_TEXT
+
+
+def _clip(path: Path, seconds: float = 6.0) -> Path:
+    import wave
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x01\x00" * int(16000 * seconds))
+    return path
+
+
+class _FakeChatterboxModel:
+    sr = 24000
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def generate(self, text: str, *, audio_prompt_path: str) -> bytes:
+        self.calls.append((text, audio_prompt_path))
+        return b"\x10\x00" * 2400
+
+
+def test_chatterbox_factory_loads_model_once_and_clones_the_clip(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "voices" / "hero.wav")
+    model = _FakeChatterboxModel()
+    loads = []
+    factory = colab.make_cuda_chatterbox_factory(torch_loader=lambda: None, model_loader=lambda: loads.append(1) or model)
+
+    first = factory("reference-wav", None, engine="chatterbox", reference_wav=clip)
+    second = factory("reference-wav", None, engine="chatterbox", reference_wav=clip)
+
+    assert loads == [1]
+    assert first.synthesize("Hello there.") == b"\x10\x00" * 2400
+    assert model.calls == [("Hello there.", str(clip))]
+    assert second.metadata.voice_checksum == hashlib.sha256(clip.read_bytes()).hexdigest()
+    with pytest.raises(colab.ColabError, match="custom voice clip"):
+        factory("af_heart", None, engine="kokoro")
+
+
+def test_chatterbox_factory_rejects_a_too_short_clip(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "short.wav", seconds=2.0)
+    factory = colab.make_cuda_chatterbox_factory(torch_loader=lambda: None, model_loader=_FakeChatterboxModel)
+    with pytest.raises(colab.ColabError, match="between 5 and 60 seconds"):
+        factory("reference-wav", None, engine="chatterbox", reference_wav=clip)
+
+
+def test_preview_clones_splits_long_text_and_caches_by_clip_content(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "voices" / "hero.wav")
+    model = _FakeChatterboxModel()
+    factory = colab.make_cuda_chatterbox_factory(torch_loader=lambda: None, model_loader=lambda: model)
+    text = ("A sentence that is reasonably long to fill space. " * 8).strip()
+
+    results = colab.preview_clones([clip, clip], sandbox_path / "previews", text=text, cuda_check=lambda: None, engine_factory=factory)
+
+    assert list(results) == [str(clip.absolute())]
+    assert len(model.calls) == 2 and all(len(call[0]) <= 300 for call in model.calls)
+    assert " ".join(call[0] for call in model.calls) == text
+    from pdf_audiobook.audio import validate_wav
+
+    assert validate_wav(results[str(clip.absolute())]).sample_rate == 24000
+    colab.preview_clones([clip], sandbox_path / "previews", text=text, cuda_check=lambda: pytest.fail("cached preview must skip CUDA"))
+
+
+def test_clone_conversion_runs_real_worker_and_resume_refuses_another_clip(sandbox_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg is required for the M4B finalizer")
+    source = sandbox_path / "book.pdf"
+    source.write_bytes(b"%PDF-clone")
+    clip = _clip(sandbox_path / "voices" / "hero.wav")
+    text = "First sentence. Second sentence."
+
+    def analyzer(path, **_kwargs):
+        return {"source_pdf_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(), "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []}
+
+    model = _FakeChatterboxModel()
+    factory = colab.make_cuda_chatterbox_factory(torch_loader=lambda: None, model_loader=lambda: model)
+    common = dict(workspace_root=sandbox_path / "workspace", output_dir=sandbox_path / "out", chapter_mode="whole", cuda_check=lambda: None, analyzer=analyzer)
+
+    with pytest.raises(colab.ColabError, match="speed 1.0"):
+        colab.run_conversion(source, clone=clip, speed=1.2, engine_factory=factory, **common)
+
+    output = colab.run_conversion(source, clone=clip, engine_factory=factory, **common)
+
+    assert output.is_file() and output.suffix == ".m4b"
+    assert model.calls and all(prompt.endswith("chatterbox-reference.wav") for _text, prompt in model.calls)
+    other = _clip(sandbox_path / "voices" / "villain.wav", seconds=7.0)
+    with pytest.raises(colab.ColabConflictError, match="different custom voice"):
+        colab.run_conversion(source, clone=other, engine_factory=factory, **common)
+
+
+def test_main_previews_clones_and_threads_a_clone_into_conversion(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    clip = sandbox_path / "hero.wav"
+    monkeypatch.setattr(colab, "preview_voices", lambda *a, **k: pytest.fail("no Kokoro voices were requested"))
+    monkeypatch.setattr(colab, "preview_clones", lambda clips, out_dir, *, text, model, exaggeration: {str(c): Path(out_dir) / "p.wav" for c in clips})
+    assert colab.main(["--preview-dir", str(sandbox_path), "--clone", str(clip)]) == 0
+    assert f"Preview WAV {clip}: " in capsys.readouterr().out
+
+    seen = {}
+    monkeypatch.setattr(colab, "run_conversion", lambda pdf, **kwargs: seen.update(kwargs) or Path("book.m4b"))
+    assert colab.main([str(sandbox_path / "book.pdf"), "--clone", str(clip)]) == 0
+    assert seen["clone"] == clip
+    assert colab.main([str(sandbox_path / "book.pdf"), "--clone", str(clip), "--voice", "af_heart"]) == 2
+
+
+def test_clone_models_load_the_right_chatterbox_class(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    loaded: list[tuple[str, dict]] = []
+
+    class Turbo:
+        @staticmethod
+        def from_pretrained(**kwargs):
+            loaded.append(("turbo", kwargs))
+            return _FakeChatterboxModel()
+
+    class Original:
+        sr = 24000
+
+        def __init__(self):
+            self.calls = []
+
+        @staticmethod
+        def from_pretrained(**kwargs):
+            loaded.append(("original", kwargs))
+            return original
+
+        def generate(self, text, **kwargs):
+            self.calls.append(kwargs)
+            return b"\x10\x00" * 2400
+
+    original = Original()
+    modules = {"chatterbox.tts_turbo": SimpleNamespace(ChatterboxTurboTTS=Turbo), "chatterbox.tts": SimpleNamespace(ChatterboxTTS=Original)}
+    monkeypatch.setattr(colab, "_import", modules.__getitem__)
+
+    for model in ("turbo", "nano"):
+        colab.make_cuda_chatterbox_factory(model=model, torch_loader=lambda: None)("reference-wav", None, engine="chatterbox", reference_wav=clip)
+    voice = colab.make_cuda_chatterbox_factory(model="original", exaggeration=1.2, torch_loader=lambda: None)("reference-wav", None, engine="chatterbox", reference_wav=clip)
+    voice.synthesize("Hello there.")
+
+    assert loaded == [("turbo", {"device": "cuda", "nano": False}), ("turbo", {"device": "cuda", "nano": True}), ("original", {"device": "cuda"})]
+    assert original.calls == [{"audio_prompt_path": str(clip), "exaggeration": 1.2}]
+    with pytest.raises(colab.ColabError, match="custom voice model"):
+        colab.make_cuda_chatterbox_factory(model="huge")
+    with pytest.raises(colab.ColabError, match="expression"):
+        colab.make_cuda_chatterbox_factory(model="original", exaggeration=3.0)
+
+
+def test_preview_clones_caches_each_model_separately(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    model = _FakeChatterboxModel()
+    factory = colab.make_cuda_chatterbox_factory(torch_loader=lambda: None, model_loader=lambda: model)
+    paths = {
+        (name, exaggeration): colab.preview_clones([clip], sandbox_path / "p", text="Hi there friend.", model=name, exaggeration=exaggeration, cuda_check=lambda: None, engine_factory=factory)[str(clip.absolute())]
+        for name, exaggeration in (("turbo", 0.5), ("nano", 0.5), ("original", 0.5), ("original", 1.5))
+    }
+    assert len(set(paths.values())) == 4
+
+
+def test_preview_text_allows_ten_thousand_characters() -> None:
+    assert len(colab._preview_text("a" * 10000)) == 10000
+
+
+def test_clone_resume_with_a_different_model_is_refused(sandbox_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg is required for the M4B finalizer")
+    source = sandbox_path / "book.pdf"
+    source.write_bytes(b"%PDF-model")
+    clip = _clip(sandbox_path / "hero.wav")
+    text = "First sentence. Second sentence."
+
+    def analyzer(path, **_kwargs):
+        return {"source_pdf_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(), "title": "Book", "cleaned_text": text, "cleaned_map": [{"source_page": 1, "cleaned_start": 0, "cleaned_end": len(text)}], "warnings": []}
+
+    class StopWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, *, full_pipeline):
+            return WorkerResult("cancelled", 0, 1, 0)
+
+    common = dict(workspace_root=sandbox_path / "workspace", output_dir=sandbox_path / "out", chapter_mode="whole", cuda_check=lambda: None, analyzer=analyzer, worker_class=StopWorker, engine_factory=lambda *a, **k: None)
+    with pytest.raises(colab.ColabError, match="did not complete"):
+        colab.run_conversion(source, clone=clip, clone_model="original", exaggeration=1.0, **common)
+    workspace = colab.Workspace(sandbox_path / "workspace")
+    job = workspace.read_job(workspace.inspect_startup().conversion_id)
+    assert job["tts"]["settings"]["clone_model"] == "original" and job["tts"]["settings"]["exaggeration"] == 1.0
+    with pytest.raises(colab.ColabConflictError, match="different voice, speed, or chunk settings"):
+        colab.run_conversion(source, clone=clip, clone_model="turbo", **common)

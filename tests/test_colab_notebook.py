@@ -151,3 +151,25 @@ def test_every_code_cell_compiles() -> None:
         filtered_lines = [line for line in lines if not line.strip().startswith("!")]
         code_text = "".join(filtered_lines)
         compile(code_text, f"<cell_{i}>", "exec")
+
+
+def test_run_all_never_blocks_on_a_file_upload() -> None:
+    # "Run all" must finish so the panel's preview buttons respond; uploads live in panel widgets.
+    for i, cell in enumerate(_load_notebook().get("cells", [])):
+        assert "files.upload(" not in "".join(cell.get("source", [])), f"Cell {i} blocks Run all on an upload"
+
+
+def test_panel_adds_voices_and_takes_the_book() -> None:
+    source = "".join(_get_panel_cell(_load_notebook()).get("source", []))
+    assert "widgets.FileUpload(accept='audio/*,video/*'" in source
+    assert "add_voice_button.on_click(add_voices)" in source
+    assert "book_upload = widgets.FileUpload(" in source
+    assert "'--clone'" in source
+
+
+def test_custom_voice_model_reaches_preview_and_generation() -> None:
+    data = _load_notebook()
+    panel = "".join(_get_panel_cell(data).get("source", []))
+    generate = "".join(_get_generate_cell(data).get("source", []))
+    assert "clone_model_picker = widgets.Dropdown(" in panel and "cmd.extend(clone_args())" in panel
+    assert "cmd += clone_args()" in generate

@@ -1,4 +1,4 @@
-"""Headless Google Colab runner for the optional Kokoro GPU workflow.
+"""Headless Google Colab runner for the optional Kokoro / Chatterbox GPU workflow.
 
 This module is deliberately separate from the desktop launcher.  Colab calls
 the same workspace, chapter planning, resumable worker, and M4B finalizer as
@@ -15,13 +15,28 @@ import importlib
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterator
 
+from .audio import write_pcm_wav
 from .chapters import create_chapter_plan
+from .chatterbox_reference import validate_reference_file
 from .pdf import analyze_pdf
 from .preview_worker import PREVIEW_TEXT, generate_preview
 from .security import pid_is_alive
-from .tts import EngineMetadata, KokoroVoice, SynthesisSettings, plan_chunks
+from .tts import (
+    CHATTERBOX_CHUNK_CAP,
+    CHATTERBOX_NANO_MODEL,
+    CHATTERBOX_PACKAGE_VERSION,
+    CHATTERBOX_REFERENCE_VOICE,
+    CHATTERBOX_SAMPLE_RATE,
+    CHATTERBOX_SOURCE_COMMIT,
+    ChatterboxVoice,
+    EngineMetadata,
+    KokoroVoice,
+    SynthesisSettings,
+    plan_chunks,
+)
 from .voice_registry import APPROVED_VOICE_IDS
 from .worker import ConversionWorker, WorkerResult
 from .workspace import ManifestError, Workspace, WorkspaceError
@@ -82,6 +97,94 @@ def make_cuda_kokoro_factory(*, torch_loader: Callable[[], Any] | None = None, k
     return factory
 
 
+# Custom-voice (Chatterbox) models, best default first. "original" is the
+# largest and the only one with an exaggeration (expression) control; the Turbo
+# family uses inline tags such as [laugh] instead.
+CLONE_MODELS = ("turbo", "original", "nano")
+DEFAULT_CLONE_MODEL = "turbo"
+DEFAULT_EXAGGERATION = 0.5
+
+
+class _ExpressiveModel:
+    """Give the original Chatterbox model ChatterboxVoice's call shape, with a fixed exaggeration."""
+
+    def __init__(self, model: Any, exaggeration: float) -> None:
+        self._model = model
+        self._exaggeration = exaggeration
+        self.sr = getattr(model, "sr", CHATTERBOX_SAMPLE_RATE)
+
+    def generate(self, text: str, *, audio_prompt_path: str) -> Any:
+        return self._model.generate(text, audio_prompt_path=audio_prompt_path, exaggeration=self._exaggeration)
+
+
+def _load_clone_model(model: str, exaggeration: float) -> Any:
+    if model == "original":
+        return _ExpressiveModel(_import("chatterbox.tts").ChatterboxTTS.from_pretrained(device="cuda"), exaggeration)
+    return _import("chatterbox.tts_turbo").ChatterboxTurboTTS.from_pretrained(device="cuda", nano=model == "nano")
+
+
+def _clone_options(model: Any, exaggeration: Any) -> tuple[str, float]:
+    """Validate the custom-voice model and expression before anything is touched."""
+
+    if model not in CLONE_MODELS:
+        raise ColabError(f"custom voice model must be one of: {', '.join(CLONE_MODELS)}")
+    if isinstance(exaggeration, bool):
+        raise ColabError("expression must be between 0.25 and 2.0")
+    try:
+        value = float(exaggeration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ColabError("expression must be between 0.25 and 2.0") from exc
+    if not math.isfinite(value) or not 0.25 <= value <= 2.0:
+        raise ColabError("expression must be between 0.25 and 2.0")
+    return model, value
+
+
+def make_cuda_chatterbox_factory(
+    *,
+    model: str = DEFAULT_CLONE_MODEL,
+    exaggeration: float = DEFAULT_EXAGGERATION,
+    torch_loader: Callable[[], Any] | None = None,
+    model_loader: Callable[[], Any] | None = None,
+) -> Callable[..., Any]:
+    """Return a worker-compatible Chatterbox factory that clones a reference WAV on CUDA.
+
+    The model is loaded once and shared, so previewing several library voices
+    does not reload it.
+    """
+
+    model, exaggeration = _clone_options(model, exaggeration)
+    load_torch = torch_loader or _cuda_module
+    load_model = model_loader or (lambda: _load_clone_model(model, exaggeration))
+    cache: dict[str, Any] = {}
+
+    def factory(voice: str, settings: SynthesisSettings | None = None, *, engine: str = "chatterbox", reference_wav: Any = None) -> ChatterboxVoice:
+        if engine != "chatterbox" or voice != CHATTERBOX_REFERENCE_VOICE or reference_wav is None:
+            raise ColabError("the Colab Chatterbox runner needs a custom voice clip")
+        load_torch()
+        clip = Path(reference_wav)
+        digest = _clip_digest(clip)
+        if "model" not in cache:
+            try:
+                cache["model"] = load_model()
+            except Exception as exc:
+                raise ColabError("Chatterbox could not be loaded in the Colab GPU runtime; run the voice-cloning setup cell") from exc
+        settings = settings or SynthesisSettings(sample_rate=CHATTERBOX_SAMPLE_RATE, chunk_cap=CHATTERBOX_CHUNK_CAP)
+        return ChatterboxVoice(cache["model"], settings, CHATTERBOX_REFERENCE_VOICE, clip, digest)
+
+    return factory
+
+
+def _clip_digest(clip: Any) -> str:
+    """Validate a custom voice clip and return its SHA-256."""
+
+    try:
+        _wav, digest = validate_reference_file(Path(clip).expanduser())
+    except (TypeError, ValueError) as exc:
+        name = Path(clip).name if isinstance(clip, (str, os.PathLike)) else "clip"
+        raise ColabError(f"voice clip {name} must be a mono 16-bit WAV between 5 and 60 seconds long") from exc
+    return digest
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -122,14 +225,17 @@ def _validate_voice_speed(voice: str, speed: float) -> None:
         raise ColabError("speed must be between 0.5 and 2.0")
 
 
+MAX_PREVIEW_CHARS = 10000
+
+
 def _preview_text(text: Any) -> str:
     if text is None:
         return PREVIEW_TEXT
     if not isinstance(text, str):
-        raise ColabError("preview text must be 1 to 500 characters")
+        raise ColabError(f"preview text must be 1 to {MAX_PREVIEW_CHARS} characters")
     cleaned = text.strip()
-    if not (1 <= len(cleaned) <= 500):
-        raise ColabError("preview text must be 1 to 500 characters")
+    if not (1 <= len(cleaned) <= MAX_PREVIEW_CHARS):
+        raise ColabError(f"preview text must be 1 to {MAX_PREVIEW_CHARS} characters")
     return cleaned
 
 
@@ -144,6 +250,40 @@ def _expected_tts(cleaned_text: str, plan: dict[str, Any], voice: str, speed: fl
     )
     chunks = plan_chunks(cleaned_text, plan["chapters"], metadata, cap=settings.chunk_cap)
     return {**metadata.as_dict(), "speed": speed, "chunk_cap": settings.chunk_cap}, len(chunks)
+
+
+def _expected_chatterbox_tts(cleaned_text: str, plan: dict[str, Any], descriptor: dict[str, Any], model: str = DEFAULT_CLONE_MODEL, exaggeration: float = DEFAULT_EXAGGERATION) -> tuple[dict[str, Any], int]:
+    """Mirror the desktop app's Chatterbox reference-voice generation identity.
+
+    The model fields keep the desktop's validated Nano identity; the model that
+    actually narrates (and its expression) is recorded in the settings, so a
+    resume with a different model is refused like any other settings change.
+    """
+
+    settings = SynthesisSettings(speed=1.0, sample_rate=CHATTERBOX_SAMPLE_RATE, chunk_cap=CHATTERBOX_CHUNK_CAP, chunk_mode="legacy")
+    settings_dict = {**settings.as_dict(), "reference_descriptor_sha256": descriptor["descriptor_sha256"], "clone_model": model}
+    if model == "original":
+        settings_dict["exaggeration"] = exaggeration
+    metadata = EngineMetadata(
+        "chatterbox", CHATTERBOX_PACKAGE_VERSION, CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, "unrecorded",
+        CHATTERBOX_REFERENCE_VOICE, CHATTERBOX_SOURCE_COMMIT, descriptor["voice_checksum"], CHATTERBOX_SAMPLE_RATE, settings_dict,
+    )
+    chunks = plan_chunks(cleaned_text, plan["chapters"], metadata, cap=CHATTERBOX_CHUNK_CAP)
+    return {**metadata.as_dict(), "speed": 1.0, "chunk_cap": CHATTERBOX_CHUNK_CAP}, len(chunks)
+
+
+def _ensure_reference(workspace: Workspace, conversion_id: str, clip: Path, digest: str) -> dict[str, Any]:
+    """Copy the library clip into the conversion once; refuse a different clip on resume."""
+
+    if workspace.chatterbox_reference_descriptor_path(conversion_id).exists():
+        reference = workspace.load_chatterbox_reference(conversion_id)
+        if reference.descriptor["reference_sha256"] != digest:
+            raise ColabConflictError("active conversion uses a different custom voice; no files were changed. Pass start_new (--start-new) to discard it")
+        return reference.descriptor
+    if workspace.read_job(conversion_id).get("schema_version") == 4:
+        raise ColabConflictError("active conversion has different voice, speed, or chunk settings; no files were changed. Pass start_new (--start-new) to discard it")
+    workspace.store_chatterbox_reference(conversion_id, clip, consent_confirmed=True, consent_evidence="colab-voice-library")
+    return workspace.load_chatterbox_reference(conversion_id).descriptor
 
 
 def _ensure_chapter_plan(workspace: Workspace, conversion_id: str, mode: str, count: int | None) -> dict[str, Any]:
@@ -312,6 +452,9 @@ def run_conversion(
     output_dir: str | os.PathLike[str],
     voice: str = "af_heart",
     speed: float = 1.0,
+    clone: str | os.PathLike[str] | None = None,
+    clone_model: str = DEFAULT_CLONE_MODEL,
+    exaggeration: float = DEFAULT_EXAGGERATION,
     chapter_mode: str = "original",
     chapter_count: int | None = None,
     start_new: bool = False,
@@ -320,7 +463,12 @@ def run_conversion(
     worker_class: Callable[..., Any] = ConversionWorker,
     engine_factory: Callable[..., Any] | None = None,
 ) -> Path:
-    """Analyze, synthesize, and publish one PDF, resuming only a match."""
+    """Analyze, synthesize, and publish one PDF, resuming only a match.
+
+    ``clone`` narrates with a custom voice clip through the Chatterbox
+    ``clone_model`` instead of the Kokoro ``voice``; Chatterbox only supports
+    speed 1.0.
+    """
 
     if type(start_new) is not bool:
         raise ColabError("start_new must be a boolean")
@@ -333,7 +481,16 @@ def run_conversion(
     # speed is coerced exactly once here, so validation binds the same value the
     # rest of the run uses even for an object with a stateful __float__.
     requested_speed = _normalized_speed(speed)
-    _validate_voice_speed(voice, requested_speed)
+    clip: Path | None = None
+    clip_digest = ""
+    if clone is None:
+        _validate_voice_speed(voice, requested_speed)
+    else:
+        clone_model, exaggeration = _clone_options(clone_model, exaggeration)
+        clip = Path(clone).expanduser().absolute()
+        clip_digest = _clip_digest(clip)
+        if requested_speed != 1.0:
+            raise ColabError("custom voices only support speed 1.0")
     cuda_check()
     workspace = Workspace(Path(workspace_root).expanduser())
     output = Path(output_dir).expanduser().absolute()
@@ -373,7 +530,11 @@ def run_conversion(
 
     plan = _ensure_chapter_plan(workspace, conversion_id, mode, count)
     cleaned_text, _ = workspace.load_cleaned_artifacts(conversion_id)
-    tts, total_chunks = _expected_tts(cleaned_text, plan, voice, requested_speed)
+    if clip is None:
+        tts, total_chunks = _expected_tts(cleaned_text, plan, voice, requested_speed)
+    else:
+        descriptor = _ensure_reference(workspace, conversion_id, clip, clip_digest)
+        tts, total_chunks = _expected_chatterbox_tts(cleaned_text, plan, descriptor, clone_model, exaggeration)
     job = workspace.read_job(conversion_id)
     if job.get("schema_version") == 4 and (job.get("tts") != tts or job.get("total_chunks") != total_chunks):
         raise ColabConflictError("active conversion has different voice, speed, or chunk settings; no files were changed. Pass start_new (--start-new) to discard it")
@@ -384,7 +545,7 @@ def run_conversion(
         return Path(job["output"]["path"])
     workspace.configure_generation(conversion_id, tts=tts, total_chunks=total_chunks)
 
-    factory = engine_factory or make_cuda_kokoro_factory()
+    factory = engine_factory or (make_cuda_kokoro_factory() if clip is None else make_cuda_chatterbox_factory(model=clone_model, exaggeration=exaggeration))
     display = ColabProgressDisplay(plan)
     progress_workspace = _ProgressWorkspaceProxy(workspace, display)
     worker = worker_class(progress_workspace, conversion_id, engine_factory=factory)
@@ -478,6 +639,63 @@ def preview_voices(
     return results
 
 
+def _split_for_chatterbox(text: str) -> list[str]:
+    """Pack whole sentences into pieces no longer than the Chatterbox chunk cap."""
+
+    pieces: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if pieces and len(pieces[-1]) + 1 + len(sentence) <= CHATTERBOX_CHUNK_CAP:
+            pieces[-1] += " " + sentence
+        elif sentence:
+            pieces.append(sentence)
+    return pieces
+
+
+def preview_clones(
+    clips: list[str | os.PathLike[str]],
+    out_dir: str | os.PathLike[str],
+    *,
+    text: str | None = None,
+    model: str = DEFAULT_CLONE_MODEL,
+    exaggeration: float = DEFAULT_EXAGGERATION,
+    cuda_check: Callable[[], Any] = _cuda_module,
+    engine_factory: Callable[..., Any] | None = None,
+) -> dict[str, Path]:
+    """Render preview WAVs for custom voice clips, cached by clip, model and text."""
+
+    model, exaggeration = _clone_options(model, exaggeration)
+    clip_list = list(dict.fromkeys(Path(clip).expanduser().absolute() for clip in clips))
+    if not clip_list:
+        raise ColabError("choose at least one voice to preview")
+    sample_text = _preview_text(text)
+    text_digest = hashlib.sha256(sample_text.encode("utf-8")).hexdigest()[:12]
+    directory = Path(out_dir).expanduser().absolute()
+
+    results: dict[str, Path] = {}
+    missing: list[tuple[Path, Path]] = []
+    for clip in clip_list:
+        style = f"{model}-{exaggeration:g}" if model == "original" else model
+        target = directory / f"clone-{style}-{_clip_digest(clip)[:16]}-{text_digest}.wav"
+        results[str(clip)] = target
+        if not target.is_file():
+            missing.append((clip, target))
+
+    if missing:
+        cuda_check()
+        directory.mkdir(parents=True, exist_ok=True)
+        factory = engine_factory or make_cuda_chatterbox_factory(model=model, exaggeration=exaggeration, torch_loader=lambda: None)
+        for clip, target in missing:
+            try:
+                loaded = factory(CHATTERBOX_REFERENCE_VOICE, None, engine="chatterbox", reference_wav=clip)
+                pcm = b"".join(loaded.synthesize(piece) for piece in _split_for_chatterbox(sample_text))
+                write_pcm_wav(target, pcm, CHATTERBOX_SAMPLE_RATE, overwrite=True)
+            except ColabError:
+                raise
+            except Exception as exc:
+                raise ColabError(f"voice preview failed for {clip.stem}") from exc
+    return results
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one Single Voice Kokoro audiobook conversion on a CUDA runtime")
     parser.add_argument("pdf", type=Path, nargs="?")
@@ -489,6 +707,14 @@ def _parser() -> argparse.ArgumentParser:
         choices=APPROVED_VOICE_IDS,
         help="Kokoro voice; repeat with --preview-dir to preview several voices",
     )
+    parser.add_argument(
+        "--clone",
+        action="append",
+        type=Path,
+        help="Custom voice clip (mono 16-bit WAV, 5-60 s) narrated with Chatterbox instead of a Kokoro voice; repeat with --preview-dir",
+    )
+    parser.add_argument("--clone-model", choices=CLONE_MODELS, default=DEFAULT_CLONE_MODEL, help="Chatterbox model for --clone voices")
+    parser.add_argument("--exaggeration", type=float, default=DEFAULT_EXAGGERATION, help="Expression for the original model, 0.25-2.0")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--chapter-mode", choices=("original", "whole", "custom"), default="original")
     parser.add_argument("--chapter-count", type=int)
@@ -509,25 +735,30 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preview-text",
         type=str,
-        help="Custom preview text (1-500 characters); defaults to the built-in sample sentence",
+        help="Custom preview text (1-10000 characters); defaults to the built-in sample sentence",
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    voices = args.voice or ["af_heart"]
+    clones = args.clone or []
+    voices = args.voice or ([] if clones else ["af_heart"])
     if args.preview_dir is not None:
         try:
-            previews = preview_voices(voices, args.preview_dir, speed=args.speed, text=args.preview_text)
+            previews: dict[str, Path] = {}
+            if voices:
+                previews.update(preview_voices(voices, args.preview_dir, speed=args.speed, text=args.preview_text))
+            if clones:
+                previews.update(preview_clones(clones, args.preview_dir, text=args.preview_text, model=args.clone_model, exaggeration=args.exaggeration))
         except (ColabError, OSError, ValueError) as exc:
             print(f"Colab voice preview failed: {exc}")
             return 2
         for voice, path in previews.items():
             print(f"Preview WAV {voice}: {path}")
         return 0
-    if len(voices) > 1:
-        print("Colab conversion failed: a conversion uses exactly one --voice")
+    if len(voices) + len(clones) > 1:
+        print("Colab conversion failed: a conversion uses exactly one --voice or --clone")
         return 2
     if args.pdf is None:
         print("Colab conversion failed: a PDF path is required unless --preview-dir is used")
@@ -537,8 +768,11 @@ def main(argv: list[str] | None = None) -> int:
             args.pdf,
             workspace_root=args.workspace_root,
             output_dir=args.output_dir,
-            voice=voices[0],
+            voice=voices[0] if voices else "af_heart",
             speed=args.speed,
+            clone=clones[0] if clones else None,
+            clone_model=args.clone_model,
+            exaggeration=args.exaggeration,
             chapter_mode=args.chapter_mode,
             chapter_count=args.chapter_count,
             start_new=args.start_new,
@@ -554,4 +788,4 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "make_cuda_kokoro_factory", "preview_voice", "preview_voices", "run_conversion"]
+__all__ = ["ColabConflictError", "ColabError", "ColabProgressDisplay", "main", "CLONE_MODELS", "make_cuda_chatterbox_factory", "make_cuda_kokoro_factory", "preview_clones", "preview_voice", "preview_voices", "run_conversion"]

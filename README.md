@@ -2,7 +2,7 @@
 
 Turn a PDF into an M4B audiobook with chapters, for free, on your own computer. Everything runs locally in your browser at `http://127.0.0.1` — no accounts, no API keys, no uploads.
 
-- **Narration:** [Kokoro](https://github.com/hexgrad/kokoro) (28 English voices, CPU-friendly). Optional: Chatterbox Nano, Interactive Voices (BookNLP) for per-character voices.
+- **Narration:** [Kokoro](https://github.com/hexgrad/kokoro) (28 English voices, CPU-friendly). Optional: Chatterbox Nano, voice cloning from your own clips (in Colab), Interactive Voices (BookNLP) for per-character voices.
 - **Output:** M4B with embedded chapters, verified after encoding.
 - **No GPU needed.** A GPU only makes it faster.
 
@@ -64,13 +64,27 @@ If you use a terminal-based assistant like Claude Code or Codex, open it inside 
 
 ## Run it in Google Colab instead (no install)
 
-If your computer is slow or you can't install anything, run the Kokoro pipeline on a free Colab GPU:
+If your computer is slow or you can't install anything, run it on a free Colab GPU:
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AugustZhang1/AudiobookFree/blob/main/colab/PDF_Audiobook_Colab.ipynb)
 
 1. Open the link above and choose **Runtime → Change runtime type → T4 GPU**.
-2. Run the cells top to bottom. Pick a voice in the **Choose a voice** panel — preview or compare voices on your own sample text before converting.
-3. Upload your PDF when prompted and download the finished M4B at the end.
+2. Click **Runtime → Run all**. Nothing asks for a file, so the cells run straight through to the panel.
+3. In the panel, pick a voice and click **Preview voice** to hear it on your own sample text (up to 10,000 characters). To compare, pick more voices under **Compare with** and click **Compare voices**.
+4. Click **Choose book** in the panel and pick a PDF or EPUB, then run the last cell. The finished M4B downloads at the end.
+
+### Your own voices (voice cloning)
+
+The notebook can narrate with any voice you have a clip of, using [Chatterbox](https://github.com/resemble-ai/chatterbox):
+
+1. Under **Add a voice**, click **Choose clips**, pick an audio or video file (up to 20 MB) of one person talking, with no music, and click **Add to library**. The first 30 seconds are used, and the clip must have more than 5 seconds of audio. The file name becomes the voice name.
+2. The voice is saved to Google Drive in `MyDrive/AudiobookFree/voices` and shows up in the voice list as **★ name · your voice** in every future session.
+3. Pick a **Custom voice model**:
+   - **Turbo** (default): good quality, and it understands tags in the text such as `[laugh]` and `[sigh]`.
+   - **Original**: the largest and slowest model. Use its **Expression** slider instead of tags.
+   - **Nano**: the fastest model, with the lowest quality.
+
+Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
 
 Free Colab sessions can disconnect; the notebook checkpoints every few pages and resumes where it left off if you rerun it with the same settings. There is no page limit on the PDF (the file-size limit is 100 MiB).
 
