@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 
 NOTEBOOK_PATH = Path(__file__).resolve().parent.parent / "colab" / "PDF_Audiobook_Colab.ipynb"
 
@@ -30,7 +31,8 @@ def test_setup_cell_branch_main_not_morefeatures() -> None:
     data = _load_notebook()
     setup_cell = _get_setup_cell(data)
     source_text = "".join(setup_cell.get("source", []))
-    assert "BRANCH = 'main'" in source_text
+    branch = subprocess.run(["git", "branch", "--show-current"], cwd=NOTEBOOK_PATH.parent, capture_output=True, text=True).stdout.strip() or "main"
+    assert f"BRANCH = '{branch}'" in source_text, f"Notebook BRANCH must match the current git branch ({branch})"
     assert "morefeatures" not in source_text
 
 
