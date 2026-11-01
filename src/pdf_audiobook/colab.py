@@ -786,7 +786,7 @@ def preview_clones(
     results: dict[str, Path] = {}
     missing: list[tuple[Path, Path]] = []
     for clip in clip_list:
-        style = f"{model}-{exaggeration:g}" if model == "original" else model
+        style = f"{model}-{exaggeration:g}" if model == "original" else ("qwen-padded" if model == "qwen" else model)
         target = directory / f"clone-{style}-{_clip_digest(clip)[:16]}-{text_digest}.wav"
         results[str(clip)] = target
         if not target.is_file():

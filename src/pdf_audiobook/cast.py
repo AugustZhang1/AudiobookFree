@@ -515,6 +515,7 @@ def _line_keys(settings: dict[str, Any]) -> Callable[[str, str], str]:
             if voice not in clip_shas:
                 clip_shas[voice] = _file_sha(voice)
             model = settings.get("clone_model", "original")
+            model = "qwen-padded" if model == "qwen" else model  # cache name changes when the Qwen3 prompt does
             style = f"clone:{model}:{settings.get('exaggeration', 0.5) if model == 'original' else ''}:{clip_shas[voice]}"
         else:
             style = f"kokoro:{voice}:{float(settings.get('speed', 1.0)):g}"
