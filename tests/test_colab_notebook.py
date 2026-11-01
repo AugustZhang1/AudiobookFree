@@ -173,3 +173,21 @@ def test_custom_voice_model_reaches_preview_and_generation() -> None:
     generate = "".join(_get_generate_cell(data).get("source", []))
     assert "clone_model_picker = widgets.Dropdown(" in panel and "cmd.extend(clone_args())" in panel
     assert "cmd += clone_args()" in generate
+
+
+def test_character_voices_are_an_opt_in_dropdown_at_the_top() -> None:
+    data = _load_notebook()
+    panel = "".join(_get_panel_cell(data).get("source", []))
+    generate = "".join(_get_generate_cell(data).get("source", []))
+    assert "narration_picker = widgets.Dropdown(" in panel
+    assert "value='single'," in panel.split("narration_picker = widgets.Dropdown(", 1)[1].split("\n)", 1)[0]
+    assert "panel = widgets.VBox([\n    narration_picker," in panel
+    assert "cast_section = widgets.VBox(" in panel and "layout=widgets.Layout(display='none')" in panel.split("cast_section = widgets.VBox(", 1)[1]
+    assert "make_script_button.on_click(make_script)" in panel
+    assert "preview_cast_button.on_click(preview_cast)" in panel and "'--script', 'preview.txt'" in panel
+    assert "cast_tools.recommend_voices(" in panel and "own_voice_from = widgets.BoundedIntText(" in panel
+    assert "design_button.on_click(design_one)" in panel and "'pdf_audiobook.voice_design', '--batch'" in panel
+    assert "design_cast_box = widgets.Checkbox(\n    value=True," in panel and "suggested.update(cast_state.get('designed', {}))" in panel
+    assert "if narration_picker.value == 'cast':" in generate
+    for step in ("'render'", "'--engine', 'kokoro'", "'--engine', 'clone'", "'build'"):
+        assert step in generate

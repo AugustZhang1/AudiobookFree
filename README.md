@@ -36,7 +36,9 @@ Turn a PDF into an M4B audiobook with chapters, for free, on your own computer. 
 | `-WithChatterbox` | Add the Chatterbox Nano engine (large download) |
 | `-WithBookNLP` | Add Interactive Voices (per-character voice assignment) |
 
-Re-run the setup script with any flag later to add it.
+Re-run the setup script with any flag later to add it. Optional Chatterbox Nano is used only for single-voice narration; Interactive Voices remains Kokoro-only.
+
+While a book is generating you can click **Cancel** to stop it. When it finishes, click **Convert Another PDF** to start over.
 
 ## Quick start (macOS / Linux)
 
@@ -85,6 +87,22 @@ The notebook can narrate with any voice you have a clip of, using [Chatterbox](h
    - **Nano**: the fastest model, with the lowest quality.
 
 Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
+
+### Design a voice
+
+Under **Design a voice**, describe any voice ("a gruff old man with a deep, gravelly voice") or pick a preset such as *Gruff old man*, *Charming woman* or *Menacing villain*, then click **Design voice**. [Qwen3-TTS VoiceDesign](https://github.com/QwenLM/Qwen3-TTS) invents the voice and speaks a short sample, which is saved to your library. Chatterbox then clones that fixed sample to narrate, so the voice stays the same for the whole book. Each design comes out a little different, so design again if you want another take. The designer installs and downloads its model (about 4 GB) the first time you use it in a session.
+
+### Character voices (Gemini)
+
+Give each character in the book their own voice, with the narrator reading everything else:
+
+1. Set **Narration** at the top of the panel to **Character voices (Gemini)**. It is off (**One voice**) by default.
+2. Choose your book and chapter mode, then click **Make script**. Gemini works out who says each quote. The book's words are never changed: the app splits the text at the quotation marks and Gemini only names the speaker of each quote.
+3. Each character gets a short summary of who they are in the story and a description of how they sound, written by Gemini from the book. By default every main character gets a new voice designed from that description (see **Design a voice**). Untick **Design a unique voice for each character** to have Gemini pick from your existing voices instead. Change any voice, or pick **Narrator voice**. Designed voices are read by Chatterbox, so run the voice-cloning setup cell.
+4. Characters with fewer lines than **Own voice from** (5 by default) are read by the narrator, so a large book doesn't need a voice for every minor character.
+5. Click **Preview cast** to hear each character read one of their own lines, then run the last cell.
+
+It uses Colab's built-in Gemini through your Google login, so no key is needed. If that is unavailable or hits its limit, paste a free API key from [aistudio.google.com](https://aistudio.google.com/apikey). The script is saved to `MyDrive/AudiobookFree/cast` as a text file (`[Mara] "Are you coming?"`) that you can edit to fix a speaker. Every rendered line is cached there too, so a rerun after a disconnect continues where it stopped. Dialogue without quotation marks (dashes, italic thoughts) stays with the narrator.
 
 Free Colab sessions can disconnect; the notebook checkpoints every few pages and resumes where it left off if you rerun it with the same settings. There is no page limit on the PDF (the file-size limit is 100 MiB).
 

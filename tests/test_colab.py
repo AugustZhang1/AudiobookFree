@@ -773,7 +773,7 @@ def test_notebook_parses_and_generate_cell_does_not_reassign_chapter_count() -> 
     generate = [
         "".join(cell["source"])
         for cell in document["cells"]
-        if cell.get("cell_type") == "code" and "pdf_audiobook.colab" in "".join(cell["source"]) and "--chapter-mode" in "".join(cell["source"])
+        if cell.get("cell_type") == "code" and "# One long, resumable headless run" in "".join(cell["source"])
     ]
 
     assert len(generate) == 1
