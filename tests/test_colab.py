@@ -1452,29 +1452,57 @@ def test_clone_resume_with_a_different_model_is_refused(sandbox_path: Path) -> N
         colab.run_conversion(source, clone=clip, clone_model="turbo", **common)
 
 
-def test_qwen_clone_model_uses_the_speaker_embedding_only(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_clone_model_transcribes_once_and_passes_the_transcript(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     clip = _clip(sandbox_path / "hero.wav")
+    heard: list[Path] = []
 
     class Base:
         def __init__(self):
-            self.prompts = []
             self.calls = []
-
-        def create_voice_clone_prompt(self, **kwargs):
-            self.prompts.append(kwargs)
-            return "prompt"
 
         def generate_voice_clone(self, **kwargs):
             self.calls.append(kwargs)
             return [[0.1] * 4800], 24000
 
     base = Base()
-    monkeypatch.setattr(colab, "_load_qwen_clone_model", lambda: colab._QwenCloneModel(base))
+    model = colab._QwenCloneModel(base, transcriber=lambda path: heard.append(path) or "  Hello   there ")
+    monkeypatch.setattr(colab, "_load_qwen_clone_model", lambda: model)
     voice = colab.make_cuda_chatterbox_factory(model="qwen", torch_loader=lambda: None)("reference-wav", None, engine="chatterbox", reference_wav=clip)
     voice.synthesize("First line.")
     voice.synthesize("Second line.")
 
-    assert base.prompts == [{"ref_audio": str(clip), "x_vector_only_mode": True}]
-    assert [call["voice_clone_prompt"] for call in base.calls] == ["prompt", "prompt"]
-    assert base.calls[0]["text"] == "First line."
-    assert colab.DEFAULT_CLONE_MODEL == "qwen"
+    assert heard == [clip]
+    assert colab.transcript_path(clip).read_text(encoding="utf-8") == "Hello there\n"
+    assert [call["ref_text"] for call in base.calls] == ["Hello there.", "Hello there."]
+    assert base.calls[0]["text"] == "First line." and base.calls[0]["ref_audio"] == base.calls[1]["ref_audio"] != str(clip)
+    import wave
+    with wave.open(str(clip), "rb") as original, wave.open(base.calls[0]["ref_audio"], "rb") as padded:
+        assert padded.getnframes() == original.getnframes() + 2 * (original.getframerate() // 2)
+
+
+def test_reference_transcript_prefers_an_edited_transcript(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    colab.transcript_path(clip).write_text("Fixed by hand.\n", encoding="utf-8")
+    assert colab.reference_transcript(clip, transcriber=lambda path: pytest.fail("should not transcribe")) == "Fixed by hand."
+
+
+def test_index_clone_model_reads_emotion_from_each_line(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    calls: list[dict] = []
+
+    class IndexTTS2:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def infer(self, **kwargs):
+            calls.append(kwargs)
+            return 22050, [[16384]] * 2205
+
+    numpy = pytest.importorskip("numpy")
+    monkeypatch.setattr(colab, "_import", {"indextts.infer_v2": SimpleNamespace(IndexTTS2=IndexTTS2), "numpy": numpy}.__getitem__)
+    audio = colab._load_index_clone_model(1.5).generate("You stole my kill!", audio_prompt_path=str(clip))
+
+    assert calls[0]["model_dir"].endswith("checkpoints") and calls[0]["use_fp16"] is True
+    assert calls[1] == {"spk_audio_prompt": str(clip), "text": "You stole my kill!", "output_path": None, "use_emo_text": True, "emo_alpha": 1.0}
+    assert len(audio) == 2400 and abs(audio[0] - 0.5) < 1e-6
+    assert colab.DEFAULT_CLONE_MODEL == "index"

@@ -77,16 +77,18 @@ If your computer is slow or you can't install anything, run it on a free Colab G
 
 ### Your own voices (voice cloning)
 
-The notebook can narrate with any voice you have a clip of. By default it uses [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) Base, which copies a voice most closely; [Chatterbox](https://github.com/resemble-ai/chatterbox) models are also available under **Custom voice model**:
+The notebook can narrate with any voice you have a clip of. By default it uses [IndexTTS-2](https://github.com/index-tts/index-tts), which copies the voice from your clip and reads the emotion of each line from its words; [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) Base and [Chatterbox](https://github.com/resemble-ai/chatterbox) models are also available under **Custom voice model**:
 
 1. Under **Add a voice**, click **Choose clips**, pick an audio or video file (up to 20 MB) of one person talking, with no music, and click **Add to library**. The first 30 seconds are used, and the clip must have more than 5 seconds of audio. The file name becomes the voice name.
 2. The voice is saved to Google Drive in `MyDrive/AudiobookFree/voices` and shows up in the voice list as **★ name · your voice** in every future session.
 3. Pick a **Custom voice model**:
-   - **Turbo** (default): good quality, and it understands tags in the text such as `[laugh]` and `[sigh]`.
+   - **IndexTTS-2** (default): close voice match with emotion taken from each line. **Expression** (0.25-1.0) sets how strong the emotion is. Slower; the first use installs it (about 10 minutes, 6 GB).
+   - **Qwen3**: closest match to the clip's delivery, using a transcript of the clip.
+   - **Turbo**: good quality, and it understands tags in the text such as `[laugh]` and `[sigh]`.
    - **Original**: the largest and slowest model. Use its **Expression** slider instead of tags.
    - **Nano**: the fastest model, with the lowest quality.
 
-Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
+Qwen3 needs to know what is said in the clip: the first time a voice is used, Whisper transcribes it and saves `name.transcript.txt` beside the clip. Check that file and fix any wrong word: if the transcript does not match the clip exactly, bits of the clip leak into the lines. A short clip (5-15 s) that ends on a full sentence works best. Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
 
 ### Design a voice
 

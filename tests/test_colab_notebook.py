@@ -175,8 +175,9 @@ def test_custom_voice_model_reaches_preview_and_generation() -> None:
     generate = "".join(_get_generate_cell(data).get("source", []))
     assert "clone_model_picker = widgets.Dropdown(" in panel and "cmd.extend(clone_args())" in panel
     assert "cmd += clone_args()" in generate
-    assert "value='qwen',\n    description='Custom voice model'," in panel
+    assert "value='index',\n    description='Custom voice model'," in panel
     assert "def ensure_qwen_env(" in panel and "'pypdf==6.15.0', 'pdfplumber==0.11.10'" in panel
+    assert "def ensure_index_env(" in panel and "snapshot_download('IndexTeam/IndexTTS-2'" in panel
     assert "(clone_python(), '--clone') if custom" in generate and "stream([clone_python(), *cast_cmd, 'render'" in generate
 
 

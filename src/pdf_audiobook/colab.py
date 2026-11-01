@@ -16,7 +16,11 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
+import tempfile
+from array import array
 from typing import Any, Callable, Iterator
+import wave
 
 from .audio import write_pcm_wav
 from .chapters import create_chapter_plan
@@ -97,40 +101,115 @@ def make_cuda_kokoro_factory(*, torch_loader: Callable[[], Any] | None = None, k
     return factory
 
 
-# Custom-voice models, best first. "qwen" is Qwen3-TTS Base, which copies a
-# voice most closely from its speaker embedding, and runs in the voice-design environment (qwen-tts) instead of Chatterbox's.
+# Custom-voice models, best first. "index" is IndexTTS-2: it copies the voice
+# from the clip and reads each line's emotion from its words (Expression sets
+# how strongly), in its own environment (the index-tts repo, checkpoints in
+# INDEXTTS_DIR). "qwen" is Qwen3-TTS Base: it is given a transcript of the
+# clip, so it copies accent and delivery closely, and runs in the
+# voice-design environment (qwen-tts) instead of Chatterbox's.
 # "original" is the largest Chatterbox and the only model with an exaggeration
 # (expression) control; the Turbo family uses inline tags such as [laugh] instead.
-CLONE_MODELS = ("qwen", "original", "turbo", "nano")
-DEFAULT_CLONE_MODEL = "qwen"
+CLONE_MODELS = ("index", "qwen", "original", "turbo", "nano")
+DEFAULT_CLONE_MODEL = "index"
 DEFAULT_EXAGGERATION = 0.5
 QWEN_CLONE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+WHISPER_MODEL_ID = "openai/whisper-large-v3-turbo"
+
+
+def transcript_path(clip: str | os.PathLike[str]) -> Path:
+    """Where a clip's transcript lives: ``name.transcript.txt`` beside ``name.wav``; edit it to fix a mistake."""
+
+    return Path(clip).with_suffix(".transcript.txt")
+
+
+def _wav_floats(clip: Path) -> tuple[list[float], int]:
+    with wave.open(str(clip), "rb") as handle:
+        channels, width, rate = handle.getnchannels(), handle.getsampwidth(), handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    if width != 2:
+        raise ColabError("custom voice clips must be 16-bit WAV")
+    samples = array("h", frames)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    mono = [sum(samples[i:i + channels]) / channels / 32768.0 for i in range(0, len(samples), channels)]
+    return mono, rate
+
+
+def _whisper_transcribe(clip: Path) -> str:
+    torch = _import("torch")
+    numpy = _import("numpy")
+    samples, rate = _wav_floats(clip)
+    asr = _import("transformers").pipeline("automatic-speech-recognition", model=WHISPER_MODEL_ID, device=0)
+    try:
+        result = asr({"raw": numpy.asarray(samples, dtype=numpy.float32), "sampling_rate": rate}, chunk_length_s=30, generate_kwargs={"language": "english"})
+    finally:
+        del asr
+        torch.cuda.empty_cache()
+    return str(result["text"])
+
+
+def reference_transcript(clip: str | os.PathLike[str], *, transcriber: Callable[[Path], str] | None = None) -> str:
+    """Return what is said in ``clip``, transcribing it with Whisper the first time and saving it beside the clip."""
+
+    path = transcript_path(clip)
+    if path.is_file():
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        if text:
+            return text
+    print(f"Transcribing {Path(clip).stem} for Qwen3 cloning (first time only)…", flush=True)
+    text = " ".join(str((transcriber or _whisper_transcribe)(Path(clip))).split())
+    if not text:
+        raise ColabError(f"no speech was found in {Path(clip).stem}; use a clip of someone talking")
+    path.write_text(text + "\n", encoding="utf-8")
+    print(f"Transcript saved to {path.name}: \"{text}\" (fix it if a word is wrong; a mismatch makes the clip leak into lines)", flush=True)
+    return text
 
 
 class _QwenCloneModel:
-    """Give Qwen3-TTS Base voice cloning ChatterboxVoice's call shape (24 kHz audio from a reference clip).
-
-    Uses the speaker embedding only: Qwen3's transcript-guided (ICL) mode
-    continues on from the clip, so bits of the clip leak into every line.
-    """
+    """Give Qwen3-TTS Base voice cloning ChatterboxVoice's call shape (24 kHz audio from a reference clip)."""
 
     sr = CHATTERBOX_SAMPLE_RATE
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, transcriber: Callable[[Path], str] | None = None) -> None:
         self._model = model
-        self._prompts: dict[str, Any] = {}
+        self._transcriber = transcriber
+        self._prompts: dict[str, tuple[str, str]] = {}
+        self._scratch = tempfile.TemporaryDirectory(prefix="qwen-ref-")
+
+    def _prompt(self, clip: str) -> tuple[str, str]:
+        """A copy of the clip with half a second of silence on each end, and its transcript ending in punctuation.
+
+        Qwen3 continues straight on from the clip, so a clip that stops mid-word
+        or a transcript without a full stop leaks bits of the clip into the
+        start of every line; a clean, silent boundary prevents that.
+        """
+        if clip not in self._prompts:
+            text = reference_transcript(clip, transcriber=self._transcriber)
+            if text[-1] not in ".!?…\"'":
+                text += "."
+            padded = Path(self._scratch.name) / f"{len(self._prompts)}.wav"
+            with wave.open(clip, "rb") as source:
+                params, frames = source.getparams(), source.readframes(source.getnframes())
+            silence = b"\x00" * (params.sampwidth * params.nchannels * (params.framerate // 2))
+            with wave.open(str(padded), "wb") as target:
+                target.setparams(params)
+                target.writeframes(silence + frames + silence)
+            self._prompts[clip] = (str(padded), text)
+        return self._prompts[clip]
 
     def generate(self, text: str, *, audio_prompt_path: str) -> Any:
-        if audio_prompt_path not in self._prompts:
-            self._prompts[audio_prompt_path] = self._model.create_voice_clone_prompt(ref_audio=audio_prompt_path, x_vector_only_mode=True)
-        wavs, rate = self._model.generate_voice_clone(text=text, language="English", voice_clone_prompt=self._prompts[audio_prompt_path])
-        audio = wavs[0]
-        if int(rate) != self.sr:
-            numpy = _import("numpy")
-            audio = numpy.asarray(audio, dtype=numpy.float32).reshape(-1)
-            positions = numpy.arange(round(len(audio) * self.sr / int(rate))) * (int(rate) / self.sr)
-            audio = numpy.interp(positions, numpy.arange(len(audio)), audio).astype(numpy.float32)
+        ref_audio, ref_text = self._prompt(audio_prompt_path)
+        wavs, rate = self._model.generate_voice_clone(text=text, language="English", ref_audio=ref_audio, ref_text=ref_text)
+        return _resample(wavs[0], int(rate), self.sr)
+
+
+def _resample(audio: Any, rate: int, target: int) -> Any:
+    if rate == target:
         return audio
+    numpy = _import("numpy")
+    audio = numpy.asarray(audio, dtype=numpy.float32).reshape(-1)
+    positions = numpy.arange(round(len(audio) * target / rate)) * (rate / target)
+    return numpy.interp(positions, numpy.arange(len(audio)), audio).astype(numpy.float32)
 
 
 def _load_qwen_clone_model() -> Any:
@@ -139,6 +218,27 @@ def _load_qwen_clone_model() -> Any:
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float32
     model = _import("qwen_tts").Qwen3TTSModel.from_pretrained(QWEN_CLONE_MODEL_ID, device_map="cuda:0", dtype=dtype, attn_implementation="sdpa")
     return _QwenCloneModel(model)
+
+
+class _IndexCloneModel:
+    """Give IndexTTS-2 ChatterboxVoice's call shape: the voice from the clip, the emotion from the line's own words."""
+
+    sr = CHATTERBOX_SAMPLE_RATE
+
+    def __init__(self, model: Any, exaggeration: float) -> None:
+        self._model = model
+        self._emotion = min(1.0, exaggeration)  # IndexTTS-2's emotion strength runs 0-1
+
+    def generate(self, text: str, *, audio_prompt_path: str) -> Any:
+        rate, pcm = self._model.infer(spk_audio_prompt=audio_prompt_path, text=text, output_path=None, use_emo_text=True, emo_alpha=self._emotion)
+        numpy = _import("numpy")
+        return _resample(numpy.asarray(pcm, dtype=numpy.float32).reshape(-1) / 32768.0, int(rate), self.sr)
+
+
+def _load_index_clone_model(exaggeration: float) -> Any:
+    checkpoints = os.environ.get("INDEXTTS_DIR", "/content/index-tts/checkpoints")
+    model = _import("indextts.infer_v2").IndexTTS2(cfg_path=f"{checkpoints}/config.yaml", model_dir=checkpoints, use_fp16=True, use_cuda_kernel=False)
+    return _IndexCloneModel(model, exaggeration)
 
 
 class _ExpressiveModel:
@@ -154,6 +254,8 @@ class _ExpressiveModel:
 
 
 def _load_clone_model(model: str, exaggeration: float) -> Any:
+    if model == "index":
+        return _load_index_clone_model(exaggeration)
     if model == "qwen":
         return _load_qwen_clone_model()
     if model == "original":
@@ -205,6 +307,8 @@ def make_cuda_chatterbox_factory(
             try:
                 cache["model"] = load_model()
             except Exception as exc:
+                if model == "index":
+                    raise ColabError(f"IndexTTS-2 could not be loaded in the Colab GPU runtime: {exc}") from exc
                 if model == "qwen":
                     raise ColabError(f"Qwen3-TTS could not be loaded in the Colab GPU runtime: {exc}") from exc
                 raise ColabError("Chatterbox could not be loaded in the Colab GPU runtime; run the voice-cloning setup cell") from exc
@@ -302,7 +406,7 @@ def _expected_chatterbox_tts(cleaned_text: str, plan: dict[str, Any], descriptor
 
     settings = SynthesisSettings(speed=1.0, sample_rate=CHATTERBOX_SAMPLE_RATE, chunk_cap=CHATTERBOX_CHUNK_CAP, chunk_mode="legacy")
     settings_dict = {**settings.as_dict(), "reference_descriptor_sha256": descriptor["descriptor_sha256"], "clone_model": model}
-    if model == "original":
+    if model in ("original", "index"):
         settings_dict["exaggeration"] = exaggeration
     metadata = EngineMetadata(
         "chatterbox", CHATTERBOX_PACKAGE_VERSION, CHATTERBOX_NANO_MODEL, CHATTERBOX_SOURCE_COMMIT, "unrecorded",
@@ -714,7 +818,7 @@ def preview_clones(
     results: dict[str, Path] = {}
     missing: list[tuple[Path, Path]] = []
     for clip in clip_list:
-        style = f"{model}-{exaggeration:g}" if model == "original" else ("qwen-xvec" if model == "qwen" else model)
+        style = f"{model}-{exaggeration:g}" if model in ("original", "index") else ("qwen-icl" if model == "qwen" else model)
         target = directory / f"clone-{style}-{_clip_digest(clip)[:16]}-{text_digest}.wav"
         results[str(clip)] = target
         if not target.is_file():
