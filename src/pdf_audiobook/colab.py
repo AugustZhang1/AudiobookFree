@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from array import array
 from typing import Any, Callable, Iterator
 import wave
@@ -168,12 +169,33 @@ class _QwenCloneModel:
     def __init__(self, model: Any, transcriber: Callable[[Path], str] | None = None) -> None:
         self._model = model
         self._transcriber = transcriber
-        self._texts: dict[str, str] = {}
+        self._prompts: dict[str, tuple[str, str]] = {}
+        self._scratch = tempfile.TemporaryDirectory(prefix="qwen-ref-")
+
+    def _prompt(self, clip: str) -> tuple[str, str]:
+        """A copy of the clip with half a second of silence on each end, and its transcript ending in punctuation.
+
+        Qwen3 continues straight on from the clip, so a clip that stops mid-word
+        or a transcript without a full stop leaks bits of the clip into the
+        start of every line; a clean, silent boundary prevents that.
+        """
+        if clip not in self._prompts:
+            text = reference_transcript(clip, transcriber=self._transcriber)
+            if text[-1] not in ".!?…\"'":
+                text += "."
+            padded = Path(self._scratch.name) / f"{len(self._prompts)}.wav"
+            with wave.open(clip, "rb") as source:
+                params, frames = source.getparams(), source.readframes(source.getnframes())
+            silence = b"\x00" * (params.sampwidth * params.nchannels * (params.framerate // 2))
+            with wave.open(str(padded), "wb") as target:
+                target.setparams(params)
+                target.writeframes(silence + frames + silence)
+            self._prompts[clip] = (str(padded), text)
+        return self._prompts[clip]
 
     def generate(self, text: str, *, audio_prompt_path: str) -> Any:
-        if audio_prompt_path not in self._texts:
-            self._texts[audio_prompt_path] = reference_transcript(audio_prompt_path, transcriber=self._transcriber)
-        wavs, rate = self._model.generate_voice_clone(text=text, language="English", ref_audio=audio_prompt_path, ref_text=self._texts[audio_prompt_path])
+        ref_audio, ref_text = self._prompt(audio_prompt_path)
+        wavs, rate = self._model.generate_voice_clone(text=text, language="English", ref_audio=ref_audio, ref_text=ref_text)
         audio = wavs[0]
         if int(rate) != self.sr:
             numpy = _import("numpy")

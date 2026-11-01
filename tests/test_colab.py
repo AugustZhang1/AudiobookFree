@@ -1465,16 +1465,19 @@ def test_qwen_clone_model_transcribes_once_and_passes_the_transcript(sandbox_pat
             return [[0.1] * 4800], 24000
 
     base = Base()
-    model = colab._QwenCloneModel(base, transcriber=lambda path: heard.append(path) or "  Hello   there. ")
+    model = colab._QwenCloneModel(base, transcriber=lambda path: heard.append(path) or "  Hello   there ")
     monkeypatch.setattr(colab, "_load_qwen_clone_model", lambda: model)
     voice = colab.make_cuda_chatterbox_factory(model="qwen", torch_loader=lambda: None)("reference-wav", None, engine="chatterbox", reference_wav=clip)
     voice.synthesize("First line.")
     voice.synthesize("Second line.")
 
     assert heard == [clip]
-    assert colab.transcript_path(clip).read_text(encoding="utf-8") == "Hello there.\n"
+    assert colab.transcript_path(clip).read_text(encoding="utf-8") == "Hello there\n"
     assert [call["ref_text"] for call in base.calls] == ["Hello there.", "Hello there."]
-    assert base.calls[0]["ref_audio"] == str(clip) and base.calls[0]["text"] == "First line."
+    assert base.calls[0]["text"] == "First line." and base.calls[0]["ref_audio"] == base.calls[1]["ref_audio"] != str(clip)
+    import wave
+    with wave.open(str(clip), "rb") as original, wave.open(base.calls[0]["ref_audio"], "rb") as padded:
+        assert padded.getnframes() == original.getnframes() + 2 * (original.getframerate() // 2)
     assert colab.DEFAULT_CLONE_MODEL == "qwen"
 
 
