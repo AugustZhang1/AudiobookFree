@@ -514,7 +514,7 @@ def _line_keys(settings: dict[str, Any]) -> Callable[[str, str], str]:
         if _is_custom(voice):
             if voice not in clip_shas:
                 clip_shas[voice] = _file_sha(voice)
-            model = settings.get("clone_model", "turbo")
+            model = settings.get("clone_model", "original")
             style = f"clone:{model}:{settings.get('exaggeration', 0.5) if model == 'original' else ''}:{clip_shas[voice]}"
         else:
             style = f"kokoro:{voice}:{float(settings.get('speed', 1.0)):g}"
@@ -570,7 +570,7 @@ def _default_loader(settings: dict[str, Any], engine: str) -> Callable[[str], Ca
     from .tts import CHATTERBOX_REFERENCE_VOICE, SynthesisSettings
 
     if engine == "clone":
-        factory = colab.make_cuda_chatterbox_factory(model=settings.get("clone_model", "turbo"), exaggeration=settings.get("exaggeration", 0.5))
+        factory = colab.make_cuda_chatterbox_factory(model=settings.get("clone_model", "original"), exaggeration=settings.get("exaggeration", 0.5))
 
         def load_clone(voice: str) -> Callable[[str], bytes]:
             loaded = factory(CHATTERBOX_REFERENCE_VOICE, None, engine="chatterbox", reference_wav=voice)

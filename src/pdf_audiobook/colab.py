@@ -97,11 +97,11 @@ def make_cuda_kokoro_factory(*, torch_loader: Callable[[], Any] | None = None, k
     return factory
 
 
-# Custom-voice (Chatterbox) models, best default first. "original" is the
+# Custom-voice (Chatterbox) models, best first. "original" is the
 # largest and the only one with an exaggeration (expression) control; the Turbo
 # family uses inline tags such as [laugh] instead.
-CLONE_MODELS = ("turbo", "original", "nano")
-DEFAULT_CLONE_MODEL = "turbo"
+CLONE_MODELS = ("original", "turbo", "nano")
+DEFAULT_CLONE_MODEL = "original"
 DEFAULT_EXAGGERATION = 0.5
 
 
