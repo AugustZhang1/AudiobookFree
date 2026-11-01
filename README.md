@@ -77,7 +77,7 @@ If your computer is slow or you can't install anything, run it on a free Colab G
 
 ### Your own voices (voice cloning)
 
-The notebook can narrate with any voice you have a clip of, using [Chatterbox](https://github.com/resemble-ai/chatterbox):
+The notebook can narrate with any voice you have a clip of. By default it uses [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) Base, which copies a voice most closely; [Chatterbox](https://github.com/resemble-ai/chatterbox) models are also available under **Custom voice model**:
 
 1. Under **Add a voice**, click **Choose clips**, pick an audio or video file (up to 20 MB) of one person talking, with no music, and click **Add to library**. The first 30 seconds are used, and the clip must have more than 5 seconds of audio. The file name becomes the voice name.
 2. The voice is saved to Google Drive in `MyDrive/AudiobookFree/voices` and shows up in the voice list as **★ name · your voice** in every future session.
@@ -86,7 +86,7 @@ The notebook can narrate with any voice you have a clip of, using [Chatterbox](h
    - **Original**: the largest and slowest model. Use its **Expression** slider instead of tags.
    - **Nano**: the fastest model, with the lowest quality.
 
-Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
+Qwen3 needs to know what is said in the clip: the first time a voice is used, Whisper transcribes it and saves `name.transcript.txt` beside the clip. If the transcript is wrong, fix that file; an accurate transcript gives a closer voice. Custom voices always narrate at speed 1.0. Clean, English, single-speaker clips clone best. Only clone voices you have permission to use.
 
 ### Design a voice
 
@@ -98,7 +98,7 @@ Give each character in the book their own voice, with the narrator reading every
 
 1. Set **Narration** at the top of the panel to **Character voices (Gemini)**. It is off (**One voice**) by default.
 2. Choose your book and chapter mode, then click **Make script**. Gemini works out who says each quote. The book's words are never changed: the app splits the text at the quotation marks and Gemini only names the speaker of each quote.
-3. Each character gets a short summary of who they are in the story and a description of how they sound, written by Gemini from the book. By default every main character gets a new voice designed from that description (see **Design a voice**). Untick **Design a unique voice for each character** to have Gemini pick from your existing voices instead. Change any voice, or pick **Narrator voice**. Designed voices are read by Chatterbox, so run the voice-cloning setup cell.
+3. Each character gets a short summary of who they are in the story and a description of how they sound, written by Gemini from the book. By default every main character gets a new voice designed from that description (see **Design a voice**). Untick **Design a unique voice for each character** to have Gemini pick from your existing voices instead. Change any voice, or pick **Narrator voice**. Designed voices are read by your custom voice model (Qwen3 by default; Chatterbox models need the voice-cloning setup cell).
 4. Characters with fewer lines than **Own voice from** (5 by default) are read by the narrator, so a large book doesn't need a voice for every minor character.
 5. Click **Preview cast** to hear each character read one of their own lines, then run the last cell.
 

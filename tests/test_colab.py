@@ -1450,3 +1450,35 @@ def test_clone_resume_with_a_different_model_is_refused(sandbox_path: Path) -> N
     assert job["tts"]["settings"]["clone_model"] == "original" and job["tts"]["settings"]["exaggeration"] == 1.0
     with pytest.raises(colab.ColabConflictError, match="different voice, speed, or chunk settings"):
         colab.run_conversion(source, clone=clip, clone_model="turbo", **common)
+
+
+def test_qwen_clone_model_transcribes_once_and_passes_the_transcript(sandbox_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    heard: list[Path] = []
+
+    class Base:
+        def __init__(self):
+            self.calls = []
+
+        def generate_voice_clone(self, **kwargs):
+            self.calls.append(kwargs)
+            return [[0.1] * 4800], 24000
+
+    base = Base()
+    model = colab._QwenCloneModel(base, transcriber=lambda path: heard.append(path) or "  Hello   there. ")
+    monkeypatch.setattr(colab, "_load_qwen_clone_model", lambda: model)
+    voice = colab.make_cuda_chatterbox_factory(model="qwen", torch_loader=lambda: None)("reference-wav", None, engine="chatterbox", reference_wav=clip)
+    voice.synthesize("First line.")
+    voice.synthesize("Second line.")
+
+    assert heard == [clip]
+    assert colab.transcript_path(clip).read_text(encoding="utf-8") == "Hello there.\n"
+    assert [call["ref_text"] for call in base.calls] == ["Hello there.", "Hello there."]
+    assert base.calls[0]["ref_audio"] == str(clip) and base.calls[0]["text"] == "First line."
+    assert colab.DEFAULT_CLONE_MODEL == "qwen"
+
+
+def test_reference_transcript_prefers_an_edited_transcript(sandbox_path: Path) -> None:
+    clip = _clip(sandbox_path / "hero.wav")
+    colab.transcript_path(clip).write_text("Fixed by hand.\n", encoding="utf-8")
+    assert colab.reference_transcript(clip, transcriber=lambda path: pytest.fail("should not transcribe")) == "Fixed by hand."
