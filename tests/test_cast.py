@@ -123,6 +123,28 @@ def test_british_single_quotes_are_found_but_apostrophes_are_not() -> None:
 def test_unclosed_quote_runs_to_the_end_of_the_paragraph() -> None:
     text = "“It went on for pages and pages"
     assert cast._quotes(text, single=False) == [(0, len(text))]
+    text = '"A speech that goes on into the next paragraph.'
+    assert cast._quotes(text, single=False) == [(0, len(text))]
+    assert cast._quotes('the end of a quote." Then narration.', single=False) == []
+
+
+def test_single_line_breaks_split_paragraphs_but_never_inside_a_quote() -> None:
+    # EPUB-converted PDFs keep paragraphs apart with one line break, which also
+    # appears where a line wraps before a capital letter.
+    text = (
+        "Sunny looked at the\nSin of Solace. It laughed.\n"
+        '"Let\'s go.\nWe\'ll escape," he said.\n'
+        '"First paragraph of a long speech.\n'
+        '"And the second."\n'
+        "The mist rolled in."
+    )
+    assert cast._paragraphs(text) == [
+        "Sunny looked at the Sin of Solace. It laughed.",
+        '"Let\'s go. We\'ll escape," he said.',
+        '"First paragraph of a long speech.',
+        '"And the second."',
+        "The mist rolled in.",
+    ]
 
 
 def test_parse_reply_cleans_names() -> None:

@@ -47,7 +47,10 @@ CHAPTER_PAUSE_SECONDS = 1.0
 GEMINI_MODEL = "gemini-flash-latest"
 
 _PARAGRAPH = re.compile(r"\n\s*\n")
-_DOUBLE_QUOTE = re.compile(r'“(?:[^“”])+(?:”|$)|"[^"]+"')
+_DOUBLE_QUOTE = re.compile(r'“(?:[^“”])+(?:”|$)|"[^"]+"|^"[^"]+$')
+# Some PDFs (EPUB conversions especially) keep paragraphs apart with a single
+# line break, which also appears where a line wraps before a capital letter.
+_SENTENCE_END = re.compile(r"[.!?…:\"”'’)\]*~-]$")
 _SINGLE_QUOTE = re.compile(r"(?<!\w)‘(?:[^‘’]|’(?=\w))+(?:’(?!\w)|$)")
 _LINE = re.compile(r"^\[([^\[\]\n]+)\]\s?(.*)$")
 # Same rule as tts.flowed_paragraphs: a leading Chapter/Part/Section line is its own paragraph.
@@ -68,15 +71,28 @@ class CastError(RuntimeError):
 # --- script -------------------------------------------------------------------
 
 
+def _quote_open(text: str) -> bool:
+    return text.count('"') % 2 == 1 or text.count("“") > text.count("”")
+
+
 def _paragraphs(text: str) -> list[str]:
+    """Split text into paragraphs: at blank lines, and at a line break that ends
+    a sentence outside any quote or that starts a new quote, so a quote that
+    wraps mid-speech is never cut in two."""
+
     paragraphs: list[str] = []
     for block in _PARAGRAPH.split(text):
-        lines = block.strip().split("\n")
-        while len(lines) > 1 and _HEADING_LINE.match(lines[0].strip()):
-            paragraphs.append(lines.pop(0).strip())
-        flowed = " ".join(" ".join(lines).split())
-        if flowed:
-            paragraphs.append(flowed)
+        lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
+        while len(lines) > 1 and _HEADING_LINE.match(lines[0]):
+            paragraphs.append(lines.pop(0))
+        current: list[str] = []
+        for line in lines:
+            if current and (line[0] in '"“' or (_SENTENCE_END.search(current[-1]) and not _quote_open(" ".join(current)))):
+                paragraphs.append(" ".join(" ".join(current).split()))
+                current = []
+            current.append(line)
+        if current:
+            paragraphs.append(" ".join(" ".join(current).split()))
     return paragraphs
 
 
